@@ -4,17 +4,36 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 
-if ! "${PYTHON_BIN}" -c "import sglang_router.launch_router" >/dev/null 2>&1; then
-  cat >&2 <<'MSG'
-sglang_router is not installed in this environment.
-To use the PD router, build and install the Python binding first:
-
-  cd /workspace/sglang/sgl-model-gateway/bindings/python
-  maturin build --release --out dist --features vendored-openssl
-  /venv/main/bin/pip install dist/sglang_router-*.whl
-MSG
-  exit 1
+if [[ -f "$HOME/.cargo/env" ]]; then
+  source "$HOME/.cargo/env"
 fi
+
+ensure_router_installed() {
+  if "${PYTHON_BIN}" -c "import sglang_router.launch_router" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "[router_pd] sglang_router is missing; attempting automatic build/install..."
+  apt-get update
+  apt-get install -y --no-install-recommends \
+    cargo \
+    rustc \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    libprotobuf-dev
+  "${PIP_BIN}" install -U maturin
+
+  (
+    cd "${SGLANG_REPO_ROOT}/sgl-model-gateway/bindings/python"
+    "${PYTHON_BIN}" -m maturin build --release --out dist --features vendored-openssl
+    "${PIP_BIN}" install dist/sglang_router-*.whl
+  )
+
+  "${PYTHON_BIN}" -c "import sglang_router.launch_router" >/dev/null 2>&1
+}
+
+ensure_router_installed
 
 exec "${PYTHON_BIN}" -m sglang_router.launch_router \
   --pd-disaggregation \
