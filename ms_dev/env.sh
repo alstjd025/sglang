@@ -19,8 +19,8 @@ export SGLANG_REQUEST_METRICS_DIR="${SGLANG_RUNTIME_DIR}/request_metrics"
 export SGLANG_CRASH_DUMP_DIR="${SGLANG_RUNTIME_DIR}/crash_dump"
 
 # Model / server config
-# export SGLANG_MODEL_PATH="meta-llama/Meta-Llama-3.1-8B-Instruct"
-export SGLANG_MODEL_PATH="meta-llama/Meta-Llama-3-8B-Instruct"
+export SGLANG_MODEL_PATH="meta-llama/Meta-Llama-3.1-8B-Instruct"
+#export SGLANG_MODEL_PATH="meta-llama/Meta-Llama-3-8B-Instruct"
 export SGLANG_HOST="0.0.0.0"
 export SGLANG_ATTENTION_BACKEND="triton"
 export SGLANG_SAMPLING_BACKEND="pytorch"
@@ -65,3 +65,4 @@ mkdir -p "${HF_HUB_CACHE}"
 mkdir -p "${SGLANG_REQUEST_LOG_DIR}"
 mkdir -p "${SGLANG_REQUEST_METRICS_DIR}"
 mkdir -p "${SGLANG_CRASH_DUMP_DIR}"
+export MC_TCP_ENABLE_CONNECTION_POOL=1

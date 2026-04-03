@@ -4,11 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 
-if [[ -f "$HOME/.cargo/env" ]]; then
-  # Prefer a rustup-managed toolchain when it exists.
-  source "$HOME/.cargo/env"
-fi
-
 cd "${SGLANG_REPO_ROOT}"
 
 SGLANG_PYTHON_EXTRAS="${SGLANG_PYTHON_EXTRAS:-tracing}"
@@ -26,16 +21,32 @@ ROUTER_BINDINGS_DIR="${SGLANG_REPO_ROOT}/sgl-model-gateway/bindings/python"
 echo "[install_dev] upgrading pip..."
 "${PIP_BIN}" install --upgrade pip
 
-echo "[install_dev] installing router build dependencies..."
+echo "[install_dev] installing system build dependencies..."
 apt-get update
 apt-get install -y --no-install-recommends \
-  cargo \
-  rustc \
+  curl \
+  build-essential \
   pkg-config \
   libssl-dev \
   protobuf-compiler \
   libprotobuf-dev \
-  mooncake-transfer-engine
+  ca-certificates
+
+echo "[install_dev] installing rustup + recent stable Rust..."
+if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+  curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+fi
+
+source "$HOME/.cargo/env"
+
+rustup toolchain install stable
+rustup default stable
+
+echo "[install_dev] rust toolchain:"
+which cargo
+which rustc
+cargo --version
+rustc --version
 
 echo "[install_dev] ensuring maturin is installed..."
 "${PIP_BIN}" install -U maturin
@@ -48,7 +59,7 @@ echo "[install_dev] building and installing sglang_router..."
 (
   cd "${ROUTER_BINDINGS_DIR}"
   "${PYTHON_BIN}" -m maturin build --release --out dist --features vendored-openssl
-  "${PIP_BIN}" install dist/sglang_router-*.whl
+  "${PIP_BIN}" install --force-reinstall dist/sglang_router-*.whl
 )
 
 echo "[install_dev] verifying runtime imports..."
