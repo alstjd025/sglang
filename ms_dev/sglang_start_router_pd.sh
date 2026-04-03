@@ -22,6 +22,7 @@ ensure_router_installed() {
     libssl-dev \
     protobuf-compiler \
     libprotobuf-dev
+
   "${PIP_BIN}" install -U maturin
 
   (
@@ -35,10 +36,22 @@ ensure_router_installed() {
 
 ensure_router_installed
 
-exec "${PYTHON_BIN}" -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill "http://${SGLANG_PD_BACKEND_HOST}:${SGLANG_PD_PREFILL_PORT}" \
-  --decode "http://${SGLANG_PD_BACKEND_HOST}:${SGLANG_PD_DECODE_PORT}" \
-  --host "${SGLANG_PD_ROUTER_HOST}" \
-  --port "${SGLANG_PD_ROUTER_PORT}" \
-  ${SGLANG_PD_ROUTER_EXTRA_ARGS}
+args=(
+  --pd-disaggregation
+  --prefill "http://${SGLANG_PD_BACKEND_HOST}:${SGLANG_PD_PREFILL_PORT}"
+  --decode "http://${SGLANG_PD_BACKEND_HOST}:${SGLANG_PD_DECODE_PORT}"
+  --host "${SGLANG_PD_ROUTER_HOST}"
+  --port "${SGLANG_PD_ROUTER_PORT}"
+)
+
+if [[ -n "${SGLANG_PD_ROUTER_EXTRA_ARGS}" ]]; then
+  # shellcheck disable=SC2206
+  extra_args=( ${SGLANG_PD_ROUTER_EXTRA_ARGS} )
+  args+=("${extra_args[@]}")
+fi
+
+echo "[router_pd] launching router:"
+printf ' %q' "${PYTHON_BIN}" -m sglang_router.launch_router "${args[@]}"
+echo
+
+exec "${PYTHON_BIN}" -m sglang_router.launch_router "${args[@]}"

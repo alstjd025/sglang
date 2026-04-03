@@ -34,7 +34,8 @@ apt-get install -y --no-install-recommends \
   pkg-config \
   libssl-dev \
   protobuf-compiler \
-  libprotobuf-dev
+  libprotobuf-dev \
+  mooncake-transfer-engine
 
 echo "[install_dev] ensuring maturin is installed..."
 "${PIP_BIN}" install -U maturin

@@ -2,12 +2,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "${SCRIPT_DIR}/lib_sglang_server.sh"
+source "${SCRIPT_DIR}/env.sh"
 
 args=(
-  --disaggregation-mode decode
+  -m sglang.launch_server
+  --model-path "${SGLANG_MODEL_PATH}"
+  --host "${SGLANG_HOST}"
   --port "${SGLANG_PD_DECODE_PORT}"
+  --attention-backend "${SGLANG_ATTENTION_BACKEND}"
+  --sampling-backend "${SGLANG_SAMPLING_BACKEND}"
+  --mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
+  --disaggregation-mode decode
   --base-gpu-id "${SGLANG_PD_DECODE_BASE_GPU_ID}"
+  --tp-size 1
 )
 
 if [[ -n "${SGLANG_PD_IB_DEVICE}" ]]; then
@@ -20,4 +27,8 @@ if [[ -n "${SGLANG_PD_DECODE_EXTRA_ARGS}" ]]; then
   args+=("${extra_args[@]}")
 fi
 
-run_sglang_server "${args[@]}"
+echo "[decode_pd] launching decode:"
+printf ' %q' "${PYTHON_BIN}" "${args[@]}"
+echo
+
+exec "${PYTHON_BIN}" "${args[@]}"
