@@ -42,6 +42,11 @@ args=(
   --decode "http://${SGLANG_PD_BACKEND_HOST}:${SGLANG_PD_DECODE_PORT}"
   --host "${SGLANG_PD_ROUTER_HOST}"
   --port "${SGLANG_PD_ROUTER_PORT}"
+  --log-dir "${SGLANG_ROUTER_LOG_DIR}"
+  --json-log
+  --prometheus-port "${SGLANG_ROUTER_PROMETHEUS_PORT}"
+  --enable-trace
+  --otlp-traces-endpoint "${SGLANG_OTLP_TRACES_ENDPOINT}"
 )
 
 if [[ -n "${SGLANG_PD_ROUTER_EXTRA_ARGS}" ]]; then
