@@ -42,6 +42,7 @@ args=(
   --decode "http://${SGLANG_PD_BACKEND_HOST}:${SGLANG_PD_DECODE_PORT}"
   --host "${SGLANG_PD_ROUTER_HOST}"
   --port "${SGLANG_PD_ROUTER_PORT}"
+  --request-timeout-secs "${SGLANG_PD_ROUTER_REQUEST_TIMEOUT_SECS}"
   --log-dir "${SGLANG_ROUTER_LOG_DIR}"
   --json-log
   --prometheus-port "${SGLANG_ROUTER_PROMETHEUS_PORT}"
