@@ -92,6 +92,9 @@ class SchedulerStats:
     cache_hit_rate: float = 0.0
 
     max_total_num_tokens: int = 0
+    available_tokens: int = 0
+    evictable_tokens: int = 0
+    protected_tokens: int = 0
 
     # Speculative decoding
     spec_accept_length: float = 0.0
@@ -267,6 +270,24 @@ class SchedulerMetricsCollector:
         self.max_total_num_tokens = Gauge(
             name="sglang:max_total_num_tokens",
             documentation="Maximum total number of tokens in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.available_tokens = Gauge(
+            name="sglang:available_tokens",
+            documentation="Number of immediately allocatable KV tokens in device pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.evictable_tokens = Gauge(
+            name="sglang:evictable_tokens",
+            documentation="Number of KV tokens currently cache-evictable (unlocked).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.protected_tokens = Gauge(
+            name="sglang:protected_tokens",
+            documentation="Number of KV tokens protected by active lock references.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -948,6 +969,9 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
+        self._log_gauge(self.available_tokens, stats.available_tokens)
+        self._log_gauge(self.evictable_tokens, stats.evictable_tokens)
+        self._log_gauge(self.protected_tokens, stats.protected_tokens)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)

@@ -386,7 +386,7 @@ class Scheduler(
 
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
-
+        
         # Init running status
         self.init_running_status()
 
@@ -744,7 +744,6 @@ class Scheduler(
         ):
             if not self.is_hybrid_swa:
                 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-
                 self.tree_cache = ChunkCache(params)
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache

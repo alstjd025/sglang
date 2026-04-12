@@ -53,6 +53,13 @@ def fmt_kv_used_max(used_tokens: Optional[float], max_tokens: Optional[float]) -
     return f"{fmt_int(used_tokens)}/{fmt_int(max_tokens)} tok"
 
 
+def fmt_used_total_pct(used: Optional[float], total: Optional[float]) -> str:
+    if used is None or total is None or total <= 0:
+        return "-"
+    pct = (used / total) * 100.0
+    return f"{fmt_int(used)}/{fmt_int(total)} ({fmt_float(pct, 1)}%)"
+
+
 def metric_value(role_state: Dict[str, object], name: str) -> Optional[float]:
     metrics = role_state.get("metrics")
     if not isinstance(metrics, dict):
@@ -383,6 +390,12 @@ def render_status(
     prefill_kv_used = metric_value(prefill, "sglang:num_used_tokens")
     prefill_kv_max = metric_value(prefill, "sglang:max_total_num_tokens")
     prefill_cache_hit = metric_value(prefill, "sglang:cache_hit_rate")
+    prefill_full_token_usage = metric_value(prefill, "sglang:full_token_usage")
+    prefill_available_tokens = metric_value(prefill, "sglang:available_tokens")
+    prefill_evictable_tokens = metric_value(prefill, "sglang:evictable_tokens")
+    prefill_protected_tokens = metric_value(prefill, "sglang:protected_tokens")
+    prefill_hicache_host_used_tokens = metric_value(prefill, "sglang:hicache_host_used_tokens")
+    prefill_hicache_host_total_tokens = metric_value(prefill, "sglang:hicache_host_total_tokens")
 
     decode_throughput = metric_value(decode, "sglang:gen_throughput")
     decode_running = metric_value(decode, "sglang:num_running_reqs")
@@ -394,6 +407,12 @@ def render_status(
     decode_kv_used = metric_value(decode, "sglang:num_used_tokens")
     decode_kv_max = metric_value(decode, "sglang:max_total_num_tokens")
     decode_cache_hit = metric_value(decode, "sglang:cache_hit_rate")
+    decode_full_token_usage = metric_value(decode, "sglang:full_token_usage")
+    decode_available_tokens = metric_value(decode, "sglang:available_tokens")
+    decode_evictable_tokens = metric_value(decode, "sglang:evictable_tokens")
+    decode_protected_tokens = metric_value(decode, "sglang:protected_tokens")
+    decode_hicache_host_used_tokens = metric_value(decode, "sglang:hicache_host_used_tokens")
+    decode_hicache_host_total_tokens = metric_value(decode, "sglang:hicache_host_total_tokens")
 
     prefill_kv_ratio = (
         (prefill_kv_used / prefill_kv_max)
@@ -403,6 +422,21 @@ def render_status(
     decode_kv_ratio = (
         (decode_kv_used / decode_kv_max)
         if decode_kv_used is not None and decode_kv_max is not None and decode_kv_max > 0
+        else None
+    )
+
+    prefill_hicache_host_ratio = (
+        (prefill_hicache_host_used_tokens / prefill_hicache_host_total_tokens)
+        if prefill_hicache_host_used_tokens is not None
+        and prefill_hicache_host_total_tokens is not None
+        and prefill_hicache_host_total_tokens > 0
+        else None
+    )
+    decode_hicache_host_ratio = (
+        (decode_hicache_host_used_tokens / decode_hicache_host_total_tokens)
+        if decode_hicache_host_used_tokens is not None
+        and decode_hicache_host_total_tokens is not None
+        and decode_hicache_host_total_tokens > 0
         else None
     )
 
@@ -483,12 +517,13 @@ def render_status(
         "features: "
         + " | ".join(
             [
-                f"prefill_hicache={prefill_hicache_text}",
+                f"prefill_hicache_l2={prefill_hicache_text}",
                 f"decode_hicache_l2={decode_hicache_l2_text}",
-                f"decode_offload={decode_offload_text}",
+                f"decode_pd_offload={decode_offload_text}",
             ]
         )
     )
+    lines.append("legend: hicache=L1/L2/L3 tiered cache, pd_offload=PD decode-specific KV offload path")
     lines.append(colorize("-" * 118, "muted", use_color))
 
     lines.append(
@@ -515,6 +550,17 @@ def render_status(
                 ("token_usage", color_high_bad(prefill_token_usage if prefill_token_usage is None else prefill_token_usage*100.0, fmt_pct(prefill_token_usage), warn=70.0, bad=90.0, enabled=use_color)),
                 ("cache_hit", color_high_good(prefill_cache_hit, fmt_pct(prefill_cache_hit), warn=0.50, good=0.80, enabled=use_color)),
                 ("TTFT_mean", color_high_bad(prefill_ttft_ms, f'{fmt_float(prefill_ttft_ms, 2)}ms', warn=800.0, bad=2000.0, enabled=use_color)),
+            ]
+        )
+    )
+    lines.append(
+        "         "
+        + metric_row(
+            [
+                ("full_usage", color_high_bad(prefill_full_token_usage if prefill_full_token_usage is None else prefill_full_token_usage*100.0, fmt_pct(prefill_full_token_usage), warn=70.0, bad=90.0, enabled=use_color)),
+                ("avail/evict/prot", f"{fmt_int(prefill_available_tokens)}/{fmt_int(prefill_evictable_tokens)}/{fmt_int(prefill_protected_tokens)}"),
+                ("host_used/total", fmt_used_total_pct(prefill_hicache_host_used_tokens, prefill_hicache_host_total_tokens)),
+                ("host_usage", color_high_bad(prefill_hicache_host_ratio if prefill_hicache_host_ratio is None else prefill_hicache_host_ratio*100.0, fmt_pct(prefill_hicache_host_ratio), warn=70.0, bad=90.0, enabled=use_color)),
             ]
         )
     )
@@ -547,6 +593,17 @@ def render_status(
             ]
         )
     )
+    lines.append(
+        "         "
+        + metric_row(
+            [
+                ("full_usage", color_high_bad(decode_full_token_usage if decode_full_token_usage is None else decode_full_token_usage*100.0, fmt_pct(decode_full_token_usage), warn=70.0, bad=90.0, enabled=use_color)),
+                ("avail/evict/prot", f"{fmt_int(decode_available_tokens)}/{fmt_int(decode_evictable_tokens)}/{fmt_int(decode_protected_tokens)}"),
+                ("host_used/total", fmt_used_total_pct(decode_hicache_host_used_tokens, decode_hicache_host_total_tokens)),
+                ("host_usage", color_high_bad(decode_hicache_host_ratio if decode_hicache_host_ratio is None else decode_hicache_host_ratio*100.0, fmt_pct(decode_hicache_host_ratio), warn=70.0, bad=90.0, enabled=use_color)),
+            ]
+        )
+    )
 
     lines.append(
         f"{colorize('ROUTER', 'accent', use_color)} "
@@ -574,6 +631,7 @@ def render_status(
             ]
         )
     )
+
 
     lines.extend(gpu_lines)
     lines.append(system_summary)
@@ -629,10 +687,23 @@ def render_status_single(
     server_kv_used = metric_value(server, "sglang:num_used_tokens")
     server_kv_max = metric_value(server, "sglang:max_total_num_tokens")
     server_cache_hit = metric_value(server, "sglang:cache_hit_rate")
+    server_full_token_usage = metric_value(server, "sglang:full_token_usage")
+    server_available_tokens = metric_value(server, "sglang:available_tokens")
+    server_evictable_tokens = metric_value(server, "sglang:evictable_tokens")
+    server_protected_tokens = metric_value(server, "sglang:protected_tokens")
+    server_hicache_host_used_tokens = metric_value(server, "sglang:hicache_host_used_tokens")
+    server_hicache_host_total_tokens = metric_value(server, "sglang:hicache_host_total_tokens")
 
     server_kv_ratio = (
         (server_kv_used / server_kv_max)
         if server_kv_used is not None and server_kv_max is not None and server_kv_max > 0
+        else None
+    )
+    server_hicache_host_ratio = (
+        (server_hicache_host_used_tokens / server_hicache_host_total_tokens)
+        if server_hicache_host_used_tokens is not None
+        and server_hicache_host_total_tokens is not None
+        and server_hicache_host_total_tokens > 0
         else None
     )
 
@@ -689,11 +760,12 @@ def render_status_single(
         "features: "
         + " | ".join(
             [
-                f"server_hicache={server_hicache_text}",
-                f"server_l3_storage={server_l3_text}",
+                f"server_hicache_l2={server_hicache_text}",
+                f"server_hicache_l3={server_l3_text}",
             ]
         )
     )
+    lines.append("legend: hicache_l2=host memory tier, hicache_l3=storage tier")
     lines.append(colorize("-" * 118, "muted", use_color))
 
     lines.append(
@@ -722,6 +794,19 @@ def render_status_single(
                 ("cache_hit", color_high_good(server_cache_hit, fmt_pct(server_cache_hit), warn=0.50, good=0.80, enabled=use_color)),
                 ("TTFT_mean", color_high_bad(server_ttft_ms, f'{fmt_float(server_ttft_ms, 2)}ms', warn=800.0, bad=2000.0, enabled=use_color)),
                 ("TBT_mean", color_high_bad(server_tbt_ms, f'{fmt_float(server_tbt_ms, 2)}ms', warn=60.0, bad=120.0, enabled=use_color)),
+            ],
+            label_width=11,
+        )
+    )
+
+    lines.append(
+        "        "
+        + metric_row(
+            [
+                ("full_usage", color_high_bad(server_full_token_usage if server_full_token_usage is None else server_full_token_usage*100.0, fmt_pct(server_full_token_usage), warn=70.0, bad=90.0, enabled=use_color)),
+                ("avail/evict/prot", f"{fmt_int(server_available_tokens)}/{fmt_int(server_evictable_tokens)}/{fmt_int(server_protected_tokens)}"),
+                ("host_used/total", fmt_used_total_pct(server_hicache_host_used_tokens, server_hicache_host_total_tokens)),
+                ("host_usage", color_high_bad(server_hicache_host_ratio if server_hicache_host_ratio is None else server_hicache_host_ratio*100.0, fmt_pct(server_hicache_host_ratio), warn=70.0, bad=90.0, enabled=use_color)),
             ],
             label_width=11,
         )

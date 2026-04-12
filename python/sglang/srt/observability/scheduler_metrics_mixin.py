@@ -339,6 +339,7 @@ class SchedulerMetricsMixin:
             # Others
             self.calculate_utilization()
             self.update_lora_metrics()
+            self._update_token_pool_breakdown_stats()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
@@ -555,6 +556,7 @@ class SchedulerMetricsMixin:
             # Others
             self.calculate_utilization()
             self.update_lora_metrics()
+            self._update_token_pool_breakdown_stats()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
@@ -603,6 +605,53 @@ class SchedulerMetricsMixin:
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
+
+    def _update_token_pool_breakdown_stats(self: Scheduler):
+        """Populate available/evictable/protected token breakdown metrics.
+
+        Notes:
+        - For non-hybrid pools, values come directly from _get_token_info().
+        - For SWA/Mamba hybrid pools, we use the tighter(min) capacity view across
+          participating pools so numbers remain bounded by max_total_num_tokens.
+        """
+        if self.is_hybrid_swa:
+            (
+                _full_num_used,
+                _swa_num_used,
+                _full_tok,
+                _swa_tok,
+                full_available_size,
+                full_evictable_size,
+                swa_available_size,
+                swa_evictable_size,
+            ) = self._get_swa_token_info()
+            available_tokens = min(full_available_size, swa_available_size)
+            evictable_tokens = min(full_evictable_size, swa_evictable_size)
+        elif self.is_hybrid_ssm:
+            (
+                _full_num_used,
+                _mamba_num_used,
+                _full_tok,
+                _mamba_tok,
+                full_available_size,
+                full_evictable_size,
+                mamba_available_size,
+                mamba_evictable_size,
+            ) = self._get_mamba_token_info()
+            available_tokens = min(full_available_size, mamba_available_size)
+            evictable_tokens = min(full_evictable_size, mamba_evictable_size)
+        else:
+            _num_used, _tok_usage, available_tokens, evictable_tokens = self._get_token_info()
+
+        available_tokens = int(max(0, available_tokens))
+        evictable_tokens = int(max(0, evictable_tokens))
+        protected_tokens = int(
+            max(0, self.max_total_num_tokens - available_tokens - evictable_tokens)
+        )
+
+        self.stats.available_tokens = available_tokens
+        self.stats.evictable_tokens = evictable_tokens
+        self.stats.protected_tokens = protected_tokens
 
     def _log_hicache_stats(self: Scheduler):
         """Populate HiCache host-tier stats on self.stats.

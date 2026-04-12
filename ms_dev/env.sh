@@ -4,8 +4,8 @@
 export SGLANG_SERVER_HICACHE_ENABLE=0
 
 # Important: turning on/off Hicache and offload in PD mode. 0 means disabled, 1 means enabled.
-export SGLANG_PD_PREFILL_HICACHE_ENABLE=0 
-export SGLANG_PD_DECODE_OFFLOAD_ENABLE=1
+export SGLANG_PD_PREFILL_HICACHE_ENABLE=1 
+export SGLANG_PD_DECODE_OFFLOAD_ENABLE=0
 
 # Paths
 export SGLANG_REPO_ROOT="/workspace/sglang"
