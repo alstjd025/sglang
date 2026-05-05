@@ -1,0 +1,4 @@
+{
+  "ts": "2026-05-05T15:55:41.195+09:00",
+  "error": "timeout waiting for http://127.0.0.1:31000. last_error=<urlopen error [Errno 111] Connection refused>"
+}

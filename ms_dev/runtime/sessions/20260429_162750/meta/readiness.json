@@ -1,0 +1,6 @@
+{
+  "ts": "2026-04-29T07:30:20.649Z",
+  "readiness": {
+    "server": "/metrics"
+  }
+}

@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+
+# Single-server profile (no PD disaggregation).
+# Sourced by sglang_start_server*.sh via lib_sglang_server.sh -> env.sh.
+
+if [[ -z "${SGLANG_REPO_ROOT:-}" ]]; then
+  _ENV_SINGLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  source "${_ENV_SINGLE_DIR}/env.common.sh"
+fi
+
+# Tensor parallelism for the single server (single mode only).
+export SGLANG_TP_SIZE="${SGLANG_TP_SIZE:-4}"
+
+# Runtime dirs
+export SGLANG_REQUEST_LOG_DIR="${SGLANG_REQUEST_LOG_DIR:-${SGLANG_RUNTIME_DIR}/request_logs}"
+export SGLANG_REQUEST_METRICS_DIR="${SGLANG_REQUEST_METRICS_DIR:-${SGLANG_RUNTIME_DIR}/request_metrics}"
+export SGLANG_CRASH_DUMP_DIR="${SGLANG_CRASH_DUMP_DIR:-${SGLANG_RUNTIME_DIR}/crash_dump}"
+
+# HiCache on single server. 0=disabled, 1=enabled.
+export SGLANG_SERVER_HICACHE_ENABLE="${SGLANG_SERVER_HICACHE_ENABLE:-1}"
+export SGLANG_SERVER_HICACHE_STORAGE_BACKEND="${SGLANG_SERVER_HICACHE_STORAGE_BACKEND:-}"
+export SGLANG_SERVER_HICACHE_PREFETCH_POLICY="${SGLANG_SERVER_HICACHE_PREFETCH_POLICY:-timeout}"
+export SGLANG_SERVER_HICACHE_WRITE_POLICY="${SGLANG_SERVER_HICACHE_WRITE_POLICY:-write_back}"
+export SGLANG_SERVER_HICACHE_IO_BACKEND="${SGLANG_SERVER_HICACHE_IO_BACKEND:-kernel}"
+export SGLANG_SERVER_HICACHE_MEM_LAYOUT="${SGLANG_SERVER_HICACHE_MEM_LAYOUT:-page_first}"
+export SGLANG_SERVER_HICACHE_RATIO="${SGLANG_SERVER_HICACHE_RATIO:-2}"
+export SGLANG_SERVER_HICACHE_SIZE="${SGLANG_SERVER_HICACHE_SIZE:-200}" # in GB; 0 = auto
+export SGLANG_SERVER_ENABLE_CACHE_REPORT="${SGLANG_SERVER_ENABLE_CACHE_REPORT:-1}"
+
+mkdir -p "${SGLANG_REQUEST_LOG_DIR}"
+mkdir -p "${SGLANG_REQUEST_METRICS_DIR}"
+mkdir -p "${SGLANG_CRASH_DUMP_DIR}"
