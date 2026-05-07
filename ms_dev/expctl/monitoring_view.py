@@ -241,6 +241,8 @@ def detect_runtime_feature_flags(
         "server_admission_dry_run": None,
         "server_admission_ttft_slo_ms": None,
         "server_admission_tbt_slo_ms": None,
+        "server_admission_ttft_slo_ratio": None,
+        "server_admission_tbt_slo_ratio": None,
     }
 
     if enabled_roles.get("prefill", False):
@@ -265,15 +267,26 @@ def detect_runtime_feature_flags(
         states["server_l3"] = detect_launch_flag(
             process_log_dir, "server", "--hicache-storage-backend"
         )
-        ttft = detect_launch_arg(
+        ttft_ms = detect_launch_arg(
             process_log_dir, "server", "--admission-ttft-slo-ms"
         )
-        tbt = detect_launch_arg(
+        tbt_ms = detect_launch_arg(
             process_log_dir, "server", "--admission-tbt-slo-ms"
         )
-        states["server_admission_ttft_slo_ms"] = ttft  # type: ignore[assignment]
-        states["server_admission_tbt_slo_ms"] = tbt  # type: ignore[assignment]
-        states["server_admission"] = (ttft is not None) or (tbt is not None)
+        ttft_ratio = detect_launch_arg(
+            process_log_dir, "server", "--admission-ttft-slo-ratio"
+        )
+        tbt_ratio = detect_launch_arg(
+            process_log_dir, "server", "--admission-tbt-slo-ratio"
+        )
+        states["server_admission_ttft_slo_ms"] = ttft_ms  # type: ignore[assignment]
+        states["server_admission_tbt_slo_ms"] = tbt_ms  # type: ignore[assignment]
+        states["server_admission_ttft_slo_ratio"] = ttft_ratio  # type: ignore[assignment]
+        states["server_admission_tbt_slo_ratio"] = tbt_ratio  # type: ignore[assignment]
+        # Active iff at least one absolute or ratio SLO flag is present.
+        states["server_admission"] = any(
+            v is not None for v in (ttft_ms, tbt_ms, ttft_ratio, tbt_ratio)
+        )
         states["server_admission_dry_run"] = detect_launch_flag(
             process_log_dir, "server", "--admission-dry-run"
         )
@@ -319,6 +332,10 @@ def admission_state_text(
 
     Phase A: only the single-server `server` role exposes a meaningful state.
     PD prefill/decode get N/A because the controller is bypassed.
+
+    Active criteria are derived from any of:
+      --admission-ttft-slo-ms, --admission-tbt-slo-ms (absolute caps)
+      --admission-ttft-slo-ratio, --admission-tbt-slo-ratio (slowdown bounds)
     """
     if not role_enabled:
         return colorize("N/A", "muted", use_color)
@@ -331,19 +348,33 @@ def admission_state_text(
     if not enabled:
         return colorize("OFF", "muted", use_color)
 
-    ttft_raw = feature_states.get("server_admission_ttft_slo_ms")
-    tbt_raw = feature_states.get("server_admission_tbt_slo_ms")
+    ttft_ms = feature_states.get("server_admission_ttft_slo_ms")
+    tbt_ms = feature_states.get("server_admission_tbt_slo_ms")
+    ttft_ratio = feature_states.get("server_admission_ttft_slo_ratio")
+    tbt_ratio = feature_states.get("server_admission_tbt_slo_ratio")
+
+    def _fmt_ms(v):
+        try:
+            f = float(v)
+            return f"{f/1000.0:g}s" if f >= 1000.0 else f"{f:g}ms"
+        except (TypeError, ValueError):
+            return str(v)
+
+    def _fmt_ratio(v):
+        try:
+            return f"{float(v):g}x"
+        except (TypeError, ValueError):
+            return str(v)
+
     parts: List[str] = []
-    try:
-        if ttft_raw is not None:
-            parts.append(f"ttft={float(ttft_raw)/1000.0:g}s")
-    except (TypeError, ValueError):
-        parts.append(f"ttft={ttft_raw}")
-    try:
-        if tbt_raw is not None:
-            parts.append(f"tbt={float(tbt_raw):g}ms")
-    except (TypeError, ValueError):
-        parts.append(f"tbt={tbt_raw}")
+    if ttft_ms is not None:
+        parts.append(f"ttft={_fmt_ms(ttft_ms)}")
+    if ttft_ratio is not None:
+        parts.append(f"ttft_ratio={_fmt_ratio(ttft_ratio)}")
+    if tbt_ms is not None:
+        parts.append(f"tbt={_fmt_ms(tbt_ms)}")
+    if tbt_ratio is not None:
+        parts.append(f"tbt_ratio={_fmt_ratio(tbt_ratio)}")
 
     suffix = (" " + " ".join(parts)) if parts else ""
     if feature_states.get("server_admission_dry_run"):
