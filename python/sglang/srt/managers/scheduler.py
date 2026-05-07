@@ -79,6 +79,15 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.admission_control import (
+    AdmissionConfig,
+    AdmissionController,
+    AdmissionDecision,
+    SchedulerSnapshot,
+    TBTEwmaTracker,
+    try_load_prefill_cost_model,
+    try_load_tbt_cost_model,
+)
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -184,9 +193,10 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -481,6 +491,9 @@ class Scheduler(
 
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
+
+        # Init admission control — see managers/admission_control/CLAUDE.md
+        self.init_admission_control()
 
         self.is_initializing = False
 
@@ -1168,6 +1181,38 @@ class Scheduler(
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
+
+    def init_admission_control(self):
+        """Initialize the admission controller — see managers/admission_control/CLAUDE.md."""
+        sa = self.server_args
+        config = AdmissionConfig(
+            ttft_slo_ms=sa.admission_ttft_slo_ms,
+            tbt_slo_ms=sa.admission_tbt_slo_ms,
+            tbt_ewma_alpha=sa.admission_tbt_ewma_alpha,
+            tbt_warm_up_steps=sa.admission_tbt_warm_up_steps,
+            tbt_reactive_ratio=sa.admission_tbt_reactive_ratio,
+            dry_run=sa.admission_dry_run,
+        )
+        if not config.any_stage_enabled:
+            self.admission_controller: Optional[AdmissionController] = None
+            return
+
+        prefill_cost = try_load_prefill_cost_model(sa.admission_prefill_cost_model_path)
+        tbt_cost = try_load_tbt_cost_model(sa.admission_tbt_cost_model_path)
+        tbt_tracker = (
+            TBTEwmaTracker(
+                alpha=config.tbt_ewma_alpha,
+                warm_up_steps=config.tbt_warm_up_steps,
+            )
+            if config.stage2_3_enabled
+            else None
+        )
+        self.admission_controller = AdmissionController(
+            config=config,
+            prefill_cost=prefill_cost,
+            tbt_cost=tbt_cost,
+            tbt_tracker=tbt_tracker,
+        )
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
@@ -2184,6 +2229,9 @@ class Scheduler(
                 return
             if self._abort_on_queued_limit(req):
                 return
+            # admission control — see managers/admission_control/CLAUDE.md
+            if self._abort_on_predicted_slo_violation(req):
+                return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
@@ -2275,6 +2323,112 @@ class Scheduler(
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
+
+    def _build_admission_snapshot(self) -> SchedulerSnapshot:
+        """Construct the read-only state view consumed by AdmissionController."""
+        # Sum of cached predicted prefill ms across already-queued requests.
+        queue_ms = 0.0
+        for r in self.waiting_queue:
+            queue_ms += getattr(r, "_predicted_prefill_ms", 0.0)
+
+        bs = len(self.running_batch.reqs) if not self.running_batch.is_empty() else 0
+        kv = 0
+        if bs:
+            for r in self.running_batch.reqs:
+                # origin_input_ids + output_ids approximates total KV occupancy
+                # for this request regardless of forward_mode (extend/decode).
+                kv += len(r.origin_input_ids) + len(r.output_ids)
+
+        return SchedulerSnapshot(
+            waiting_queue_predicted_prefill_ms=queue_ms,
+            running_batch_size=bs,
+            running_batch_total_kv_tokens=kv,
+            disaggregation_mode_is_null=(
+                self.disaggregation_mode == DisaggregationMode.NULL
+            ),
+        )
+
+    def _admission_match_prefix_len(self, req: Req) -> int:
+        """Best-effort prefix-cache lookup for admission TTFT prediction.
+
+        Returns 0 (conservative — predicts longer TTFT, more rejects) if the
+        cache cannot service a lookup at this point in the request lifecycle.
+        """
+        try:
+            key = RadixKey(
+                token_ids=req.origin_input_ids,
+                extra_key=getattr(req, "extra_key", None),
+            )
+            result = self.tree_cache.match_prefix(MatchPrefixParams(key=key))
+            return int(len(result.device_indices))
+        except Exception as e:  # noqa: BLE001 — admission must never crash request path
+            logger.debug("admission control: match_prefix failed (%s); using 0", e)
+            return 0
+
+    def _abort_on_predicted_slo_violation(self, recv_req: Req) -> bool:
+        """Run the admission controller and reject with HTTP 429 on violation.
+
+        Returns True iff the incoming request was rejected. Mirrors the
+        contract of _abort_on_queued_limit. See
+        managers/admission_control/CLAUDE.md for the policy.
+        """
+        controller = getattr(self, "admission_controller", None)
+        if controller is None or not controller.is_active():
+            return False
+
+        snapshot = self._build_admission_snapshot()
+        prefix_len = self._admission_match_prefix_len(recv_req)
+        decision: AdmissionDecision = controller.decide(
+            prompt_len=len(recv_req.origin_input_ids),
+            prefix_match_len=prefix_len,
+            snapshot=snapshot,
+        )
+
+        # Echo the prediction back onto the request so the next admission's
+        # t_queue can include it.
+        recv_req._predicted_prefill_ms = decision.predicted_prefill_ms
+
+        if decision.admit:
+            if decision.dry_run_would_reject:
+                logger.info(
+                    "[admission/dry-run] WOULD_REJECT rid=%s reason=%s "
+                    "pred_ttft=%.1fms pred_tbt=%s ewma_tbt=%s",
+                    recv_req.rid,
+                    decision.reason,
+                    decision.predicted_ttft_ms or 0.0,
+                    f"{decision.predicted_tbt_ms:.1f}ms"
+                    if decision.predicted_tbt_ms is not None
+                    else "n/a",
+                    f"{decision.tbt_ewma_ms:.1f}ms"
+                    if decision.tbt_ewma_ms is not None
+                    else "n/a",
+                )
+            return False
+
+        message = (
+            f"Admission rejected: {decision.reason} "
+            f"(predicted_ttft={decision.predicted_ttft_ms}ms "
+            f"predicted_tbt={decision.predicted_tbt_ms}ms "
+            f"ewma_tbt={decision.tbt_ewma_ms}ms "
+            f"ttft_slo={decision.ttft_slo_ms}ms tbt_slo={decision.tbt_slo_ms}ms)"
+        )
+        logger.info("[admission] REJECT rid=%s %s", recv_req.rid, message)
+        self.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.TOO_MANY_REQUESTS,
+                    "message": message,
+                    "admission_reason": decision.reason,
+                },
+                rid=recv_req.rid,
+            ),
+            recv_req,
+        )
+        recv_req.time_stats.trace_ctx.abort(
+            abort_info={"reason": message, "admission_reason": decision.reason}
+        )
+        return True
 
     def _abort_on_waiting_timeout(self):
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:

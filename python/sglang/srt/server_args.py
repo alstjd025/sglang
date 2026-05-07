@@ -361,6 +361,16 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
+    # Admission control (Mooncake-style predictive SLO admission).
+    # See managers/admission_control/CLAUDE.md.
+    admission_ttft_slo_ms: Optional[float] = None
+    admission_tbt_slo_ms: Optional[float] = None
+    admission_prefill_cost_model_path: Optional[str] = None
+    admission_tbt_cost_model_path: Optional[str] = None
+    admission_tbt_ewma_alpha: float = 0.1
+    admission_tbt_warm_up_steps: int = 100
+    admission_tbt_reactive_ratio: float = 0.9
+    admission_dry_run: bool = False
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
@@ -4500,6 +4510,55 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_queued_requests,
             help="The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
+        )
+        # Admission control flags — see managers/admission_control/CLAUDE.md
+        parser.add_argument(
+            "--admission-ttft-slo-ms",
+            type=float,
+            default=ServerArgs.admission_ttft_slo_ms,
+            help="Predictive admission control: reject incoming requests whose predicted TTFT (queue + this prefill) exceeds this value (ms). Unset = disabled. Requires --admission-prefill-cost-model-path.",
+        )
+        parser.add_argument(
+            "--admission-tbt-slo-ms",
+            type=float,
+            default=ServerArgs.admission_tbt_slo_ms,
+            help="Predictive admission control: reject when predicted TBT (current batch + this request) or recent EWMA TBT exceeds this value (ms). Unset = disabled.",
+        )
+        parser.add_argument(
+            "--admission-prefill-cost-model-path",
+            type=str,
+            default=ServerArgs.admission_prefill_cost_model_path,
+            help="Path to JSON cost model {alpha,beta,gamma} produced by tools/admission_control/fit_cost_model.py.",
+        )
+        parser.add_argument(
+            "--admission-tbt-cost-model-path",
+            type=str,
+            default=ServerArgs.admission_tbt_cost_model_path,
+            help="Path to JSON TBT cost model {a,b,c} produced by tools/admission_control/fit_cost_model.py.",
+        )
+        parser.add_argument(
+            "--admission-tbt-ewma-alpha",
+            type=float,
+            default=ServerArgs.admission_tbt_ewma_alpha,
+            help="EWMA smoothing factor for the reactive TBT safety net (0,1].",
+        )
+        parser.add_argument(
+            "--admission-tbt-warm-up-steps",
+            type=int,
+            default=ServerArgs.admission_tbt_warm_up_steps,
+            help="Decode steps required before the reactive TBT EWMA gate is active.",
+        )
+        parser.add_argument(
+            "--admission-tbt-reactive-ratio",
+            type=float,
+            default=ServerArgs.admission_tbt_reactive_ratio,
+            help="Reactive EWMA threshold = tbt_slo_ms * this ratio.",
+        )
+        parser.add_argument(
+            "--admission-dry-run",
+            action="store_true",
+            default=ServerArgs.admission_dry_run,
+            help="Compute admission decisions and log/expose them but always admit. Use to tune SLOs against real traffic before enforcement.",
         )
         parser.add_argument(
             "--max-total-tokens",
