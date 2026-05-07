@@ -58,6 +58,12 @@ export MC_TCP_ENABLE_CONNECTION_POOL="${MC_TCP_ENABLE_CONNECTION_POOL:-1}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${SGLANG_RUNTIME_DIR}/cache/triton}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${SGLANG_RUNTIME_DIR}/cache/torchinductor}"
 
+# sglang's numa-bind v2 (default True since 0.5.x) writes a numactl wrapper
+# script into /tmp and points multiprocessing.spawn at it. With /tmp mounted
+# noexec, every spawned scheduler/detokenizer dies silently with exit 255 and
+# no traceback. Disable v2 to fall back to in-process libnuma binding.
+export SGLANG_NUMA_BIND_V2="${SGLANG_NUMA_BIND_V2:-0}"
+
 mkdir -p "${SGLANG_RUNTIME_DIR}"
 mkdir -p "${HF_HOME}"
 mkdir -p "${HF_HUB_CACHE}"

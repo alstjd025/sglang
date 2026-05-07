@@ -276,3 +276,6 @@ sgl-kernel/csrc/**/*_musa/
 *.ply
 *.npz
 artifacts/
+
+# ms_dev runtime artifacts (session logs, torchinductor/triton caches, crash dumps)
+ms_dev/runtime/

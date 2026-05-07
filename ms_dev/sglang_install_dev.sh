@@ -27,8 +27,9 @@ echo "[install_dev] upgrading pip..."
 "${PIP_BIN}" install --upgrade pip
 
 echo "[install_dev] installing system build dependencies..."
-apt-get update
-apt-get install -y --no-install-recommends \
+GCSUDO="${GCSUDO:-/engrid/ensh/gpubin/ctn_gcsudo}"
+"${GCSUDO}" apt-get update
+"${GCSUDO}" apt-get install -y --no-install-recommends \
   curl \
   build-essential \
   pkg-config \
@@ -39,7 +40,10 @@ apt-get install -y --no-install-recommends \
 
 echo "[install_dev] installing rustup + recent stable Rust..."
 if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
-  curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+  # /tmp may be mounted noexec on some hosts; stage rustup-init under $HOME instead.
+  RUSTUP_TMPDIR="${HOME}/.cache/sglang-rustup-tmp"
+  mkdir -p "${RUSTUP_TMPDIR}"
+  TMPDIR="${RUSTUP_TMPDIR}" curl https://sh.rustup.rs -sSf | TMPDIR="${RUSTUP_TMPDIR}" sh -s -- -y --profile minimal
 fi
 
 source "$HOME/.cargo/env"
