@@ -28,51 +28,76 @@ Produces JSON consumable by `--admission-prefill-cost-model-path` and `--admissi
 
 ### Method (prefill)
 
-For each (prompt_len, prefix_ratio) combination:
+For each (n, p) cell:
 
-1. Build a long enough "warm-up" prompt of `prompt_len * prefix_ratio` tokens, send a
-   throwaway request to populate the radix cache.
-2. Build a "measure" prompt = warm-up tokens + fresh suffix to total `prompt_len`.
-3. POST to `/generate` with `max_new_tokens=1`. Use streaming response to extract the
-   timestamp of the first generated token; subtract send time = TTFT (≈ T_prefill when
-   queue is empty).
-4. Repeat ≥3 times per cell, take the median.
+1. (Optional) `POST /flush_cache` to start with an empty radix cache.
+2. Generate `p` random token ids, send as a warm-up request with
+   `max_new_tokens=1`. SGLang inserts the prefix into the radix cache.
+3. Build the measure prompt = warm-up ids + `n - p` fresh random ids.
+4. POST to `/generate` with `max_new_tokens=1`, `stream=true`. Time the wall
+   clock from request send to first SSE chunk = TTFT ≈ T_prefill when the
+   server is idle.
+5. Validate: response's `meta_info.cached_tokens` should match `p` (modulo
+   page-size rounding). The script logs a WARN if they diverge.
+6. Repeat `--repeats` times per cell.
 
-Run `numpy.polyfit(d, t, deg=2)` over collected `(d, t)` samples.
+Then `numpy.polyfit(d, t, deg=2)` over all `(d=n-p, t=ttft_ms)` samples
+fits α, β, γ. Pure-Python fallback is included so the tool works without
+numpy.
+
+The default grid covers d ∈ {0, 128, 256, 512, 1k, 2k, 4k, 8k, 16k} at three
+prefix sizes (0, 8k, 32k) — chosen from the production distribution
+(d median ~1.5k, p99 ~12k; cache hit ratio median 93-96%).
 
 ### Method (TBT)
 
-For each (target_batch_size, kv_total) combination:
+For each (batch_size, prompt_len) cell:
 
-1. Submit `target_batch_size` long-running requests with `max_new_tokens` large enough
-   to span the measurement window, so the running batch size stabilizes.
-2. Wait for the running batch to reach the target (poll `/get_server_info`).
-3. Sample TBT for ≥30 decode steps (extract from request streaming intervals or from
-   `step_time_dict` via internal-state endpoint).
-4. Median over samples.
+1. Build `batch_size` distinct random prompts of length `prompt_len`. Distinct
+   contents prevent the radix cache from collapsing them into one entry.
+2. Open `batch_size` concurrent streaming `/generate` calls in a thread pool,
+   each with `max_new_tokens = warmup_tokens + measure_tokens`.
+3. Per stream, time the inter-chunk intervals. Discard the first
+   `warmup_tokens` (covers initial prefill + decode ramp-up) and keep the
+   next `measure_tokens` intervals.
+4. Across all streams, take the median of all retained intervals as the
+   cell's TBT estimate. `total_kv ≈ batch_size * prompt_len` is the cell's
+   KV occupancy proxy at decode start.
 
-Linear fit: `TBT = a + b·bs + c·kv` via `numpy.linalg.lstsq`.
+Linear fit `TBT = a + b·bs + c·kv` via `numpy.linalg.lstsq` (or pure-Python
+normal equations as fallback). Caveat: TBT depends on more than just (bs,
+kv) — quantization, attention backend, sequence length distribution within
+the batch all matter — so re-fit when any of those change.
 
 ### Usage
 
+The actual CLI uses **subcommands** `prefill` and `tbt`, not `--target`. Defaults
+target the user's production workload (Llama-3.3-70B, agent-style traces with
+median prompt 18-30k tokens, 93-96% cache hit ratio, d=n-p median ~1500).
+
 ```bash
-# Prefill cost model
-python tools/admission_control/fit_cost_model.py \
+# Prefill cost model (uses production-tuned default grid)
+python tools/admission_control/fit_cost_model.py prefill \
     --server http://localhost:31000 \
-    --target prefill \
-    --prompt-lens 128 512 1024 2048 4096 8192 16384 \
-    --prefix-ratios 0.0 0.5 0.9 \
-    --repeats 3 \
     --output ms_dev/runtime/cost_models/prefill_llama3-70b.json
 
-# TBT cost model (do this on a separate run; needs no concurrent traffic)
-python tools/admission_control/fit_cost_model.py \
+# Override grid:
+python tools/admission_control/fit_cost_model.py prefill \
     --server http://localhost:31000 \
-    --target tbt \
+    --output prefill.json \
+    --n-list 100 500 1000 2000 4000 8000 16000 \
+    --p-list 0 1000 4000 \
+    --repeats 3 \
+    --flush-each
+
+# TBT cost model — runs concurrent batches in-process; no other traffic should
+# hit the server during this run.
+python tools/admission_control/fit_cost_model.py tbt \
+    --server http://localhost:31000 \
+    --output ms_dev/runtime/cost_models/tbt_llama3-70b.json \
     --batch-sizes 1 4 8 16 32 \
-    --kv-totals 1024 4096 16384 65536 \
-    --warmup-steps 10 --measure-steps 30 \
-    --output ms_dev/runtime/cost_models/tbt_llama3-70b.json
+    --prompt-lens 1024 4096 16384 \
+    --warmup-tokens 10 --measure-tokens 30
 ```
 
 ### Output location convention
