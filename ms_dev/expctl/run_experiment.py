@@ -353,6 +353,51 @@ def main() -> int:
     metrics_dir.mkdir(parents=True, exist_ok=True)
     meta_dir.mkdir(parents=True, exist_ok=True)
 
+    # ------------------------------------------------------------------
+    # Admission control (Mooncake-style predictive SLO admission).
+    # See ms_dev/admission_control_description.md.
+    # ------------------------------------------------------------------
+    # Detect whether any SLO is set in the parent shell environment.
+    admission_env_keys = (
+        "SGLANG_ADMISSION_TTFT_SLO_MS",
+        "SGLANG_ADMISSION_TBT_SLO_MS",
+        "SGLANG_ADMISSION_TTFT_SLO_RATIO",
+        "SGLANG_ADMISSION_TBT_SLO_RATIO",
+        "SGLANG_ADMISSION_PREFILL_COST_MODEL",
+        "SGLANG_ADMISSION_TBT_COST_MODEL",
+        "SGLANG_ADMISSION_TBT_EWMA_ALPHA",
+        "SGLANG_ADMISSION_TBT_REACTIVE_RATIO",
+        "SGLANG_ADMISSION_DRY_RUN",
+        "SGLANG_ADMISSION_DECISION_LOG",
+    )
+    admission_config_snapshot = {
+        k: os.environ[k] for k in admission_env_keys if os.environ.get(k)
+    }
+    admission_enabled = any(
+        admission_config_snapshot.get(k)
+        for k in (
+            "SGLANG_ADMISSION_TTFT_SLO_MS",
+            "SGLANG_ADMISSION_TBT_SLO_MS",
+            "SGLANG_ADMISSION_TTFT_SLO_RATIO",
+            "SGLANG_ADMISSION_TBT_SLO_RATIO",
+        )
+    )
+    # Auto-route the decision-log path into the session folder when the user
+    # didn't pin one explicitly. The DecisionLogger creates parent dirs itself.
+    admission_decision_log_path: Optional[Path] = None
+    if admission_enabled:
+        if admission_config_snapshot.get("SGLANG_ADMISSION_DECISION_LOG"):
+            admission_decision_log_path = Path(
+                admission_config_snapshot["SGLANG_ADMISSION_DECISION_LOG"]
+            )
+        else:
+            admission_decision_log_path = (
+                session_dir / "admission_decisions.jsonl"
+            )
+            admission_config_snapshot["SGLANG_ADMISSION_DECISION_LOG"] = str(
+                admission_decision_log_path
+            )
+
     sglang_exact = [
         "sglang:gen_throughput",
         "sglang:num_running_reqs",
@@ -510,6 +555,11 @@ def main() -> int:
                 "SGLANG_CRASH_DUMP_DIR": str(role_dir(crash_dump_root, "server")),
             }
         }
+        # Auto-route admission decision log into the session folder.
+        if admission_enabled and admission_decision_log_path is not None:
+            launch_env_overrides["server"]["SGLANG_ADMISSION_DECISION_LOG"] = str(
+                admission_decision_log_path
+            )
 
     if args.cleanup_extra_ports.strip():
         for item in args.cleanup_extra_ports.split(","):
@@ -593,6 +643,18 @@ def main() -> int:
         "network": network_meta,
         "paths": session_paths,
         "launch_env_overrides": launch_env_overrides,
+        # Snapshot of SGLANG_ADMISSION_* env vars active at session start.
+        # See ms_dev/admission_control_description.md.
+        "admission_config": {
+            "enabled": admission_enabled,
+            "applied_in_mode": admission_enabled and mode == "single",
+            "env": admission_config_snapshot,
+            "decision_log_path": (
+                str(admission_decision_log_path)
+                if admission_decision_log_path is not None
+                else None
+            ),
+        },
     }
     (meta_dir / "run_meta.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
 
