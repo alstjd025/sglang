@@ -84,6 +84,7 @@ from sglang.srt.managers.admission_control import (
     AdmissionController,
     AdmissionDecision,
     AdmissionMetrics,
+    DecisionLogger,
     SchedulerSnapshot,
     TBTEwmaTracker,
     try_load_prefill_cost_model,
@@ -1197,6 +1198,7 @@ class Scheduler(
         if not config.any_stage_enabled:
             self.admission_controller: Optional[AdmissionController] = None
             self.admission_metrics: Optional[AdmissionMetrics] = None
+            self.admission_decision_logger: Optional[DecisionLogger] = None
             return
 
         prefill_cost = try_load_prefill_cost_model(sa.admission_prefill_cost_model_path)
@@ -1225,6 +1227,15 @@ class Scheduler(
             )
         else:
             self.admission_metrics = None
+
+        # Per-decision JSONL log (Step 9 — replay tool input).
+        # Gate on attn_tp_rank == 0 so a TP=N deployment doesn't write N
+        # duplicate rows per decision. The same gate applies to AdmissionMetrics
+        # via metrics_collector existence (only the stats-logging rank has one).
+        if sa.admission_decision_log and getattr(self, "attn_tp_rank", 0) == 0:
+            self.admission_decision_logger = DecisionLogger(sa.admission_decision_log)
+        else:
+            self.admission_decision_logger = None
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
@@ -2404,6 +2415,17 @@ class Scheduler(
         metrics = getattr(self, "admission_metrics", None)
         if metrics is not None:
             metrics.record_decision(decision)
+
+        # JSONL decision log for offline replay/SLO tuning.
+        decision_logger = getattr(self, "admission_decision_logger", None)
+        if decision_logger is not None and decision_logger.enabled:
+            decision_logger.record(
+                rid=recv_req.rid,
+                decision=decision,
+                prompt_len=len(recv_req.origin_input_ids),
+                prefix_len=prefix_len,
+                snapshot=snapshot,
+            )
 
         if decision.admit:
             if decision.dry_run_would_reject:

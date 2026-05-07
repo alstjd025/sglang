@@ -371,6 +371,7 @@ class ServerArgs:
     admission_tbt_warm_up_steps: int = 100
     admission_tbt_reactive_ratio: float = 0.9
     admission_dry_run: bool = False
+    admission_decision_log: Optional[str] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
@@ -4559,6 +4560,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.admission_dry_run,
             help="Compute admission decisions and log/expose them but always admit. Use to tune SLOs against real traffic before enforcement.",
+        )
+        parser.add_argument(
+            "--admission-decision-log",
+            type=str,
+            default=ServerArgs.admission_decision_log,
+            help="Append every admission decision as a JSONL row to this path. Consumed by tools/admission_control/replay_admission.py.",
         )
         parser.add_argument(
             "--max-total-tokens",

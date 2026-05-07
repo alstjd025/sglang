@@ -30,6 +30,7 @@ from sglang.srt.managers.admission_control.cost_model import (
     try_load_prefill_cost_model,
     try_load_tbt_cost_model,
 )
+from sglang.srt.managers.admission_control.decision_log import DecisionLogger
 from sglang.srt.managers.admission_control.metrics import AdmissionMetrics
 from sglang.srt.managers.admission_control.tbt_tracker import TBTEwmaTracker
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -624,6 +625,132 @@ class TestAdmissionMetrics(unittest.TestCase):
         )
         self.assertEqual(admit_value, 1.0)
         self.assertEqual(reject_value, 2.0)
+
+
+class TestDecisionLogger(unittest.TestCase):
+    """JSONL persistence of admission decisions."""
+
+    def test_writes_jsonl_lines(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "decisions.jsonl"
+            log = DecisionLogger(path)
+            self.assertTrue(log.enabled)
+            decision = AdmissionDecision(
+                admit=False, reason=REASON_TTFT_PREDICTED,
+                predicted_ttft_ms=4500.0, ttft_slo_ms=2000.0,
+                predicted_prefill_ms=320.0, queue_predicted_ms=4180.0,
+            )
+            snap = SchedulerSnapshot(
+                waiting_queue_predicted_prefill_ms=4180.0,
+                running_batch_size=12,
+                running_batch_total_kv_tokens=145000,
+                disaggregation_mode_is_null=True,
+            )
+            log.record(rid="abc", decision=decision, prompt_len=18432,
+                       prefix_len=16384, snapshot=snap)
+            log.close()
+            content = path.read_text().strip().splitlines()
+            self.assertEqual(len(content), 1)
+            row = json.loads(content[0])
+            self.assertEqual(row["rid"], "abc")
+            self.assertFalse(row["admit"])
+            self.assertEqual(row["reason"], REASON_TTFT_PREDICTED)
+            self.assertEqual(row["prompt_len"], 18432)
+            self.assertEqual(row["prefix_len"], 16384)
+            self.assertEqual(row["running_batch_size"], 12)
+
+    def test_disabled_on_open_failure(self):
+        # /proc is read-only; the open should fail and the logger should
+        # disable itself rather than raise.
+        log = DecisionLogger("/proc/this/cannot/be/created.jsonl")
+        self.assertFalse(log.enabled)
+        # record() must not raise even when disabled.
+        log.record(
+            rid="x",
+            decision=AdmissionDecision(admit=True, reason=REASON_ADMIT),
+            prompt_len=0, prefix_len=0,
+            snapshot=SchedulerSnapshot(0.0, 0, 0, True),
+        )
+
+
+class TestReplayLogic(unittest.TestCase):
+    """Verifies the offline replay tool's policy reconstruction matches the
+    online controller. The replay module lives under tools/, so we import it
+    by relative path discovery rather than installation.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location(
+            "replay_admission",
+            repo / "tools" / "admission_control" / "replay_admission.py",
+        )
+        cls.replay = importlib.util.module_from_spec(spec)
+        # dataclass decorator needs the module visible in sys.modules.
+        sys.modules["replay_admission"] = cls.replay
+        spec.loader.exec_module(cls.replay)
+
+    def _row(self, **kw) -> "Any":
+        defaults = dict(
+            rid="r", ts=0.0, admit=True, reason=REASON_ADMIT,
+            dry_run_would_reject=False,
+            predicted_ttft_ms=None, predicted_tbt_ms=None,
+            tbt_ewma_ms=None, queue_predicted_ms=None,
+            ttft_slo_ms=None, tbt_slo_ms=None,
+            prompt_len=0, prefix_len=0,
+            running_batch_size=0, running_batch_total_kv_tokens=0,
+        )
+        defaults.update(kw)
+        return self.replay.DecisionRow(**defaults)
+
+    def test_disabled_passes_through(self):
+        row = self._row(reason=REASON_DISABLED)
+        verdict = self.replay.evaluate_row(row, 1000, 100, 0.9)
+        self.assertEqual(verdict, REASON_DISABLED)
+
+    def test_ttft_threshold_applied(self):
+        row = self._row(predicted_ttft_ms=1500.0, predicted_tbt_ms=10.0)
+        # SLO 2000 → admit; SLO 1000 → reject.
+        self.assertEqual(self.replay.evaluate_row(row, 2000, 100, 0.9), REASON_ADMIT)
+        self.assertEqual(
+            self.replay.evaluate_row(row, 1000, 100, 0.9), REASON_TTFT_PREDICTED
+        )
+
+    def test_tbt_predicted_priority(self):
+        # Stage 2 dominates Stage 3 when both would reject.
+        row = self._row(predicted_ttft_ms=10.0, predicted_tbt_ms=300.0, tbt_ewma_ms=400.0)
+        self.assertEqual(
+            self.replay.evaluate_row(row, 5000, 200, 0.9), REASON_TBT_PREDICTED
+        )
+
+    def test_tbt_reactive_when_predicted_passes(self):
+        row = self._row(predicted_ttft_ms=10.0, predicted_tbt_ms=20.0, tbt_ewma_ms=400.0)
+        self.assertEqual(
+            self.replay.evaluate_row(row, 5000, 200, 0.9), REASON_TBT_REACTIVE
+        )
+
+    def test_evaluate_slo_counts(self):
+        rows = [
+            self._row(predicted_ttft_ms=10.0),         # admit
+            self._row(predicted_ttft_ms=5000.0),       # rej_ttft
+            self._row(predicted_ttft_ms=10.0, predicted_tbt_ms=300.0),  # rej_tbt_p
+            self._row(predicted_ttft_ms=10.0, predicted_tbt_ms=20.0,
+                      tbt_ewma_ms=400.0),              # rej_tbt_r
+            self._row(reason=REASON_DISABLED),         # skipped
+        ]
+        out = self.replay.evaluate_slo(rows, 1000, 200, 0.9)
+        self.assertEqual(out.total, 5)
+        self.assertEqual(out.admit, 1)
+        self.assertEqual(out.rej_ttft, 1)
+        self.assertEqual(out.rej_tbt_pred, 1)
+        self.assertEqual(out.rej_tbt_react, 1)
+        self.assertEqual(out.skipped_disabled, 1)
+        self.assertAlmostEqual(out.reject_pct, 75.0)  # 3/(5-1) = 75%
 
 
 if __name__ == "__main__":

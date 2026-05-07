@@ -118,51 +118,66 @@ created by the fit script if missing.
 
 ## replay_admission.py
 
-Takes a JSONL decision log (from `--admission-dry-run` mode) and reports what *would*
-have been admitted/rejected under one or more candidate SLO settings.
+Takes a JSONL decision log (produced by `--admission-decision-log`) and reports what
+the policy would have decided under one or more candidate SLO settings. Lets you tune
+SLOs against real traffic before flipping enforcement on.
 
-Use this to tune SLOs against real traffic before turning admission control on for real.
+### Producing the input
+
+The scheduler appends one row per decision when `SGLANG_ADMISSION_DECISION_LOG` (or
+`--admission-decision-log`) is set. With `SGLANG_ADMISSION_DRY_RUN=1` you get a log
+where every reject is "would-have-rejected" — perfect for sweeping SLOs without
+actually losing requests.
+
+```bash
+export SGLANG_ADMISSION_TTFT_SLO_MS=2000
+export SGLANG_ADMISSION_TBT_SLO_MS=100
+export SGLANG_ADMISSION_PREFILL_COST_MODEL=ms_dev/runtime/cost_models/prefill_*.json
+export SGLANG_ADMISSION_TBT_COST_MODEL=ms_dev/runtime/cost_models/tbt_*.json
+export SGLANG_ADMISSION_DRY_RUN=1
+export SGLANG_ADMISSION_DECISION_LOG=ms_dev/runtime/sessions/<sess>/admission_decisions.jsonl
+bash ms_dev/start_server_no_pd.sh --metrics
+# ...drive your stress workload...
+```
+
+Only the attn_tp_rank=0 scheduler writes the log (TP-dedup), so a TP=N deployment
+produces one row per decision, not N.
 
 ### Inputs
 
-- `--decision-log <path>` — JSONL file produced by the controller in dry-run mode.
-  Each line: `{ts, rid, predicted_ttft, predicted_tbt, queue_predicted, ...}`.
-  Path defaults to `<session>/admission_decisions.jsonl` if `--session-dir` is given.
-- `--ttft-slo <ms>` (repeatable) — candidate TTFT SLO(s).
+- `--decision-log <path>` — required JSONL path.
+- `--ttft-slo <ms>` (repeatable) — candidate TTFT SLO(s) to evaluate.
 - `--tbt-slo <ms>` (repeatable) — candidate TBT SLO(s).
+- `--reactive-ratio <r>` — Stage 3 trip = `tbt_slo * r` (default 0.9).
+- `--csv-out <path>` — write the summary table to CSV.
+- `--details-out <path>` — when exactly one (ttft, tbt) pair is given, write a
+  per-decision CSV including `original_admit / original_reason / replay_verdict`
+  for diff-style inspection.
 
 ### Outputs
 
-stdout table + optional CSV:
+Stdout summary (Cartesian product of TTFT × TBT × reactive_ratio):
 
 ```
-TTFT_SLO   TBT_SLO   total   admit   rej_TTFT   rej_TBT_pred   rej_TBT_react   reject_pct
-30000      200       12031   11420   411        180            20              5.1%
-30000      150       12031   10980   411        585            55              8.7%
-20000      200       12031   10885   946        180            20              9.5%
-...
+TTFT_SLO    TBT_SLO  react×    total    admit  rej_TTFT  rej_TBT_p  rej_TBT_r   rej_pct
+--------------------------------------------------------------------------------------------
+      1000        100    0.90       25        2        23          0          0    92.00%
+      5000        100    0.90       25        2        23          0          0    92.00%
+     30000        100    0.90       25       19         6          0          0    24.00%
 ```
 
-CSV format identical (`--csv-out path`).
+`--csv-out` produces the same data with the same columns.
 
-### Usage
+### Caveat — counterfactual, not simulation
 
-```bash
-python tools/admission_control/replay_admission.py \
-    --session-dir ms_dev/runtime/sessions/20260507_180000 \
-    --ttft-slo 20000 30000 60000 \
-    --tbt-slo 100 150 200 300 \
-    --csv-out reports/slo_sweep.csv
-```
-
-The session dir is auto-discovered from `meta/run_meta.json` if a path is given;
-otherwise pass `--decision-log` directly.
-
-### Caveat
-
-Replay is a **counterfactual** — it assumes the predictor's outputs at request arrival
-were correct. It does not simulate feedback: e.g., a real reject would have changed the
-queue state for subsequent requests. Treat results as upper bounds on reject rate.
+Replay re-thresholds the predictions stored at decision time; it does NOT recompute
+predictions from a different cost model, and it does NOT simulate the feedback effect
+of changing the admit/reject decision (the `queue_predicted_ms` in row N reflects the
+actual outcome of rows 0..N-1, not the counterfactual). When you sweep down to a
+tighter SLO than what was active during the dry-run, reported reject counts are an
+**upper bound** — under real enforcement, rejecting earlier requests would shrink the
+queue and admit more later ones. For an accurate operating-point estimate, re-run the
+workload with the chosen SLO under real enforcement.
 
 ---
 

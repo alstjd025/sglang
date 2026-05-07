@@ -147,6 +147,9 @@ append_admission_args() {
   if [[ "${SGLANG_ADMISSION_DRY_RUN:-0}" == "1" ]]; then
     _adm_out+=(--admission-dry-run)
   fi
+  if [[ -n "${SGLANG_ADMISSION_DECISION_LOG:-}" ]]; then
+    _adm_out+=(--admission-decision-log "${SGLANG_ADMISSION_DECISION_LOG}")
+  fi
 }
 
 # launch_server <cmd...>

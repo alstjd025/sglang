@@ -102,6 +102,7 @@ All flags are namespaced `--admission-*`. CLI default = `None` / `False` → adm
 | `--admission-tbt-ewma-alpha <float>` | `SGLANG_ADMISSION_TBT_EWMA_ALPHA` | `0.1` | EWMA smoothing factor |
 | `--admission-tbt-reactive-ratio <float>` | `SGLANG_ADMISSION_TBT_REACTIVE_RATIO` | `0.9` | Stage 3 trips at `tbt_slo * ratio` |
 | `--admission-dry-run` | `SGLANG_ADMISSION_DRY_RUN` | `False` | Log decisions but always admit (★ tuning mode) |
+| `--admission-decision-log <path>` | `SGLANG_ADMISSION_DECISION_LOG` | unset | Append every decision as a JSONL row. Consumed by `tools/admission_control/replay_admission.py`. Only the rank-0 scheduler writes (TP-dedup). |
 
 ### Validation rules
 

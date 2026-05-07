@@ -85,6 +85,7 @@ violate configured SLOs. Module:
 | `SGLANG_ADMISSION_TBT_EWMA_ALPHA` | `--admission-tbt-ewma-alpha` | `0.1` | Stage 3 smoothing |
 | `SGLANG_ADMISSION_TBT_REACTIVE_RATIO` | `--admission-tbt-reactive-ratio` | `0.9` | Stage 3 trip threshold |
 | `SGLANG_ADMISSION_DRY_RUN` | `--admission-dry-run` | `0` | Log decisions but always admit |
+| `SGLANG_ADMISSION_DECISION_LOG` | `--admission-decision-log` | unset | JSONL path for offline replay (rank-0 only) |
 
 If both SLO env vars are unset/empty, `lib_server.sh::append_admission_args` adds nothing
 and admission control is fully off (server behaves as before).
