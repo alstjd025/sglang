@@ -62,6 +62,11 @@ if [[ -n "${SGLANG_SERVE_EXTRA_ARGS:-}" ]]; then
   extra_args=( ${SGLANG_SERVE_EXTRA_ARGS} )
 fi
 
+# Admission control (Phase A: NULL/single only).
+# See ms_dev/CLAUDE.md and managers/admission_control/CLAUDE.md.
+admission_args=()
+append_admission_args admission_args "single"
+
 cd "${SGLANG_REPO_ROOT}"
 
 launch_server \
@@ -76,5 +81,6 @@ launch_server \
   --random-seed 42 \
   "${obs_args[@]}" \
   "${hicache_args[@]}" \
+  "${admission_args[@]}" \
   "${extra_args[@]}" \
   "${OBS_REMAINING_ARGS[@]}"

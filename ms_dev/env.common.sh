@@ -52,6 +52,18 @@ export HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-${HF_TOKEN:-}}"
 # Mooncake TCP
 export MC_TCP_ENABLE_CONNECTION_POOL="${MC_TCP_ENABLE_CONNECTION_POOL:-1}"
 
+# Admission control (Mooncake-style predictive SLO admission).
+# Off by default — set TTFT/TBT SLO to enable. See ms_dev/CLAUDE.md.
+# These env vars are translated to --admission-* CLI flags by
+# lib_server.sh::append_admission_args.
+export SGLANG_ADMISSION_TTFT_SLO_MS="${SGLANG_ADMISSION_TTFT_SLO_MS:-}"
+export SGLANG_ADMISSION_TBT_SLO_MS="${SGLANG_ADMISSION_TBT_SLO_MS:-}"
+export SGLANG_ADMISSION_PREFILL_COST_MODEL="${SGLANG_ADMISSION_PREFILL_COST_MODEL:-}"
+export SGLANG_ADMISSION_TBT_COST_MODEL="${SGLANG_ADMISSION_TBT_COST_MODEL:-}"
+export SGLANG_ADMISSION_TBT_EWMA_ALPHA="${SGLANG_ADMISSION_TBT_EWMA_ALPHA:-}"
+export SGLANG_ADMISSION_TBT_REACTIVE_RATIO="${SGLANG_ADMISSION_TBT_REACTIVE_RATIO:-}"
+export SGLANG_ADMISSION_DRY_RUN="${SGLANG_ADMISSION_DRY_RUN:-0}"
+
 # Some environments mount /tmp with noexec, which breaks Triton /
 # torchinductor when they try to mmap compiled .so files. Redirect their
 # caches under the runtime dir (which lives on the repo FS and allows exec).

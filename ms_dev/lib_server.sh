@@ -99,6 +99,56 @@ append_obs_args() {
   fi
 }
 
+# append_admission_args <out-array-name> [mode]
+#
+# Appends --admission-* CLI args to the named array based on
+# SGLANG_ADMISSION_* env vars (set in env.common.sh). Each env var is only
+# forwarded if explicitly non-empty; unset vars fall back to the SGLang
+# CLI defaults. Setting either TTFT or TBT SLO turns admission control on.
+#
+# Arguments:
+#   $1 — array variable name (passed by reference, like append_obs_args).
+#   $2 — optional launcher mode: "single" (default), "pd-prefill", "pd-decode".
+#        For PD modes a one-line warning is emitted if any SLO is configured,
+#        because Phase A admission control is bypassed in PD mode.
+#
+# See managers/admission_control/CLAUDE.md and ms_dev/CLAUDE.md.
+append_admission_args() {
+  local -n _adm_out="$1"
+  local mode="${2:-single}"
+
+  local has_slo=0
+  if [[ -n "${SGLANG_ADMISSION_TTFT_SLO_MS:-}" || -n "${SGLANG_ADMISSION_TBT_SLO_MS:-}" ]]; then
+    has_slo=1
+  fi
+
+  if (( has_slo )) && [[ "${mode}" != "single" ]]; then
+    echo "[lib_server] admission control flags will be passed but the controller is bypassed in PD mode (Phase A scope)" >&2
+  fi
+
+  if [[ -n "${SGLANG_ADMISSION_TTFT_SLO_MS:-}" ]]; then
+    _adm_out+=(--admission-ttft-slo-ms "${SGLANG_ADMISSION_TTFT_SLO_MS}")
+  fi
+  if [[ -n "${SGLANG_ADMISSION_TBT_SLO_MS:-}" ]]; then
+    _adm_out+=(--admission-tbt-slo-ms "${SGLANG_ADMISSION_TBT_SLO_MS}")
+  fi
+  if [[ -n "${SGLANG_ADMISSION_PREFILL_COST_MODEL:-}" ]]; then
+    _adm_out+=(--admission-prefill-cost-model-path "${SGLANG_ADMISSION_PREFILL_COST_MODEL}")
+  fi
+  if [[ -n "${SGLANG_ADMISSION_TBT_COST_MODEL:-}" ]]; then
+    _adm_out+=(--admission-tbt-cost-model-path "${SGLANG_ADMISSION_TBT_COST_MODEL}")
+  fi
+  if [[ -n "${SGLANG_ADMISSION_TBT_EWMA_ALPHA:-}" ]]; then
+    _adm_out+=(--admission-tbt-ewma-alpha "${SGLANG_ADMISSION_TBT_EWMA_ALPHA}")
+  fi
+  if [[ -n "${SGLANG_ADMISSION_TBT_REACTIVE_RATIO:-}" ]]; then
+    _adm_out+=(--admission-tbt-reactive-ratio "${SGLANG_ADMISSION_TBT_REACTIVE_RATIO}")
+  fi
+  if [[ "${SGLANG_ADMISSION_DRY_RUN:-0}" == "1" ]]; then
+    _adm_out+=(--admission-dry-run)
+  fi
+}
+
 # launch_server <cmd...>
 #
 # Prints a quoted command line and execs it (replacing the shell).

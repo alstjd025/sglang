@@ -385,6 +385,13 @@ def main() -> int:
         "sglang:queue_time_seconds",
         "sglang:hicache_host_used_tokens",
         "sglang:hicache_host_total_tokens",
+        # Admission control (Mooncake-style predictive SLO admission).
+        # See managers/admission_control/CLAUDE.md.
+        "sglang:admission_decisions_total",
+        "sglang:admission_predicted_ttft_ms",
+        "sglang:admission_predicted_tbt_ms",
+        "sglang:admission_tbt_ewma_ms",
+        "sglang:admission_queue_predicted_ms",
     ]
 
     if mode == "pd":

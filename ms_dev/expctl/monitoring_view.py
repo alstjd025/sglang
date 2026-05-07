@@ -235,6 +235,12 @@ def detect_runtime_feature_flags(
         "decode_offload": None,
         "server_hicache": None,
         "server_l3": None,
+        # Admission control (Phase A: server/single mode only).
+        # See managers/admission_control/CLAUDE.md and ms_dev/CLAUDE.md.
+        "server_admission": None,
+        "server_admission_dry_run": None,
+        "server_admission_ttft_slo_ms": None,
+        "server_admission_tbt_slo_ms": None,
     }
 
     if enabled_roles.get("prefill", False):
@@ -258,6 +264,18 @@ def detect_runtime_feature_flags(
         )
         states["server_l3"] = detect_launch_flag(
             process_log_dir, "server", "--hicache-storage-backend"
+        )
+        ttft = detect_launch_arg(
+            process_log_dir, "server", "--admission-ttft-slo-ms"
+        )
+        tbt = detect_launch_arg(
+            process_log_dir, "server", "--admission-tbt-slo-ms"
+        )
+        states["server_admission_ttft_slo_ms"] = ttft  # type: ignore[assignment]
+        states["server_admission_tbt_slo_ms"] = tbt  # type: ignore[assignment]
+        states["server_admission"] = (ttft is not None) or (tbt is not None)
+        states["server_admission_dry_run"] = detect_launch_flag(
+            process_log_dir, "server", "--admission-dry-run"
         )
 
     return states
@@ -289,6 +307,48 @@ def color_state_text(state: str, enabled: bool) -> str:
     if state == "DISABLED":
         return colorize(state, "muted", enabled)
     return colorize(state, "warn", enabled)
+
+
+def admission_state_text(
+    feature_states: Dict[str, Optional[bool]],
+    role: str,
+    role_enabled: bool,
+    use_color: bool,
+) -> str:
+    """Render the admission control feature cell.
+
+    Phase A: only the single-server `server` role exposes a meaningful state.
+    PD prefill/decode get N/A because the controller is bypassed.
+    """
+    if not role_enabled:
+        return colorize("N/A", "muted", use_color)
+    if role != "server":
+        return colorize("N/A", "muted", use_color)
+
+    enabled = feature_states.get("server_admission")
+    if enabled is None:
+        return colorize("UNKNOWN", "warn", use_color)
+    if not enabled:
+        return colorize("OFF", "muted", use_color)
+
+    ttft_raw = feature_states.get("server_admission_ttft_slo_ms")
+    tbt_raw = feature_states.get("server_admission_tbt_slo_ms")
+    parts: List[str] = []
+    try:
+        if ttft_raw is not None:
+            parts.append(f"ttft={float(ttft_raw)/1000.0:g}s")
+    except (TypeError, ValueError):
+        parts.append(f"ttft={ttft_raw}")
+    try:
+        if tbt_raw is not None:
+            parts.append(f"tbt={float(tbt_raw):g}ms")
+    except (TypeError, ValueError):
+        parts.append(f"tbt={tbt_raw}")
+
+    suffix = (" " + " ".join(parts)) if parts else ""
+    if feature_states.get("server_admission_dry_run"):
+        return colorize(f"DRY_RUN{suffix}", "warn", use_color)
+    return colorize(f"ON{suffix}", "ok", use_color)
 
 
 def feature_state_text(value: Optional[bool], role_enabled: bool, use_color: bool) -> str:
@@ -529,6 +589,13 @@ def render_status(
         enabled_roles.get("decode", False),
         use_color,
     )
+    # admission control is Phase A scope = single-server only; PD shows N/A.
+    pd_admission_text = admission_state_text(
+        feature_states,
+        "prefill",
+        enabled_roles.get("prefill", False),
+        use_color,
+    )
 
     lines = []
     lines.append(colorize("=" * 118, "muted", use_color))
@@ -567,10 +634,14 @@ def render_status(
                 f"prefill_hicache_l2={prefill_hicache_text}",
                 f"decode_hicache_l2={decode_hicache_l2_text}",
                 f"decode_pd_offload={decode_offload_text}",
+                f"admission={pd_admission_text}",
             ]
         )
     )
-    lines.append("legend: hicache=L1/L2/L3 tiered cache, pd_offload=PD decode-specific KV offload path")
+    lines.append(
+        "legend: hicache=L1/L2/L3 tiered cache, pd_offload=PD decode-specific KV offload path, "
+        "admission=Mooncake-style SLO admission (Phase A: single-mode only)"
+    )
     lines.append(colorize("-" * 118, "muted", use_color))
 
     lines.append(
@@ -794,6 +865,12 @@ def render_status_single(
         enabled_roles.get("server", False),
         use_color,
     )
+    server_admission_text = admission_state_text(
+        feature_states,
+        "server",
+        enabled_roles.get("server", False),
+        use_color,
+    )
 
     lines = []
     lines.append(colorize("=" * 118, "muted", use_color))
@@ -814,10 +891,14 @@ def render_status_single(
             [
                 f"server_hicache_l2={server_hicache_text}",
                 f"server_hicache_l3={server_l3_text}",
+                f"admission={server_admission_text}",
             ]
         )
     )
-    lines.append("legend: hicache_l2=host memory tier, hicache_l3=storage tier")
+    lines.append(
+        "legend: hicache_l2=host memory tier, hicache_l3=storage tier, "
+        "admission=Mooncake-style predictive SLO admission control"
+    )
     lines.append(colorize("-" * 118, "muted", use_color))
 
     lines.append(

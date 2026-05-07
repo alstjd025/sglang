@@ -69,6 +69,12 @@ if [[ "${SGLANG_PD_PREFILL_HICACHE_ENABLE:-0}" == "1" ]]; then
   fi
 fi
 
+# Admission control flags propagate but the controller is bypassed in PD mode
+# (Phase A scope) — append_admission_args emits a warning if any SLO is set.
+admission_args=()
+append_admission_args admission_args "pd-prefill"
+args+=("${admission_args[@]}")
+
 if [[ -n "${SGLANG_PD_PREFILL_EXTRA_ARGS}" ]]; then
   # shellcheck disable=SC2206
   raw_extra=( ${SGLANG_PD_PREFILL_EXTRA_ARGS} )
