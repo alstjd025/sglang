@@ -12,6 +12,16 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from sglang.srt.managers.admission_control.controller import (
+    REASON_ADMIT,
+    REASON_DISABLED,
+    REASON_TBT_PREDICTED,
+    REASON_TBT_REACTIVE,
+    REASON_TTFT_PREDICTED,
+    AdmissionConfig,
+    AdmissionController,
+    SchedulerSnapshot,
+)
 from sglang.srt.managers.admission_control.cost_model import (
     CostModelLoadError,
     PrefillCostModel,
@@ -207,6 +217,311 @@ class TestTBTEwmaTracker(unittest.TestCase):
         t.update(50.0)
         t.update(123.0)
         self.assertAlmostEqual(t.get(), 123.0)
+
+
+# ---------------------------------------------------------------------------
+# AdmissionController decision matrix
+# ---------------------------------------------------------------------------
+
+
+def _snapshot(
+    queue_ms: float = 0.0,
+    bs: int = 0,
+    kv: int = 0,
+    null: bool = True,
+) -> SchedulerSnapshot:
+    return SchedulerSnapshot(
+        waiting_queue_predicted_prefill_ms=queue_ms,
+        running_batch_size=bs,
+        running_batch_total_kv_tokens=kv,
+        disaggregation_mode_is_null=null,
+    )
+
+
+def _prefill(alpha: float = 0.0, beta: float = 1.0, gamma: float = 0.0) -> PrefillCostModel:
+    """Default linear: T = beta·d + gamma  (1ms per missed token)."""
+    return PrefillCostModel(alpha=alpha, beta=beta, gamma=gamma)
+
+
+def _tbt(a: float = 0.0, b: float = 1.0, c: float = 0.0) -> TBTCostModel:
+    """Default: TBT = a + b·bs + c·kv  (1ms per request in batch)."""
+    return TBTCostModel(a=a, b=b, c=c)
+
+
+class TestAdmissionControllerDisabled(unittest.TestCase):
+    """When neither SLO is set, decide() short-circuits to ADMIT(DISABLED)."""
+
+    def test_no_slos_admits(self):
+        ctrl = AdmissionController(AdmissionConfig())
+        d = ctrl.decide(prompt_len=1000, prefix_match_len=0, snapshot=_snapshot())
+        self.assertTrue(d.admit)
+        self.assertEqual(d.reason, REASON_DISABLED)
+        self.assertFalse(ctrl.is_active())
+
+    def test_zero_slos_treated_as_disabled(self):
+        ctrl = AdmissionController(AdmissionConfig(ttft_slo_ms=0, tbt_slo_ms=0))
+        d = ctrl.decide(prompt_len=10, prefix_match_len=0, snapshot=_snapshot())
+        self.assertTrue(d.admit)
+        self.assertEqual(d.reason, REASON_DISABLED)
+
+
+class TestAdmissionControllerStage1(unittest.TestCase):
+    """TTFT predicted policy."""
+
+    def test_ttft_under_slo_admits(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=1000),
+            prefill_cost=_prefill(),  # T = 1ms per token
+        )
+        d = ctrl.decide(prompt_len=500, prefix_match_len=0, snapshot=_snapshot())
+        self.assertTrue(d.admit)
+        self.assertEqual(d.reason, REASON_ADMIT)
+        self.assertAlmostEqual(d.predicted_ttft_ms, 500.0)
+        self.assertAlmostEqual(d.predicted_prefill_ms, 500.0)
+
+    def test_ttft_over_slo_rejects(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=1000),
+            prefill_cost=_prefill(),
+        )
+        d = ctrl.decide(prompt_len=2000, prefix_match_len=0, snapshot=_snapshot())
+        self.assertFalse(d.admit)
+        self.assertEqual(d.reason, REASON_TTFT_PREDICTED)
+        self.assertAlmostEqual(d.predicted_ttft_ms, 2000.0)
+        self.assertAlmostEqual(d.predicted_prefill_ms, 2000.0)
+
+    def test_queue_pushes_over_slo(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=1000),
+            prefill_cost=_prefill(),
+        )
+        # 800ms in queue + 500ms self = 1300ms > 1000ms slo
+        d = ctrl.decide(
+            prompt_len=500,
+            prefix_match_len=0,
+            snapshot=_snapshot(queue_ms=800.0),
+        )
+        self.assertFalse(d.admit)
+        self.assertEqual(d.reason, REASON_TTFT_PREDICTED)
+        self.assertAlmostEqual(d.queue_predicted_ms, 800.0)
+
+    def test_prefix_match_reduces_ttft(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=1000),
+            prefill_cost=_prefill(),
+        )
+        # 2000-tok prompt would normally be 2000ms; with 1500-tok cache hit → 500ms
+        d = ctrl.decide(
+            prompt_len=2000, prefix_match_len=1500, snapshot=_snapshot()
+        )
+        self.assertTrue(d.admit)
+        self.assertAlmostEqual(d.predicted_prefill_ms, 500.0)
+
+    def test_no_cost_model_means_stage1_disabled(self):
+        # Stage 1 is configured but no cost model loaded — controller silently
+        # skips Stage 1 (lenient mode, server still runs).
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=1),  # absurdly tight
+            prefill_cost=None,
+        )
+        d = ctrl.decide(prompt_len=99999, prefix_match_len=0, snapshot=_snapshot())
+        self.assertTrue(d.admit)
+        self.assertEqual(d.reason, REASON_ADMIT)
+
+
+class TestAdmissionControllerStage2(unittest.TestCase):
+    """TBT predicted (current-batch approximation)."""
+
+    def test_tbt_under_slo_admits(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(tbt_slo_ms=200),
+            tbt_cost=_tbt(a=10.0, b=5.0, c=0.0),  # 10 + 5·bs
+        )
+        d = ctrl.decide(
+            prompt_len=10,
+            prefix_match_len=0,
+            snapshot=_snapshot(bs=10, kv=1000),
+        )
+        # bs after = 11 → 10 + 55 = 65ms < 200ms
+        self.assertTrue(d.admit)
+        self.assertAlmostEqual(d.predicted_tbt_ms, 65.0)
+
+    def test_tbt_over_slo_rejects(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(tbt_slo_ms=200),
+            tbt_cost=_tbt(a=0.0, b=10.0, c=0.0),
+        )
+        d = ctrl.decide(
+            prompt_len=10, prefix_match_len=0, snapshot=_snapshot(bs=30)
+        )
+        # bs after = 31 → 310ms > 200ms slo
+        self.assertFalse(d.admit)
+        self.assertEqual(d.reason, REASON_TBT_PREDICTED)
+
+    def test_kv_term_can_trip_slo(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(tbt_slo_ms=200),
+            tbt_cost=_tbt(a=0.0, b=0.0, c=0.01),  # 0.01ms per kv token
+        )
+        d = ctrl.decide(
+            prompt_len=5000,
+            prefix_match_len=0,
+            snapshot=_snapshot(bs=0, kv=20000),
+        )
+        # kv after = 25000 → 250ms > 200ms
+        self.assertFalse(d.admit)
+        self.assertEqual(d.reason, REASON_TBT_PREDICTED)
+
+
+class TestAdmissionControllerStage3(unittest.TestCase):
+    """TBT reactive EWMA safety net."""
+
+    def test_cold_ewma_does_not_trip(self):
+        # Tracker not warm yet → Stage 3 skipped even if value is high.
+        tracker = TBTEwmaTracker(alpha=0.5, warm_up_steps=10)
+        tracker.update(9999.0)  # one sample, not warm
+        ctrl = AdmissionController(
+            AdmissionConfig(tbt_slo_ms=200, tbt_reactive_ratio=0.9),
+            tbt_tracker=tracker,
+        )
+        d = ctrl.decide(prompt_len=1, prefix_match_len=0, snapshot=_snapshot())
+        self.assertTrue(d.admit)
+
+    def test_warm_ewma_over_threshold_rejects(self):
+        tracker = TBTEwmaTracker(alpha=1.0, warm_up_steps=1)  # snap to latest
+        tracker.update(250.0)  # warm, ewma = 250
+        ctrl = AdmissionController(
+            AdmissionConfig(tbt_slo_ms=200, tbt_reactive_ratio=0.9),
+            tbt_tracker=tracker,
+        )
+        # threshold = 200 * 0.9 = 180; ewma=250 > 180 → reject
+        d = ctrl.decide(prompt_len=1, prefix_match_len=0, snapshot=_snapshot())
+        self.assertFalse(d.admit)
+        self.assertEqual(d.reason, REASON_TBT_REACTIVE)
+        self.assertAlmostEqual(d.tbt_ewma_ms, 250.0)
+
+    def test_warm_ewma_under_threshold_admits(self):
+        tracker = TBTEwmaTracker(alpha=1.0, warm_up_steps=1)
+        tracker.update(150.0)
+        ctrl = AdmissionController(
+            AdmissionConfig(tbt_slo_ms=200, tbt_reactive_ratio=0.9),
+            tbt_tracker=tracker,
+        )
+        # threshold = 180; ewma=150 < 180 → admit
+        d = ctrl.decide(prompt_len=1, prefix_match_len=0, snapshot=_snapshot())
+        self.assertTrue(d.admit)
+        self.assertAlmostEqual(d.tbt_ewma_ms, 150.0)
+
+    def test_no_tracker_means_stage3_disabled(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(tbt_slo_ms=200, tbt_reactive_ratio=0.9),
+            tbt_tracker=None,
+        )
+        d = ctrl.decide(prompt_len=1, prefix_match_len=0, snapshot=_snapshot())
+        self.assertTrue(d.admit)
+
+
+class TestAdmissionControllerStageOrder(unittest.TestCase):
+    """First-violation-wins ordering: Stage 1 > Stage 2 > Stage 3."""
+
+    def test_stage1_wins_when_all_would_reject(self):
+        tracker = TBTEwmaTracker(alpha=1.0, warm_up_steps=1)
+        tracker.update(9999.0)
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=10, tbt_slo_ms=10, tbt_reactive_ratio=0.9),
+            prefill_cost=_prefill(),  # 1ms/token, will exceed 10ms easily
+            tbt_cost=_tbt(b=999.0),
+            tbt_tracker=tracker,
+        )
+        d = ctrl.decide(prompt_len=100, prefix_match_len=0, snapshot=_snapshot())
+        self.assertFalse(d.admit)
+        self.assertEqual(d.reason, REASON_TTFT_PREDICTED)
+
+    def test_stage2_wins_when_stage1_passes(self):
+        tracker = TBTEwmaTracker(alpha=1.0, warm_up_steps=1)
+        tracker.update(9999.0)
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=10000, tbt_slo_ms=10),
+            prefill_cost=_prefill(),
+            tbt_cost=_tbt(b=999.0),
+            tbt_tracker=tracker,
+        )
+        d = ctrl.decide(prompt_len=100, prefix_match_len=0, snapshot=_snapshot())
+        self.assertFalse(d.admit)
+        self.assertEqual(d.reason, REASON_TBT_PREDICTED)
+
+
+class TestAdmissionControllerDryRun(unittest.TestCase):
+    """Dry-run admits even when policy says reject; flag is set for logging."""
+
+    def test_dry_run_admits_with_would_reject_flag(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=10, dry_run=True),
+            prefill_cost=_prefill(),
+        )
+        d = ctrl.decide(prompt_len=500, prefix_match_len=0, snapshot=_snapshot())
+        self.assertTrue(d.admit)  # dry-run admits
+        self.assertEqual(d.reason, REASON_TTFT_PREDICTED)  # but reason is preserved
+        self.assertTrue(d.dry_run_would_reject)
+        self.assertAlmostEqual(d.predicted_prefill_ms, 500.0)
+
+    def test_dry_run_admit_path_no_would_reject(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=10000, dry_run=True),
+            prefill_cost=_prefill(),
+        )
+        d = ctrl.decide(prompt_len=100, prefix_match_len=0, snapshot=_snapshot())
+        self.assertTrue(d.admit)
+        self.assertEqual(d.reason, REASON_ADMIT)
+        self.assertFalse(d.dry_run_would_reject)
+
+
+class TestAdmissionControllerDisaggregation(unittest.TestCase):
+    """Phase A only supports DisaggregationMode.NULL."""
+
+    def test_non_null_mode_admits_with_disabled_reason(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=10),
+            prefill_cost=_prefill(),
+        )
+        d = ctrl.decide(
+            prompt_len=99999,
+            prefix_match_len=0,
+            snapshot=_snapshot(null=False),
+        )
+        self.assertTrue(d.admit)
+        self.assertEqual(d.reason, REASON_DISABLED)
+
+    def test_disagg_warning_emitted_once(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=10),
+            prefill_cost=_prefill(),
+        )
+        snap = _snapshot(null=False)
+        ctrl.decide(prompt_len=1, prefix_match_len=0, snapshot=snap)
+        ctrl.decide(prompt_len=1, prefix_match_len=0, snapshot=snap)
+        ctrl.decide(prompt_len=1, prefix_match_len=0, snapshot=snap)
+        # No assertion on log content; just exercise the path that gates warns.
+        self.assertTrue(ctrl._disagg_warned)
+
+
+class TestAdmissionControllerRecentDecisions(unittest.TestCase):
+    """Ring buffer for introspection, capped at 32."""
+
+    def test_records_decisions(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=1000), prefill_cost=_prefill()
+        )
+        for _ in range(3):
+            ctrl.decide(prompt_len=10, prefix_match_len=0, snapshot=_snapshot())
+        self.assertEqual(len(ctrl.recent_decisions()), 3)
+
+    def test_caps_at_max(self):
+        ctrl = AdmissionController(AdmissionConfig())
+        for _ in range(100):
+            ctrl.decide(prompt_len=1, prefix_match_len=0, snapshot=_snapshot())
+        recent = ctrl.recent_decisions()
+        self.assertEqual(len(recent), 32)
 
 
 if __name__ == "__main__":
