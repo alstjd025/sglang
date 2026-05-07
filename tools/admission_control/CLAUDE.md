@@ -124,47 +124,53 @@ SLOs against real traffic before flipping enforcement on.
 
 ### Producing the input
 
-The scheduler appends one row per decision when `SGLANG_ADMISSION_DECISION_LOG` (or
-`--admission-decision-log`) is set. With `SGLANG_ADMISSION_DRY_RUN=1` you get a log
-where every reject is "would-have-rejected" — perfect for sweeping SLOs without
+The scheduler appends one row per decision when `SGLANG_ADMISSION_DECISION_LOG`
+(or `--admission-decision-log`) is set. With `SGLANG_ADMISSION_DRY_RUN=1` every
+reject becomes "would-have-rejected" — perfect for sweeping SLOs without
 actually losing requests.
 
+The simplest path:
+
 ```bash
-export SGLANG_ADMISSION_TTFT_SLO_MS=2000
-export SGLANG_ADMISSION_TBT_SLO_MS=100
-export SGLANG_ADMISSION_PREFILL_COST_MODEL=ms_dev/runtime/cost_models/prefill_*.json
-export SGLANG_ADMISSION_TBT_COST_MODEL=ms_dev/runtime/cost_models/tbt_*.json
-export SGLANG_ADMISSION_DRY_RUN=1
-export SGLANG_ADMISSION_DECISION_LOG=ms_dev/runtime/sessions/<sess>/admission_decisions.jsonl
-bash ms_dev/start_server_no_pd.sh --metrics
+source ms_dev/experiments/admission_dryrun.sh
+python3 ms_dev/expctl/run_experiment.py --mode single
 # ...drive your stress workload...
 ```
 
-Only the attn_tp_rank=0 scheduler writes the log (TP-dedup), so a TP=N deployment
-produces one row per decision, not N.
+`run_experiment.py` auto-routes the decision log to
+`<session_dir>/admission_decisions.jsonl` when SLO env vars are set and
+`SGLANG_ADMISSION_DECISION_LOG` is unset. Only the attn_tp_rank=0 scheduler
+writes (TP-dedup), so a TP=N deployment produces one row per decision, not N.
 
 ### Inputs
 
 - `--decision-log <path>` — required JSONL path.
-- `--ttft-slo <ms>` (repeatable) — candidate TTFT SLO(s) to evaluate.
-- `--tbt-slo <ms>` (repeatable) — candidate TBT SLO(s).
+- `--ttft-slo <ms>` (repeatable) — candidate TTFT SLO(s) to evaluate; pass `0` to disable.
+- `--tbt-slo <ms>` (repeatable) — candidate TBT SLO(s); pass `0` to disable.
+- `--ttft-slo-ratio <r>` (repeatable) — candidate TTFT slowdown ratios vs solo-run; pass `1.0` to disable.
+- `--tbt-slo-ratio <r>` (repeatable) — candidate TBT slowdown ratios; pass `1.0` to disable.
 - `--reactive-ratio <r>` — Stage 3 trip = `tbt_slo * r` (default 0.9).
 - `--csv-out <path>` — write the summary table to CSV.
-- `--details-out <path>` — when exactly one (ttft, tbt) pair is given, write a
+- `--details-out <path>` — when exactly one SLO combo is given, write a
   per-decision CSV including `original_admit / original_reason / replay_verdict`
   for diff-style inspection.
 
 ### Outputs
 
-Stdout summary (Cartesian product of TTFT × TBT × reactive_ratio):
+Stdout summary (Cartesian product of all four SLO axes):
 
 ```
-TTFT_SLO    TBT_SLO  react×    total    admit  rej_TTFT  rej_TBT_p  rej_TBT_r   rej_pct
---------------------------------------------------------------------------------------------
-      1000        100    0.90       25        2        23          0          0    92.00%
-      5000        100    0.90       25        2        23          0          0    92.00%
-     30000        100    0.90       25       19         6          0          0    24.00%
+TTFT_SLO  TBT_SLO  TTFTrx  TBTrx  total  admit  rTTFT  rTTFTr  rTBTp  rTBTr  rTBTrx  rej_pct
+---------------------------------------------------------------------------------------------------------
+        0         0    1.50    1.00      25      14       0       11       0       0        0    44.00%
+        0         0    2.00    1.00      25      14       0       11       0       0        0    44.00%
+        0         0    5.00    1.00      25      17       0        8       0       0        0    32.00%
+     2000        100    1.00    1.00      25       2      23        0       0       0        0    92.00%
 ```
+
+Columns:
+- `rTTFT` / `rTTFTr` — rejects from absolute / ratio TTFT stage
+- `rTBTp` / `rTBTr` / `rTBTrx` — rejects from TBT predicted / ratio / reactive
 
 `--csv-out` produces the same data with the same columns.
 

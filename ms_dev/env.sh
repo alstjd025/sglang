@@ -36,4 +36,11 @@ case "${SGLANG_ENV_PROFILE:-all}" in
     ;;
 esac
 
+# Optional host-local overrides. env.local.sh is gitignored (see .gitignore)
+# so users can persist personal defaults — admission SLOs, custom model paths,
+# port overrides, etc. — without dirtying upstream env files.
+if [[ -f "${ENV_SCRIPT_DIR}/env.local.sh" ]]; then
+  source "${ENV_SCRIPT_DIR}/env.local.sh"
+fi
+
 echo "SGLang env setup done. (profile=${SGLANG_ENV_PROFILE:-all})"

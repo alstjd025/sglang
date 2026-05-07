@@ -92,9 +92,24 @@ or `prefill` role (PD mode, future) carries meaningful state.
 
 ### Adding admission metrics
 
-In the metric allowlist (`monitoring_metrics.py` constants near top), add the prefix
-`sglang:admission_` to capture all four admission counters/histograms/gauges. No code
-change beyond the allowlist — they flow through the same scrape/persist/snapshot path.
+The 5 admission Prometheus metrics are already in the `sglang_exact` allowlist in
+`run_experiment.py`. They flow through the same scrape/persist/snapshot path —
+output ends up in `<session>/metrics/server_metrics.jsonl`.
+
+### Per-session admission decision log + run_meta
+
+`run_experiment.py` detects any `SGLANG_ADMISSION_*_SLO_*` env var at session
+start and:
+- Auto-sets `SGLANG_ADMISSION_DECISION_LOG=<session_dir>/admission_decisions.jsonl`
+  in `launch_env_overrides["server"]` (unless user pinned the path explicitly).
+  The `DecisionLogger` in the scheduler creates the file.
+- Records every `SGLANG_ADMISSION_*` env var into `meta/run_meta.json` under
+  the `admission_config` block, with `enabled`, `applied_in_mode`, and
+  `decision_log_path` fields.
+
+PD mode captures the snapshot too but `applied_in_mode=false` (controller
+bypassed). The decision log is not auto-routed in PD because the controller
+never writes to it.
 
 Renderers can pull them via existing helpers:
 

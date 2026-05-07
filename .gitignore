@@ -279,3 +279,6 @@ artifacts/
 
 # ms_dev runtime artifacts (session logs, torchinductor/triton caches, crash dumps)
 ms_dev/runtime/
+
+# ms_dev personal/host-local env overrides (auto-sourced by env.sh)
+ms_dev/env.local.sh

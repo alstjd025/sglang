@@ -40,40 +40,60 @@ python tools/admission_control/fit_cost_model.py tbt \
 
 ### 1-B. Dry-run으로 SLO 튠
 
+가장 간단한 방법은 미리 만들어둔 **experiment wrapper script**를 source하는 것:
+
 ```bash
-# 모드 A: 절대값 SLO
+source ms_dev/experiments/admission_dryrun.sh
+python3 ms_dev/expctl/run_experiment.py --mode single
+```
+
+이렇게 하면:
+- `admission_dryrun.sh`가 SLO env vars 모두 export
+- `run_experiment.py`가 SLO 활성화를 감지 → **`admission_decisions.jsonl`을 자동으로 세션 폴더에 라우팅**
+- `meta/run_meta.json`에 `admission_config` 블록 자동 캡처
+
+직접 export하려면:
+
+```bash
+# 모드 A: 절대값 SLO만
 export SGLANG_ADMISSION_TTFT_SLO_MS=2000
 export SGLANG_ADMISSION_TBT_SLO_MS=100
 
-# OR 모드 B: 비율 SLO (solo-run 대비)
+# OR 모드 B: 비율 SLO만 (solo-run 대비)
 export SGLANG_ADMISSION_TTFT_SLO_RATIO=2.0
 export SGLANG_ADMISSION_TBT_SLO_RATIO=3.0
 
-# OR 모드 C: 둘 다 (둘 중 하나라도 위반하면 거절)
+# OR 모드 C: 둘 다 (★ 권장 — Stage 3 EWMA 안전망 활성화)
 export SGLANG_ADMISSION_TTFT_SLO_MS=30000        # 안전 cap
 export SGLANG_ADMISSION_TTFT_SLO_RATIO=2.0       # 정상 운영 기준
+export SGLANG_ADMISSION_TBT_SLO_MS=500
+export SGLANG_ADMISSION_TBT_SLO_RATIO=3.0
 
 # 공통
 export SGLANG_ADMISSION_PREFILL_COST_MODEL=ms_dev/runtime/cost_models/prefill_llama3-70b_b200x4.json
 export SGLANG_ADMISSION_TBT_COST_MODEL=ms_dev/runtime/cost_models/tbt_llama3-70b_b200x4.json
 export SGLANG_ADMISSION_DRY_RUN=1                 # ★ 거절 안 함, 결정만 기록
-export SGLANG_ADMISSION_DECISION_LOG=ms_dev/runtime/sessions/<sess>/admission_decisions.jsonl
 
-# 평소 stress test 워크로드 실행
+# DECISION_LOG는 명시 안 해도 됨 — run_experiment가 자동으로 세션 폴더에 라우팅
 python3 ms_dev/expctl/run_experiment.py --mode single
 ```
 
 ### 1-C. SLO 튠 (replay)
 
 ```bash
+SESS=ms_dev/runtime/sessions/<session_name>
 python tools/admission_control/replay_admission.py \
-    --decision-log <sess>/admission_decisions.jsonl \
-    --ttft-slo 1000 2000 5000 \
-    --ttft-slo-ratio 1.5 2.0 3.0 \
-    --csv-out report.csv
+    --decision-log $SESS/admission_decisions.jsonl \
+    --ttft-slo 0 \
+    --tbt-slo 0 \
+    --ttft-slo-ratio 1.5 2.0 3.0 5.0 \
+    --tbt-slo-ratio 2.0 3.0 5.0 \
+    --csv-out $SESS/admission_replay.csv
 ```
 
 → 각 (절대 SLO × 비율 SLO) 조합에서 거절률 확인. 운영 목표에 맞는 값 결정.
+
+세션 폴더에 `admission_replay.csv`로 저장하면 다른 산출물과 함께 보관됨.
 
 ### 1-D. 본격 사용 (dry-run 끄기)
 
@@ -297,55 +317,106 @@ if fr.get("type") == "abort" and fr.get("admission_reason"):
 
 ---
 
-## 6. 로깅 — 어디에 어떻게 기록되나
+## 6. 로깅 — 세션마다 어디에 어떻게 저장되나
 
-총 5개 채널.
-
-### 6-1. Python logger (stdout/stderr) — `process_logs/server.*`
+`run_experiment.py --mode single`로 실행하면 한 세션의 모든 admission 정보가
+세션 폴더(`ms_dev/runtime/sessions/<name>/`) 안에 자동으로 정리됩니다:
 
 ```
-[2026-05-08 00:38:04 TP0] admission control: enabled (ttft_slo_ms=2000.0 tbt_slo_ms=100.0
-                          ttft_slo_ratio=None tbt_slo_ratio=None dry_run=True ...)
-[2026-05-08 00:46:14 TP0] [admission] REJECT rid=abc123 Admission rejected: TTFT_PREDICTED
-                          (predicted_ttft=9551.7ms ttft_slo=2000ms ...)
-[2026-05-08 00:46:14 TP0] [admission/dry-run] WOULD_REJECT rid=abc123 reason=TTFT_PREDICTED
-                          pred_ttft=9551.7ms pred_tbt=n/a ewma_tbt=n/a
+ms_dev/runtime/sessions/<session_name>/
+├── meta/run_meta.json                ← admission_config 블록 (★ SLO 스냅샷)
+├── metrics/server_metrics.jsonl      ← Prometheus 5개 메트릭 자동 스크랩
+├── process_logs/
+│   ├── server.stdout.log             ← [admission] REJECT / WOULD_REJECT 로그
+│   └── server.stderr.log             ← startup ServerArgs 풀덤프 + cost model 로드
+└── admission_decisions.jsonl         ← (★) 모든 결정 한 줄씩, replay 입력
 ```
 
-거절은 항상 INFO 레벨. admit은 무음.
+이외에 `/server_info` 라이브 endpoint로 현재 상태 조회 가능.
 
-### 6-2. JSONL decision log
+총 6개 채널 — 자동 정리되는 5개 + 라이브 조회 1개.
 
-`SGLANG_ADMISSION_DECISION_LOG=<path>` 또는 `--admission-decision-log <path>` 설정 시 **rank-0 scheduler만** 매 결정마다 한 줄 append:
+### 6-1. `meta/run_meta.json` 의 `admission_config` (★ 가장 깔끔한 단일 진입점)
+
+세션 시작 시 SGLANG_ADMISSION_* env 스냅샷을 자동 캡처:
+
+```json
+{
+  "session_name": "20260508_022300",
+  "admission_config": {
+    "enabled": true,
+    "applied_in_mode": true,
+    "env": {
+      "SGLANG_ADMISSION_TTFT_SLO_RATIO": "2.0",
+      "SGLANG_ADMISSION_TBT_SLO_MS": "500",
+      "SGLANG_ADMISSION_TBT_SLO_RATIO": "3.0",
+      "SGLANG_ADMISSION_PREFILL_COST_MODEL": ".../prefill_llama3-70b_b200x4.json",
+      "SGLANG_ADMISSION_TBT_COST_MODEL": ".../tbt_llama3-70b_b200x4.json",
+      "SGLANG_ADMISSION_DRY_RUN": "1"
+    },
+    "decision_log_path": ".../sessions/20260508_022300/admission_decisions.jsonl"
+  }
+}
+```
+
+→ "이 세션 어떤 SLO로 돌렸지?" 30초 안에 답.
+
+### 6-2. `admission_decisions.jsonl` — 매 결정 한 줄
+
+자동으로 세션 폴더에 라우팅됨 (사용자가 `SGLANG_ADMISSION_DECISION_LOG`을
+명시 안 한 경우). **rank-0 scheduler만** 씁니다 (TP=N에서 N번 중복 X).
 
 ```json
 {
   "ts": 1778168774.58,
   "rid": "19246fa8...",
   "admit": true,
-  "reason": "TTFT_PREDICTED",
+  "reason": "TTFT_RATIO",
   "dry_run_would_reject": true,
-  "predicted_ttft_ms": 9551.7,
+  "predicted_ttft_ms": 410.0,
   "predicted_tbt_ms": null,
-  "solo_ttft_ms": 9551.7,
+  "solo_ttft_ms": 100.0,
   "solo_tbt_ms": null,
   "tbt_ewma_ms": null,
-  "queue_predicted_ms": 0.0,
-  "ttft_slo_ms": 2000.0,
-  "tbt_slo_ms": 100.0,
-  "ttft_slo_ratio": null,
-  "tbt_slo_ratio": null,
-  "predicted_prefill_ms": 9551.7,
-  "prompt_len": 60000,
+  "queue_predicted_ms": 310.0,
+  "ttft_slo_ms": null,
+  "tbt_slo_ms": null,
+  "ttft_slo_ratio": 2.0,
+  "tbt_slo_ratio": 3.0,
+  "predicted_prefill_ms": 100.0,
+  "prompt_len": 4000,
   "prefix_len": 0,
-  "running_batch_size": 0,
-  "running_batch_total_kv_tokens": 0
+  "running_batch_size": 12,
+  "running_batch_total_kv_tokens": 145000
 }
 ```
 
-`replay_admission.py`가 이걸 입력으로 받아 SLO sweep.
+`replay_admission.py`가 이 파일을 읽고 다른 SLO로 재평가.
 
-### 6-3. Prometheus 메트릭 (`expctl/metrics/server_metrics.jsonl`로 자동 스크랩)
+### 6-3. `process_logs/server.*` — Python logger
+
+`server.stderr.log` 시작 부분에 ServerArgs 풀덤프 (admission 필드 포함):
+```
+admission_ttft_slo_ms=None, admission_tbt_slo_ms=500.0,
+admission_ttft_slo_ratio=2.0, admission_tbt_slo_ratio=3.0, ...
+```
+
+이어서 controller 활성화 로그:
+```
+[TP0] admission control: enabled (ttft_slo_ms=None tbt_slo_ms=500.0
+      ttft_slo_ratio=2.0 tbt_slo_ratio=3.0 dry_run=True ...)
+```
+
+`server.stdout.log` 에는 매 거절 (또는 dry-run would-reject) 한 줄:
+```
+[admission] REJECT rid=abc123 Admission rejected: TTFT_RATIO
+            (predicted_ttft=410.0ms ttft_slo_ratio=2.0 ...)
+[admission/dry-run] WOULD_REJECT rid=abc123 reason=TTFT_RATIO ...
+```
+
+거절은 항상 INFO 레벨. admit은 무음 (스팸 방지).
+
+### 6-4. Prometheus 메트릭 (`metrics/server_metrics.jsonl`로 자동 스크랩)
 
 ```
 sglang:admission_decisions_total{decision, reason}    counter
@@ -361,7 +432,7 @@ sglang:admission_queue_predicted_ms                   gauge
 
 → Grafana / 자체 분석으로 거절률 시계열, reason 분포 모두 시각화 가능.
 
-### 6-4. `/server_info` 엔드포인트 (라이브 디버깅)
+### 6-5. `/server_info` 엔드포인트 (라이브 디버깅, 세션 끝나기 전에만)
 
 ```bash
 curl http://host:31000/server_info | jq '.internal_states[0].admission_state'
@@ -385,7 +456,7 @@ curl http://host:31000/server_info | jq '.internal_states[0].admission_state'
 }
 ```
 
-### 6-5. expctl status panel (라이브 모니터)
+### 6-6. expctl status panel (라이브 모니터)
 
 ```
 features: server_hicache_l2=ON | server_hicache_l3=OFF | admission=DRY_RUN ttft=2s tbt=100ms
@@ -394,6 +465,46 @@ features: server_hicache_l2=ON | server_hicache_l3=OFF | admission=DRY_RUN ttft=
 ---
 
 ## 7. 환경변수 / CLI 플래그 전체
+
+### 어디에 두나 (★)
+
+세 가지 패턴, 용도별로 선택:
+
+| 방법 | 어디에 | 용도 |
+|---|---|---|
+| **A. 셸에서 `export`** | 직접 입력 | 일회성 디버그 |
+| **B. `ms_dev/experiments/<name>.sh`** | 미리 만들고 `source` | **재현 가능한 실험 비교** ★ |
+| **C. `ms_dev/env.local.sh`** | gitignored, `env.sh`가 자동 source | **호스트별 personal default** |
+
+**`env.common.sh` / `env.single.sh` / `env.pd.sh`는 수정하지 마세요** — upstream과 충돌, 실험 비교 어려움.
+
+#### B. Experiment wrapper 패턴 (권장)
+
+`ms_dev/experiments/`에 미리 만들어 둔 wrapper들:
+- `admission_ratio_only.sh` — 비율 SLO만
+- `admission_ratio_with_safety.sh` — 비율 + 절대 안전망 (★ 운영 권장)
+- `admission_absolute_only.sh` — 절대 SLO만
+- `admission_dryrun.sh` — 위와 같지만 dry-run
+
+```bash
+source ms_dev/experiments/admission_ratio_with_safety.sh
+python3 ms_dev/expctl/run_experiment.py --mode single
+```
+
+새 실험이 필요하면 같은 패턴으로 추가. `ms_dev/experiments/README.md` 참고.
+
+#### C. `env.local.sh` 패턴 (개인용 default)
+
+`ms_dev/env.local.sh` 만들면 `env.sh`가 자동으로 source. gitignored이니까 부담 없이 호스트별 설정 가능:
+
+```bash
+# ms_dev/env.local.sh
+export SGLANG_ADMISSION_PREFILL_COST_MODEL=/abs/path/prefill.json
+export SGLANG_ADMISSION_TBT_COST_MODEL=/abs/path/tbt.json
+# ... 매번 export하기 귀찮은 것들 ...
+```
+
+### 전체 표
 
 | Env var | CLI flag | Default | 의미 |
 |---|---|---|---|
@@ -416,15 +527,15 @@ features: server_hicache_l2=ON | server_hicache_l3=OFF | admission=DRY_RUN ttft=
 
 ### 단계 1 — 평소 워크로드를 dry-run으로 흘림
 
-`admission_decisions.jsonl`을 충분히(최소 1000건+) 모음. SLO는 일단 임의로 (e.g. 절대값 10s, 비율 5x):
-
 ```bash
-export SGLANG_ADMISSION_TTFT_SLO_MS=10000
-export SGLANG_ADMISSION_TTFT_SLO_RATIO=5.0
-export SGLANG_ADMISSION_DRY_RUN=1
+source ms_dev/experiments/admission_dryrun.sh
+python3 ms_dev/expctl/run_experiment.py --mode single --session-name slo_tune_$(date +%Y%m%d_%H%M%S)
+# (평소 stress test 워크로드 발사 — 최소 1000건+ 결정 모음)
 ```
 
-(SLO를 너무 빡빡하게 잡으면 dry-run 큐에 모든 게 쌓여서 뒤따른 모든 요청이 reject되어 보임 — 결과 분석이 어려워짐.)
+세션이 끝나면 `<session_dir>/admission_decisions.jsonl`에 모든 결정이 쌓여있음.
+
+(SLO를 너무 빡빡하게 잡으면 dry-run 큐에 모든 게 쌓여서 뒤따른 모든 요청이 reject되어 보임 — 결과 분석이 어려워짐. `admission_dryrun.sh`는 의도적으로 느슨하게 설정됨.)
 
 ### 단계 2 — Replay로 sweep
 
@@ -538,7 +649,10 @@ event_loop_normal() → forward_step() → response
 | Replay 도구 | `tools/admission_control/replay_admission.py` |
 | Cost model JSON | `ms_dev/runtime/cost_models/` (gitignored) |
 | Cost model 결과 노트 | `ms_dev/runtime/cost_models/README.md` |
-| Shell 와이어링 | `ms_dev/env.common.sh`, `ms_dev/lib_server.sh` |
+| Shell 와이어링 | `ms_dev/env.common.sh`, `ms_dev/lib_server.sh`, `ms_dev/env.sh` |
+| Experiment wrappers | `ms_dev/experiments/admission_*.sh` |
+| Personal default (gitignored) | `ms_dev/env.local.sh` |
+| Per-session 자동 라우팅 | `ms_dev/expctl/run_experiment.py` (`admission_config` block, decision log) |
 | 단위 테스트 | `test/registered/admission/test_admission_control.py` (72 cases) |
 
 ---

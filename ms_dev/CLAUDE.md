@@ -20,6 +20,9 @@ ms_dev/
 ├── start_router_pd.sh           # PD router (sglang_router) launcher
 ├── stop_servers.sh              # graceful stop + port cleanup
 ├── expctl/                      # Python orchestrator/monitor — see ms_dev/expctl/CLAUDE.md
+├── experiments/                 # named, committed experiment wrappers (admission_*.sh)
+├── env.local.sh                 # gitignored — personal/host-local overrides, auto-sourced by env.sh
+├── admission_control_description.md  # top-level user-facing admission-control guide
 └── runtime/                     # gitignored: sessions, caches, logs, cost_models
 ```
 
@@ -108,6 +111,34 @@ if `SGLANG_ADMISSION_TTFT_SLO_MS` is set, since admission control is bypassed in
 Live under `runtime/cost_models/` (gitignored). Generate with
 `tools/admission_control/fit_cost_model.py` — see
 [tools/admission_control/CLAUDE.md](../tools/admission_control/CLAUDE.md).
+
+### Per-session auto-routing (run_experiment.py)
+
+When `run_experiment.py` detects any `SGLANG_ADMISSION_*_SLO_*` env var at session
+start, it:
+1. Auto-routes `SGLANG_ADMISSION_DECISION_LOG` to
+   `<session_dir>/admission_decisions.jsonl` (unless user pinned it elsewhere).
+2. Captures every `SGLANG_ADMISSION_*` env var into
+   `<session_dir>/meta/run_meta.json` under the `admission_config` block,
+   so post-hoc analysis can recover the active SLOs without grepping
+   `process_logs/server.stderr.log`.
+
+Pattern matches request_logs / metrics / crash_dump per-session routing.
+
+### Where to put SLO settings
+
+Three patterns, pick by use case:
+
+| Pattern | What | When |
+|---|---|---|
+| Shell `export` before run | one-off | quick debug |
+| `ms_dev/experiments/<name>.sh` (committed) | named, reproducible | comparing experiments — ★ |
+| `ms_dev/env.local.sh` (gitignored, auto-sourced by `env.sh`) | host-local default | personal defaults |
+
+**Don't edit `env.common.sh` / `env.single.sh` / `env.pd.sh` for experiments** —
+those are upstream-tracked defaults. The pre-baked wrappers under
+`ms_dev/experiments/` cover the common cases (`admission_ratio_only`,
+`admission_ratio_with_safety`, `admission_absolute_only`, `admission_dryrun`).
 
 ### Live monitoring
 
