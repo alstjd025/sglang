@@ -902,6 +902,17 @@ def render_status_single(
         enabled_roles.get("server", False),
         use_color,
     )
+    # Admission counter sums (counter is registered on attn_tp_rank=0 only,
+    # so series_sum returns the actual count not tp_size×).
+    server_admit_n = series_sum(
+        server, "sglang:admission_decisions_total", "decision", "admit"
+    )
+    server_reject_n = series_sum(
+        server, "sglang:admission_decisions_total", "decision", "reject"
+    )
+    server_dryrun_reject_n = series_sum(
+        server, "sglang:admission_decisions_total", "decision", "dryrun_would_reject"
+    )
 
     lines = []
     lines.append(colorize("=" * 118, "muted", use_color))
@@ -975,6 +986,67 @@ def render_status_single(
             label_width=11,
         )
     )
+
+    # Admission control counters (only when admission is active).
+    if feature_states.get("server_admission") is True:
+        admit_int = int(server_admit_n) if server_admit_n is not None else None
+        reject_int = int(server_reject_n) if server_reject_n is not None else None
+        dryrun_int = (
+            int(server_dryrun_reject_n) if server_dryrun_reject_n is not None else None
+        )
+        in_dryrun = bool(feature_states.get("server_admission_dry_run"))
+        decided_total = (admit_int or 0) + (reject_int or 0) + (dryrun_int or 0)
+        # In enforcement mode the "would_reject" share is the rejection rate.
+        # In dry-run mode the controller admits everything, so the meaningful
+        # rate is dryrun_would_reject / decided_total.
+        if in_dryrun:
+            dryrun_pct = (
+                (dryrun_int / decided_total * 100.0)
+                if decided_total > 0 and dryrun_int is not None else None
+            )
+            lines.append(
+                "        "
+                + metric_row(
+                    [
+                        ("admit", fmt_int(admit_int)),
+                        ("dryrun_reject", color_high_bad(
+                            dryrun_int, fmt_int(dryrun_int),
+                            warn=1, bad=100, enabled=use_color,
+                        )),
+                        ("dryrun_rate", color_high_bad(
+                            dryrun_pct,
+                            fmt_pct(dryrun_pct / 100.0 if dryrun_pct is not None else None),
+                            warn=10.0, bad=30.0, enabled=use_color,
+                        )),
+                        ("decided", fmt_int(decided_total) if decided_total > 0 else "-"),
+                    ],
+                    label_width=14,
+                )
+            )
+        else:
+            reject_pct = (
+                (reject_int / decided_total * 100.0)
+                if decided_total > 0 and reject_int is not None else None
+            )
+            lines.append(
+                "        "
+                + metric_row(
+                    [
+                        ("admit", fmt_int(admit_int)),
+                        ("reject", color_high_bad(
+                            reject_int, fmt_int(reject_int),
+                            warn=1, bad=100, enabled=use_color,
+                        )),
+                        ("reject_rate", color_high_bad(
+                            reject_pct,
+                            fmt_pct(reject_pct / 100.0 if reject_pct is not None else None),
+                            warn=10.0, bad=30.0, enabled=use_color,
+                        )),
+                        ("decided", fmt_int(decided_total) if decided_total > 0 else "-"),
+                    ],
+                    label_width=14,
+                )
+            )
 
     lines.extend(gpu_lines)
     lines.append(system_summary)

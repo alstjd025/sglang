@@ -1219,10 +1219,14 @@ class Scheduler(
             tbt_cost=tbt_cost,
             tbt_tracker=tbt_tracker,
         )
-        # Metrics: only register Prometheus collectors if --enable-metrics is on.
+        # Metrics: only register Prometheus collectors on attn_tp_rank=0.
+        # Same TP-dedup rationale as DecisionLogger — _add_request_to_queue
+        # runs on every rank (broadcast input) and each rank's controller.decide
+        # would otherwise increment the counter, inflating values by tp_size.
         if (
             self.server_args.enable_metrics
             and getattr(self, "metrics_collector", None) is not None
+            and getattr(self, "attn_tp_rank", 0) == 0
         ):
             self.admission_metrics = AdmissionMetrics(
                 labels=self.metrics_collector.labels
