@@ -58,11 +58,24 @@ class SchedulerSnapshot:
 # and JSONL log fields.
 REASON_ADMIT = "ADMIT"
 REASON_DISABLED = "DISABLED"
-REASON_TTFT_PREDICTED = "TTFT_PREDICTED"
-REASON_TBT_PREDICTED = "TBT_PREDICTED"
-REASON_TBT_REACTIVE = "TBT_REACTIVE"
+REASON_TTFT_PREDICTED = "TTFT_PREDICTED"        # absolute TTFT > ttft_slo_ms
+REASON_TTFT_RATIO = "TTFT_RATIO"                # pred_ttft / solo_ttft > ratio
+REASON_TBT_PREDICTED = "TBT_PREDICTED"          # absolute TBT > tbt_slo_ms
+REASON_TBT_RATIO = "TBT_RATIO"                  # pred_tbt / solo_tbt > ratio
+REASON_TBT_REACTIVE = "TBT_REACTIVE"            # measured EWMA > tbt_slo_ms * react
 
-REJECT_REASONS = (REASON_TTFT_PREDICTED, REASON_TBT_PREDICTED, REASON_TBT_REACTIVE)
+REJECT_REASONS = (
+    REASON_TTFT_PREDICTED,
+    REASON_TTFT_RATIO,
+    REASON_TBT_PREDICTED,
+    REASON_TBT_RATIO,
+    REASON_TBT_REACTIVE,
+)
+
+
+# Below this floor (ms) the solo-run baseline is too small to give a meaningful
+# slowdown ratio (numerical noise dominates). Skip ratio checks in that regime.
+_RATIO_SOLO_FLOOR_MS = 1.0
 
 
 @dataclass(frozen=True)
@@ -73,16 +86,24 @@ class AdmissionDecision:
     `dry_run_would_reject` is True iff the controller is in dry-run mode AND
     the underlying policy would have rejected. Use this to drive log/metric
     bookkeeping that distinguishes "shadow reject" from genuine admit.
+
+    Solo-run baselines (`solo_ttft_ms`, `solo_tbt_ms`) are the model's estimate
+    of "this request alone, on an idle server". The ratio policy compares the
+    under-load prediction against this baseline.
     """
 
     admit: bool
     reason: str
     predicted_ttft_ms: Optional[float] = None
     predicted_tbt_ms: Optional[float] = None
+    solo_ttft_ms: Optional[float] = None
+    solo_tbt_ms: Optional[float] = None
     queue_predicted_ms: Optional[float] = None
     tbt_ewma_ms: Optional[float] = None
     ttft_slo_ms: Optional[float] = None
     tbt_slo_ms: Optional[float] = None
+    ttft_slo_ratio: Optional[float] = None
+    tbt_slo_ratio: Optional[float] = None
     # Echo of what the new request's T_prefill prediction was. Caller stores
     # this on the request so the next admission can include it in t_queue.
     predicted_prefill_ms: float = 0.0
@@ -96,26 +117,66 @@ class AdmissionDecision:
 
 @dataclass
 class AdmissionConfig:
-    """Plain-data config injected at scheduler `__init__`."""
+    """Plain-data config injected at scheduler `__init__`.
+
+    Two parallel SLO axes — set either, or both:
+
+    - **Absolute** (`ttft_slo_ms`, `tbt_slo_ms`): hard latency caps in ms.
+      Reject if predicted latency exceeds the cap.
+    - **Ratio** (`ttft_slo_ratio`, `tbt_slo_ratio`): per-request fairness bound,
+      `pred / solo_run_baseline`. Reject if a request would be slowed down
+      more than N× compared to running alone on an idle server. Adapts to
+      heterogeneous request sizes (a 50k prompt has a 500ms baseline, so
+      1000ms is fine; a 500-tok prompt has a 30ms baseline, so 60ms is the
+      bound — both at ratio=2).
+
+    When both are set, whichever fires first wins; absolute is checked
+    before ratio so the reason is the more "severe" cap.
+    """
 
     ttft_slo_ms: Optional[float] = None
     tbt_slo_ms: Optional[float] = None
+    ttft_slo_ratio: Optional[float] = None
+    tbt_slo_ratio: Optional[float] = None
     tbt_ewma_alpha: float = 0.1
     tbt_warm_up_steps: int = 100
     tbt_reactive_ratio: float = 0.9
     dry_run: bool = False
 
     @property
-    def stage1_enabled(self) -> bool:
+    def ttft_abs_enabled(self) -> bool:
         return self.ttft_slo_ms is not None and self.ttft_slo_ms > 0
 
     @property
-    def stage2_3_enabled(self) -> bool:
+    def ttft_ratio_enabled(self) -> bool:
+        return self.ttft_slo_ratio is not None and self.ttft_slo_ratio > 1.0
+
+    @property
+    def tbt_abs_enabled(self) -> bool:
         return self.tbt_slo_ms is not None and self.tbt_slo_ms > 0
 
     @property
+    def tbt_ratio_enabled(self) -> bool:
+        return self.tbt_slo_ratio is not None and self.tbt_slo_ratio > 1.0
+
+    @property
+    def stage1_enabled(self) -> bool:
+        """Stage 1 (TTFT) runs iff at least one TTFT criterion is set."""
+        return self.ttft_abs_enabled or self.ttft_ratio_enabled
+
+    @property
+    def stage2_enabled(self) -> bool:
+        """Stage 2 (TBT predicted) runs iff at least one TBT criterion is set."""
+        return self.tbt_abs_enabled or self.tbt_ratio_enabled
+
+    @property
+    def stage3_enabled(self) -> bool:
+        """Stage 3 (TBT reactive) needs the absolute TBT SLO as a ms threshold."""
+        return self.tbt_abs_enabled
+
+    @property
     def any_stage_enabled(self) -> bool:
-        return self.stage1_enabled or self.stage2_3_enabled
+        return self.stage1_enabled or self.stage2_enabled
 
 
 class AdmissionController:
@@ -152,10 +213,12 @@ class AdmissionController:
         else:
             logger.info(
                 "admission control: enabled "
-                "(ttft_slo=%s tbt_slo=%s dry_run=%s prefill_cost=%s "
-                "tbt_cost=%s tbt_tracker=%s)",
+                "(ttft_slo_ms=%s tbt_slo_ms=%s ttft_slo_ratio=%s tbt_slo_ratio=%s "
+                "dry_run=%s prefill_cost=%s tbt_cost=%s tbt_tracker=%s)",
                 config.ttft_slo_ms,
                 config.tbt_slo_ms,
+                config.ttft_slo_ratio,
+                config.tbt_slo_ratio,
                 config.dry_run,
                 prefill_cost is not None,
                 tbt_cost is not None,
@@ -190,51 +253,107 @@ class AdmissionController:
                 AdmissionDecision(admit=True, reason=REASON_DISABLED)
             )
 
-        # Always compute T_prefill for this request when we have the model;
-        # we need it whether we admit, dry-run-reject, or genuinely reject.
-        t_prefill = (
+        # ---- Compute baselines + predictions ----------------------------
+        # Solo-run TTFT = T_prefill on an idle server (queue empty). This is
+        # also the per-request "predicted prefill" we attach back to the req
+        # so the next admission's t_queue includes it.
+        solo_ttft = (
             self.prefill_cost.estimate_ms(prompt_len, prefix_match_len)
             if self.prefill_cost is not None
-            else 0.0
+            else None
         )
+        t_prefill = solo_ttft if solo_ttft is not None else 0.0
         t_queue = snapshot.waiting_queue_predicted_prefill_ms
         pred_ttft = t_queue + t_prefill
 
-        # ---- Stage 1: TTFT predicted -------------------------------------
+        # Solo-run TBT = TBT cost model at bs=1 with just this request's KV.
+        # Predicted TBT = same model with running_batch + this request added.
+        solo_tbt: Optional[float] = None
+        pred_tbt: Optional[float] = None
+        if self.tbt_cost is not None:
+            solo_tbt = self.tbt_cost.estimate_ms(1, prompt_len)
+            bs = snapshot.running_batch_size + 1
+            kv = snapshot.running_batch_total_kv_tokens + prompt_len
+            pred_tbt = self.tbt_cost.estimate_ms(bs, kv)
+
+        # ---- Stage 1a: TTFT absolute -------------------------------------
         if (
-            self.config.stage1_enabled
-            and self.prefill_cost is not None
+            self.config.ttft_abs_enabled
+            and solo_ttft is not None
             and pred_ttft > self.config.ttft_slo_ms
         ):
             return self._record(
                 self._reject_or_dryrun(
                     reason=REASON_TTFT_PREDICTED,
                     predicted_ttft_ms=pred_ttft,
+                    predicted_tbt_ms=pred_tbt,
+                    solo_ttft_ms=solo_ttft,
+                    solo_tbt_ms=solo_tbt,
                     predicted_prefill_ms=t_prefill,
                     queue_predicted_ms=t_queue,
                 )
             )
 
-        # ---- Stage 2: TBT predicted (current-batch approximation) --------
-        pred_tbt: Optional[float] = None
-        if self.config.stage2_3_enabled and self.tbt_cost is not None:
-            bs = snapshot.running_batch_size + 1
-            kv = snapshot.running_batch_total_kv_tokens + prompt_len
-            pred_tbt = self.tbt_cost.estimate_ms(bs, kv)
-            if pred_tbt > self.config.tbt_slo_ms:
-                return self._record(
-                    self._reject_or_dryrun(
-                        reason=REASON_TBT_PREDICTED,
-                        predicted_ttft_ms=pred_ttft,
-                        predicted_tbt_ms=pred_tbt,
-                        predicted_prefill_ms=t_prefill,
-                        queue_predicted_ms=t_queue,
-                    )
+        # ---- Stage 1b: TTFT ratio (slowdown vs solo-run) -----------------
+        if (
+            self.config.ttft_ratio_enabled
+            and solo_ttft is not None
+            and solo_ttft > _RATIO_SOLO_FLOOR_MS
+            and pred_ttft / solo_ttft > self.config.ttft_slo_ratio
+        ):
+            return self._record(
+                self._reject_or_dryrun(
+                    reason=REASON_TTFT_RATIO,
+                    predicted_ttft_ms=pred_ttft,
+                    predicted_tbt_ms=pred_tbt,
+                    solo_ttft_ms=solo_ttft,
+                    solo_tbt_ms=solo_tbt,
+                    predicted_prefill_ms=t_prefill,
+                    queue_predicted_ms=t_queue,
                 )
+            )
 
-        # ---- Stage 3: TBT reactive EWMA safety net -----------------------
+        # ---- Stage 2a: TBT absolute --------------------------------------
+        if (
+            self.config.tbt_abs_enabled
+            and pred_tbt is not None
+            and pred_tbt > self.config.tbt_slo_ms
+        ):
+            return self._record(
+                self._reject_or_dryrun(
+                    reason=REASON_TBT_PREDICTED,
+                    predicted_ttft_ms=pred_ttft,
+                    predicted_tbt_ms=pred_tbt,
+                    solo_ttft_ms=solo_ttft,
+                    solo_tbt_ms=solo_tbt,
+                    predicted_prefill_ms=t_prefill,
+                    queue_predicted_ms=t_queue,
+                )
+            )
+
+        # ---- Stage 2b: TBT ratio -----------------------------------------
+        if (
+            self.config.tbt_ratio_enabled
+            and pred_tbt is not None
+            and solo_tbt is not None
+            and solo_tbt > _RATIO_SOLO_FLOOR_MS
+            and pred_tbt / solo_tbt > self.config.tbt_slo_ratio
+        ):
+            return self._record(
+                self._reject_or_dryrun(
+                    reason=REASON_TBT_RATIO,
+                    predicted_ttft_ms=pred_ttft,
+                    predicted_tbt_ms=pred_tbt,
+                    solo_ttft_ms=solo_ttft,
+                    solo_tbt_ms=solo_tbt,
+                    predicted_prefill_ms=t_prefill,
+                    queue_predicted_ms=t_queue,
+                )
+            )
+
+        # ---- Stage 3: TBT reactive EWMA safety net (absolute SLO only) ---
         ewma_ms: Optional[float] = None
-        if self.config.stage2_3_enabled and self.tbt_tracker is not None:
+        if self.config.stage3_enabled and self.tbt_tracker is not None:
             if self.tbt_tracker.is_warm():
                 ewma_ms = self.tbt_tracker.get()
                 threshold = self.config.tbt_slo_ms * self.config.tbt_reactive_ratio
@@ -244,6 +363,8 @@ class AdmissionController:
                             reason=REASON_TBT_REACTIVE,
                             predicted_ttft_ms=pred_ttft,
                             predicted_tbt_ms=pred_tbt,
+                            solo_ttft_ms=solo_ttft,
+                            solo_tbt_ms=solo_tbt,
                             tbt_ewma_ms=ewma_ms,
                             predicted_prefill_ms=t_prefill,
                             queue_predicted_ms=t_queue,
@@ -259,10 +380,14 @@ class AdmissionController:
                 reason=REASON_ADMIT,
                 predicted_ttft_ms=pred_ttft,
                 predicted_tbt_ms=pred_tbt,
+                solo_ttft_ms=solo_ttft,
+                solo_tbt_ms=solo_tbt,
                 queue_predicted_ms=t_queue,
                 tbt_ewma_ms=ewma_ms,
                 ttft_slo_ms=self.config.ttft_slo_ms,
                 tbt_slo_ms=self.config.tbt_slo_ms,
+                ttft_slo_ratio=self.config.ttft_slo_ratio,
+                tbt_slo_ratio=self.config.tbt_slo_ratio,
                 predicted_prefill_ms=t_prefill,
             )
         )
@@ -279,6 +404,8 @@ class AdmissionController:
         reason: str,
         predicted_ttft_ms: Optional[float] = None,
         predicted_tbt_ms: Optional[float] = None,
+        solo_ttft_ms: Optional[float] = None,
+        solo_tbt_ms: Optional[float] = None,
         tbt_ewma_ms: Optional[float] = None,
         queue_predicted_ms: Optional[float] = None,
         predicted_prefill_ms: float = 0.0,
@@ -289,10 +416,14 @@ class AdmissionController:
             reason=reason,
             predicted_ttft_ms=predicted_ttft_ms,
             predicted_tbt_ms=predicted_tbt_ms,
+            solo_ttft_ms=solo_ttft_ms,
+            solo_tbt_ms=solo_tbt_ms,
             queue_predicted_ms=queue_predicted_ms,
             tbt_ewma_ms=tbt_ewma_ms,
             ttft_slo_ms=self.config.ttft_slo_ms,
             tbt_slo_ms=self.config.tbt_slo_ms,
+            ttft_slo_ratio=self.config.ttft_slo_ratio,
+            tbt_slo_ratio=self.config.tbt_slo_ratio,
             predicted_prefill_ms=predicted_prefill_ms,
             dry_run_would_reject=self.config.dry_run,
         )

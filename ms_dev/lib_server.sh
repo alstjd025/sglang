@@ -118,7 +118,10 @@ append_admission_args() {
   local mode="${2:-single}"
 
   local has_slo=0
-  if [[ -n "${SGLANG_ADMISSION_TTFT_SLO_MS:-}" || -n "${SGLANG_ADMISSION_TBT_SLO_MS:-}" ]]; then
+  if [[ -n "${SGLANG_ADMISSION_TTFT_SLO_MS:-}" \
+     || -n "${SGLANG_ADMISSION_TBT_SLO_MS:-}" \
+     || -n "${SGLANG_ADMISSION_TTFT_SLO_RATIO:-}" \
+     || -n "${SGLANG_ADMISSION_TBT_SLO_RATIO:-}" ]]; then
     has_slo=1
   fi
 
@@ -131,6 +134,12 @@ append_admission_args() {
   fi
   if [[ -n "${SGLANG_ADMISSION_TBT_SLO_MS:-}" ]]; then
     _adm_out+=(--admission-tbt-slo-ms "${SGLANG_ADMISSION_TBT_SLO_MS}")
+  fi
+  if [[ -n "${SGLANG_ADMISSION_TTFT_SLO_RATIO:-}" ]]; then
+    _adm_out+=(--admission-ttft-slo-ratio "${SGLANG_ADMISSION_TTFT_SLO_RATIO}")
+  fi
+  if [[ -n "${SGLANG_ADMISSION_TBT_SLO_RATIO:-}" ]]; then
+    _adm_out+=(--admission-tbt-slo-ratio "${SGLANG_ADMISSION_TBT_SLO_RATIO}")
   fi
   if [[ -n "${SGLANG_ADMISSION_PREFILL_COST_MODEL:-}" ]]; then
     _adm_out+=(--admission-prefill-cost-model-path "${SGLANG_ADMISSION_PREFILL_COST_MODEL}")

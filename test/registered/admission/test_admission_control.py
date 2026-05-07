@@ -16,8 +16,10 @@ from sglang.srt.managers.admission_control.controller import (
     REASON_ADMIT,
     REASON_DISABLED,
     REASON_TBT_PREDICTED,
+    REASON_TBT_RATIO,
     REASON_TBT_REACTIVE,
     REASON_TTFT_PREDICTED,
+    REASON_TTFT_RATIO,
     AdmissionConfig,
     AdmissionController,
     AdmissionDecision,
@@ -441,6 +443,74 @@ class TestAdmissionControllerStage3(unittest.TestCase):
         self.assertTrue(d.admit)
 
 
+class TestAdmissionControllerRatioSlo(unittest.TestCase):
+    """Per-request slowdown-ratio policy (Stage 1b / 2b)."""
+
+    def test_ttft_ratio_only_admit(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ratio=2.0),  # solo×2 ceiling
+            prefill_cost=_prefill(beta=1.0, gamma=10.0),  # T = d + 10
+        )
+        # n=100, p=0 → solo_ttft=110ms, queue=0 → pred=110, ratio=1.0 < 2.0 → admit
+        d = ctrl.decide(prompt_len=100, prefix_match_len=0, snapshot=_snapshot())
+        self.assertTrue(d.admit)
+        self.assertEqual(d.reason, REASON_ADMIT)
+        self.assertAlmostEqual(d.solo_ttft_ms, 110.0)
+
+    def test_ttft_ratio_only_reject_due_to_queue(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ratio=2.0),
+            prefill_cost=_prefill(beta=1.0, gamma=10.0),
+        )
+        # solo=110, queue=300 → pred=410, ratio=410/110≈3.7 > 2.0 → reject
+        d = ctrl.decide(
+            prompt_len=100, prefix_match_len=0,
+            snapshot=_snapshot(queue_ms=300.0),
+        )
+        self.assertFalse(d.admit)
+        self.assertEqual(d.reason, REASON_TTFT_RATIO)
+        self.assertAlmostEqual(d.solo_ttft_ms, 110.0)
+
+    def test_ttft_ratio_skipped_when_solo_below_floor(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ratio=2.0),
+            prefill_cost=_prefill(beta=0.0, gamma=0.5),  # solo=0.5ms < 1ms floor
+        )
+        # Even with huge queue, ratio check is skipped.
+        d = ctrl.decide(
+            prompt_len=100, prefix_match_len=0,
+            snapshot=_snapshot(queue_ms=99999.0),
+        )
+        self.assertTrue(d.admit)
+
+    def test_tbt_ratio_reject(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(tbt_slo_ratio=2.0),
+            tbt_cost=_tbt(a=0.0, b=10.0, c=0.0),  # bs-only model
+        )
+        # solo=10*1=10, with bs=5 → pred=10*6=60, ratio=6 > 2 → reject
+        d = ctrl.decide(
+            prompt_len=10, prefix_match_len=0, snapshot=_snapshot(bs=5),
+        )
+        self.assertFalse(d.admit)
+        self.assertEqual(d.reason, REASON_TBT_RATIO)
+        self.assertAlmostEqual(d.solo_tbt_ms, 10.0)
+
+    def test_absolute_wins_over_ratio(self):
+        ctrl = AdmissionController(
+            AdmissionConfig(ttft_slo_ms=200, ttft_slo_ratio=2.0),
+            prefill_cost=_prefill(beta=1.0, gamma=10.0),
+        )
+        # solo=510, queue=2000 → pred=2510. Both abs(>200) and ratio(~5>2) fire.
+        d = ctrl.decide(
+            prompt_len=500, prefix_match_len=0,
+            snapshot=_snapshot(queue_ms=2000.0),
+        )
+        self.assertFalse(d.admit)
+        # Absolute is checked first.
+        self.assertEqual(d.reason, REASON_TTFT_PREDICTED)
+
+
 class TestAdmissionControllerStageOrder(unittest.TestCase):
     """First-violation-wins ordering: Stage 1 > Stage 2 > Stage 3."""
 
@@ -700,57 +770,106 @@ class TestReplayLogic(unittest.TestCase):
             rid="r", ts=0.0, admit=True, reason=REASON_ADMIT,
             dry_run_would_reject=False,
             predicted_ttft_ms=None, predicted_tbt_ms=None,
+            solo_ttft_ms=None, solo_tbt_ms=None,
             tbt_ewma_ms=None, queue_predicted_ms=None,
             ttft_slo_ms=None, tbt_slo_ms=None,
+            ttft_slo_ratio=None, tbt_slo_ratio=None,
             prompt_len=0, prefix_len=0,
             running_batch_size=0, running_batch_total_kv_tokens=0,
         )
         defaults.update(kw)
         return self.replay.DecisionRow(**defaults)
 
+    # ---- Absolute SLO -----------------------------------------------------
+
     def test_disabled_passes_through(self):
         row = self._row(reason=REASON_DISABLED)
-        verdict = self.replay.evaluate_row(row, 1000, 100, 0.9)
+        verdict = self.replay.evaluate_row(row, 1000, 100, 1.0, 1.0, 0.9)
         self.assertEqual(verdict, REASON_DISABLED)
 
     def test_ttft_threshold_applied(self):
         row = self._row(predicted_ttft_ms=1500.0, predicted_tbt_ms=10.0)
-        # SLO 2000 → admit; SLO 1000 → reject.
-        self.assertEqual(self.replay.evaluate_row(row, 2000, 100, 0.9), REASON_ADMIT)
         self.assertEqual(
-            self.replay.evaluate_row(row, 1000, 100, 0.9), REASON_TTFT_PREDICTED
+            self.replay.evaluate_row(row, 2000, 100, 1.0, 1.0, 0.9), REASON_ADMIT
+        )
+        self.assertEqual(
+            self.replay.evaluate_row(row, 1000, 100, 1.0, 1.0, 0.9),
+            REASON_TTFT_PREDICTED,
         )
 
     def test_tbt_predicted_priority(self):
-        # Stage 2 dominates Stage 3 when both would reject.
         row = self._row(predicted_ttft_ms=10.0, predicted_tbt_ms=300.0, tbt_ewma_ms=400.0)
         self.assertEqual(
-            self.replay.evaluate_row(row, 5000, 200, 0.9), REASON_TBT_PREDICTED
+            self.replay.evaluate_row(row, 5000, 200, 1.0, 1.0, 0.9),
+            REASON_TBT_PREDICTED,
         )
 
     def test_tbt_reactive_when_predicted_passes(self):
         row = self._row(predicted_ttft_ms=10.0, predicted_tbt_ms=20.0, tbt_ewma_ms=400.0)
         self.assertEqual(
-            self.replay.evaluate_row(row, 5000, 200, 0.9), REASON_TBT_REACTIVE
+            self.replay.evaluate_row(row, 5000, 200, 1.0, 1.0, 0.9),
+            REASON_TBT_REACTIVE,
         )
 
-    def test_evaluate_slo_counts(self):
+    # ---- Ratio SLO --------------------------------------------------------
+
+    def test_ttft_ratio_admit(self):
+        # 200ms / 100ms = 2.0 ratio; SLO ratio 3.0 → admit.
+        row = self._row(predicted_ttft_ms=200.0, solo_ttft_ms=100.0)
+        self.assertEqual(
+            self.replay.evaluate_row(row, 0, 0, 3.0, 1.0, 0.9), REASON_ADMIT
+        )
+
+    def test_ttft_ratio_reject(self):
+        # 400ms / 100ms = 4.0 ratio; SLO ratio 2.0 → reject.
+        row = self._row(predicted_ttft_ms=400.0, solo_ttft_ms=100.0)
+        self.assertEqual(
+            self.replay.evaluate_row(row, 0, 0, 2.0, 1.0, 0.9), REASON_TTFT_RATIO
+        )
+
+    def test_tbt_ratio_reject(self):
+        row = self._row(predicted_tbt_ms=80.0, solo_tbt_ms=20.0)
+        # 4.0 ratio; SLO 3.0 → reject
+        self.assertEqual(
+            self.replay.evaluate_row(row, 0, 0, 1.0, 3.0, 0.9), REASON_TBT_RATIO
+        )
+
+    def test_ratio_skips_when_solo_below_floor(self):
+        # solo_ttft = 0.5ms < 1ms floor → ratio check skipped (admit)
+        row = self._row(predicted_ttft_ms=10.0, solo_ttft_ms=0.5)
+        self.assertEqual(
+            self.replay.evaluate_row(row, 0, 0, 2.0, 1.0, 0.9), REASON_ADMIT
+        )
+
+    def test_absolute_wins_over_ratio_when_both_fire(self):
+        # pred=5000, solo=1000 → both abs(5000>2000) and ratio(5>2) fire.
+        # Absolute is checked first → reason=TTFT_PREDICTED.
+        row = self._row(predicted_ttft_ms=5000.0, solo_ttft_ms=1000.0)
+        self.assertEqual(
+            self.replay.evaluate_row(row, 2000, 0, 2.0, 1.0, 0.9),
+            REASON_TTFT_PREDICTED,
+        )
+
+    def test_evaluate_slo_counts_with_ratio(self):
         rows = [
-            self._row(predicted_ttft_ms=10.0),         # admit
-            self._row(predicted_ttft_ms=5000.0),       # rej_ttft
-            self._row(predicted_ttft_ms=10.0, predicted_tbt_ms=300.0),  # rej_tbt_p
+            self._row(predicted_ttft_ms=10.0),                     # admit (no slo)
+            self._row(predicted_ttft_ms=5000.0, solo_ttft_ms=100), # rej_ttft (abs)
+            self._row(predicted_ttft_ms=300.0, solo_ttft_ms=100),  # rej_ttft_ratio (3>2)
+            self._row(predicted_tbt_ms=300.0, solo_tbt_ms=20),     # rej_tbt_pred (abs)
+            self._row(predicted_tbt_ms=80.0, solo_tbt_ms=20),      # rej_tbt_ratio (4>3)
             self._row(predicted_ttft_ms=10.0, predicted_tbt_ms=20.0,
-                      tbt_ewma_ms=400.0),              # rej_tbt_r
-            self._row(reason=REASON_DISABLED),         # skipped
+                      solo_tbt_ms=20.0, tbt_ewma_ms=400.0),        # rej_tbt_react
+            self._row(reason=REASON_DISABLED),                     # skipped
         ]
-        out = self.replay.evaluate_slo(rows, 1000, 200, 0.9)
-        self.assertEqual(out.total, 5)
+        out = self.replay.evaluate_slo(rows, 1000, 200, 2.0, 3.0, 0.9)
+        self.assertEqual(out.total, 7)
         self.assertEqual(out.admit, 1)
         self.assertEqual(out.rej_ttft, 1)
+        self.assertEqual(out.rej_ttft_ratio, 1)
         self.assertEqual(out.rej_tbt_pred, 1)
+        self.assertEqual(out.rej_tbt_ratio, 1)
         self.assertEqual(out.rej_tbt_react, 1)
         self.assertEqual(out.skipped_disabled, 1)
-        self.assertAlmostEqual(out.reject_pct, 75.0)  # 3/(5-1) = 75%
 
 
 if __name__ == "__main__":

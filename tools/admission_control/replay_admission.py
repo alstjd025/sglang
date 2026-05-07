@@ -47,8 +47,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 REASON_ADMIT = "ADMIT"
 REASON_DISABLED = "DISABLED"
 REASON_TTFT_PREDICTED = "TTFT_PREDICTED"
+REASON_TTFT_RATIO = "TTFT_RATIO"
 REASON_TBT_PREDICTED = "TBT_PREDICTED"
+REASON_TBT_RATIO = "TBT_RATIO"
 REASON_TBT_REACTIVE = "TBT_REACTIVE"
+
+_RATIO_SOLO_FLOOR_MS = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -65,10 +69,14 @@ class DecisionRow:
     dry_run_would_reject: bool
     predicted_ttft_ms: Optional[float]
     predicted_tbt_ms: Optional[float]
+    solo_ttft_ms: Optional[float]
+    solo_tbt_ms: Optional[float]
     tbt_ewma_ms: Optional[float]
     queue_predicted_ms: Optional[float]
     ttft_slo_ms: Optional[float]
     tbt_slo_ms: Optional[float]
+    ttft_slo_ratio: Optional[float]
+    tbt_slo_ratio: Optional[float]
     prompt_len: int
     prefix_len: int
     running_batch_size: int
@@ -84,10 +92,14 @@ class DecisionRow:
             dry_run_would_reject=bool(d.get("dry_run_would_reject", False)),
             predicted_ttft_ms=_optfloat(d.get("predicted_ttft_ms")),
             predicted_tbt_ms=_optfloat(d.get("predicted_tbt_ms")),
+            solo_ttft_ms=_optfloat(d.get("solo_ttft_ms")),
+            solo_tbt_ms=_optfloat(d.get("solo_tbt_ms")),
             tbt_ewma_ms=_optfloat(d.get("tbt_ewma_ms")),
             queue_predicted_ms=_optfloat(d.get("queue_predicted_ms")),
             ttft_slo_ms=_optfloat(d.get("ttft_slo_ms")),
             tbt_slo_ms=_optfloat(d.get("tbt_slo_ms")),
+            ttft_slo_ratio=_optfloat(d.get("ttft_slo_ratio")),
+            tbt_slo_ratio=_optfloat(d.get("tbt_slo_ratio")),
             prompt_len=int(d.get("prompt_len", 0)),
             prefix_len=int(d.get("prefix_len", 0)),
             running_batch_size=int(d.get("running_batch_size", 0)),
@@ -134,17 +146,27 @@ def load_log(path: Path) -> List[DecisionRow]:
 class SloOutcome:
     ttft_slo_ms: float
     tbt_slo_ms: float
+    ttft_slo_ratio: float
+    tbt_slo_ratio: float
     reactive_ratio: float
     total: int
     admit: int
     rej_ttft: int
+    rej_ttft_ratio: int
     rej_tbt_pred: int
+    rej_tbt_ratio: int
     rej_tbt_react: int
     skipped_disabled: int
 
     @property
     def reject_total(self) -> int:
-        return self.rej_ttft + self.rej_tbt_pred + self.rej_tbt_react
+        return (
+            self.rej_ttft
+            + self.rej_ttft_ratio
+            + self.rej_tbt_pred
+            + self.rej_tbt_ratio
+            + self.rej_tbt_react
+        )
 
     @property
     def reject_pct(self) -> float:
@@ -156,17 +178,19 @@ def evaluate_row(
     row: DecisionRow,
     ttft_slo_ms: float,
     tbt_slo_ms: float,
+    ttft_slo_ratio: float,
+    tbt_slo_ratio: float,
     reactive_ratio: float,
 ) -> str:
-    """Apply the same hybrid-3-stage policy at the candidate SLOs.
+    """Apply the same hybrid policy at the candidate SLOs.
 
-    Returns one of REASON_* strings. DISABLED rows are passed through
-    unchanged (controller was off / non-NULL disagg).
+    Set any threshold to 0 (or below 1.0 for ratios) to disable that stage.
+    Returns one of REASON_* strings. DISABLED rows pass through.
     """
     if row.reason == REASON_DISABLED:
         return REASON_DISABLED
 
-    # Stage 1
+    # Stage 1a: TTFT absolute
     if (
         ttft_slo_ms > 0
         and row.predicted_ttft_ms is not None
@@ -174,7 +198,17 @@ def evaluate_row(
     ):
         return REASON_TTFT_PREDICTED
 
-    # Stage 2
+    # Stage 1b: TTFT ratio
+    if (
+        ttft_slo_ratio > 1.0
+        and row.predicted_ttft_ms is not None
+        and row.solo_ttft_ms is not None
+        and row.solo_ttft_ms > _RATIO_SOLO_FLOOR_MS
+        and row.predicted_ttft_ms / row.solo_ttft_ms > ttft_slo_ratio
+    ):
+        return REASON_TTFT_RATIO
+
+    # Stage 2a: TBT absolute
     if (
         tbt_slo_ms > 0
         and row.predicted_tbt_ms is not None
@@ -182,7 +216,17 @@ def evaluate_row(
     ):
         return REASON_TBT_PREDICTED
 
-    # Stage 3 (reactive)
+    # Stage 2b: TBT ratio
+    if (
+        tbt_slo_ratio > 1.0
+        and row.predicted_tbt_ms is not None
+        and row.solo_tbt_ms is not None
+        and row.solo_tbt_ms > _RATIO_SOLO_FLOOR_MS
+        and row.predicted_tbt_ms / row.solo_tbt_ms > tbt_slo_ratio
+    ):
+        return REASON_TBT_RATIO
+
+    # Stage 3: reactive (only meaningful with absolute TBT SLO)
     if (
         tbt_slo_ms > 0
         and row.tbt_ewma_ms is not None
@@ -197,27 +241,39 @@ def evaluate_slo(
     rows: List[DecisionRow],
     ttft_slo_ms: float,
     tbt_slo_ms: float,
+    ttft_slo_ratio: float,
+    tbt_slo_ratio: float,
     reactive_ratio: float,
 ) -> SloOutcome:
     out = SloOutcome(
         ttft_slo_ms=ttft_slo_ms,
         tbt_slo_ms=tbt_slo_ms,
+        ttft_slo_ratio=ttft_slo_ratio,
+        tbt_slo_ratio=tbt_slo_ratio,
         reactive_ratio=reactive_ratio,
         total=len(rows),
         admit=0,
         rej_ttft=0,
+        rej_ttft_ratio=0,
         rej_tbt_pred=0,
+        rej_tbt_ratio=0,
         rej_tbt_react=0,
         skipped_disabled=0,
     )
     for r in rows:
-        verdict = evaluate_row(r, ttft_slo_ms, tbt_slo_ms, reactive_ratio)
+        verdict = evaluate_row(
+            r, ttft_slo_ms, tbt_slo_ms, ttft_slo_ratio, tbt_slo_ratio, reactive_ratio
+        )
         if verdict == REASON_ADMIT:
             out.admit += 1
         elif verdict == REASON_TTFT_PREDICTED:
             out.rej_ttft += 1
+        elif verdict == REASON_TTFT_RATIO:
+            out.rej_ttft_ratio += 1
         elif verdict == REASON_TBT_PREDICTED:
             out.rej_tbt_pred += 1
+        elif verdict == REASON_TBT_RATIO:
+            out.rej_tbt_ratio += 1
         elif verdict == REASON_TBT_REACTIVE:
             out.rej_tbt_react += 1
         else:  # DISABLED
@@ -235,20 +291,22 @@ def print_summary(outcomes: Iterable[SloOutcome], stream=sys.stdout) -> None:
     if not rows:
         print("(no SLO combinations evaluated)", file=stream)
         return
-    # Column widths
     print(file=stream)
     print(
-        f"{'TTFT_SLO':>10}  {'TBT_SLO':>9}  {'react×':>6}  "
-        f"{'total':>7}  {'admit':>7}  {'rej_TTFT':>8}  "
-        f"{'rej_TBT_p':>9}  {'rej_TBT_r':>9}  {'rej_pct':>8}",
+        f"{'TTFT_SLO':>9}  {'TBT_SLO':>8}  {'TTFTrx':>6}  {'TBTrx':>6}  "
+        f"{'total':>6}  {'admit':>6}  {'rTTFT':>6}  {'rTTFTr':>7}  "
+        f"{'rTBTp':>6}  {'rTBTr':>6}  {'rTBTrx':>7}  {'rej_pct':>8}",
         file=stream,
     )
-    print("-" * 92, file=stream)
+    print("-" * 105, file=stream)
     for r in rows:
         print(
-            f"{r.ttft_slo_ms:>10.0f}  {r.tbt_slo_ms:>9.0f}  {r.reactive_ratio:>6.2f}  "
-            f"{r.total:>7d}  {r.admit:>7d}  {r.rej_ttft:>8d}  "
-            f"{r.rej_tbt_pred:>9d}  {r.rej_tbt_react:>9d}  {r.reject_pct:>7.2f}%",
+            f"{r.ttft_slo_ms:>9.0f}  {r.tbt_slo_ms:>8.0f}  "
+            f"{r.ttft_slo_ratio:>6.2f}  {r.tbt_slo_ratio:>6.2f}  "
+            f"{r.total:>6d}  {r.admit:>6d}  "
+            f"{r.rej_ttft:>6d}  {r.rej_ttft_ratio:>7d}  "
+            f"{r.rej_tbt_pred:>6d}  {r.rej_tbt_ratio:>6d}  "
+            f"{r.rej_tbt_react:>7d}  {r.reject_pct:>7.2f}%",
             file=stream,
         )
     print(file=stream)
@@ -259,14 +317,20 @@ def write_csv(outcomes: Iterable[SloOutcome], path: Path) -> None:
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow([
-            "ttft_slo_ms", "tbt_slo_ms", "reactive_ratio",
-            "total", "admit", "rej_ttft", "rej_tbt_pred", "rej_tbt_react",
+            "ttft_slo_ms", "tbt_slo_ms",
+            "ttft_slo_ratio", "tbt_slo_ratio", "reactive_ratio",
+            "total", "admit",
+            "rej_ttft", "rej_ttft_ratio",
+            "rej_tbt_pred", "rej_tbt_ratio", "rej_tbt_react",
             "skipped_disabled", "reject_pct",
         ])
         for r in outcomes:
             w.writerow([
-                r.ttft_slo_ms, r.tbt_slo_ms, r.reactive_ratio,
-                r.total, r.admit, r.rej_ttft, r.rej_tbt_pred, r.rej_tbt_react,
+                r.ttft_slo_ms, r.tbt_slo_ms,
+                r.ttft_slo_ratio, r.tbt_slo_ratio, r.reactive_ratio,
+                r.total, r.admit,
+                r.rej_ttft, r.rej_ttft_ratio,
+                r.rej_tbt_pred, r.rej_tbt_ratio, r.rej_tbt_react,
                 r.skipped_disabled, f"{r.reject_pct:.4f}",
             ])
 
@@ -275,6 +339,8 @@ def write_details_csv(
     rows: List[DecisionRow],
     ttft_slo_ms: float,
     tbt_slo_ms: float,
+    ttft_slo_ratio: float,
+    tbt_slo_ratio: float,
     reactive_ratio: float,
     path: Path,
 ) -> None:
@@ -285,22 +351,29 @@ def write_details_csv(
         w.writerow([
             "ts", "rid", "prompt_len", "prefix_len",
             "running_batch_size", "running_batch_total_kv_tokens",
-            "predicted_ttft_ms", "predicted_tbt_ms", "tbt_ewma_ms",
-            "queue_predicted_ms",
+            "predicted_ttft_ms", "predicted_tbt_ms",
+            "solo_ttft_ms", "solo_tbt_ms",
+            "tbt_ewma_ms", "queue_predicted_ms",
             "original_admit", "original_reason",
             "replay_verdict",
-            "ttft_slo_ms", "tbt_slo_ms", "reactive_ratio",
+            "ttft_slo_ms", "tbt_slo_ms",
+            "ttft_slo_ratio", "tbt_slo_ratio", "reactive_ratio",
         ])
         for r in rows:
-            verdict = evaluate_row(r, ttft_slo_ms, tbt_slo_ms, reactive_ratio)
+            verdict = evaluate_row(
+                r, ttft_slo_ms, tbt_slo_ms,
+                ttft_slo_ratio, tbt_slo_ratio, reactive_ratio,
+            )
             w.writerow([
                 r.ts, r.rid, r.prompt_len, r.prefix_len,
                 r.running_batch_size, r.running_batch_total_kv_tokens,
-                r.predicted_ttft_ms, r.predicted_tbt_ms, r.tbt_ewma_ms,
-                r.queue_predicted_ms,
+                r.predicted_ttft_ms, r.predicted_tbt_ms,
+                r.solo_ttft_ms, r.solo_tbt_ms,
+                r.tbt_ewma_ms, r.queue_predicted_ms,
                 r.admit, r.reason,
                 verdict,
-                ttft_slo_ms, tbt_slo_ms, reactive_ratio,
+                ttft_slo_ms, tbt_slo_ms,
+                ttft_slo_ratio, tbt_slo_ratio, reactive_ratio,
             ])
 
 
@@ -313,16 +386,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--decision-log", type=Path, required=True,
                    help="JSONL file produced by --admission-decision-log")
-    p.add_argument("--ttft-slo", type=float, nargs="+", required=True,
-                   help="candidate TTFT SLO(s) in ms (multiple allowed)")
-    p.add_argument("--tbt-slo", type=float, nargs="+", required=True,
-                   help="candidate TBT SLO(s) in ms (multiple allowed)")
+    p.add_argument("--ttft-slo", type=float, nargs="+", default=[0.0],
+                   help="candidate TTFT SLO(s) in ms; pass 0 to disable absolute TTFT check")
+    p.add_argument("--tbt-slo", type=float, nargs="+", default=[0.0],
+                   help="candidate TBT SLO(s) in ms; pass 0 to disable absolute TBT check")
+    p.add_argument("--ttft-slo-ratio", type=float, nargs="+", default=[1.0],
+                   help="candidate TTFT slowdown ratio(s) vs solo-run; pass 1 to disable")
+    p.add_argument("--tbt-slo-ratio", type=float, nargs="+", default=[1.0],
+                   help="candidate TBT slowdown ratio(s) vs solo-run; pass 1 to disable")
     p.add_argument("--reactive-ratio", type=float, default=0.9,
                    help="Stage 3 reactive threshold = tbt_slo * this (default 0.9)")
     p.add_argument("--csv-out", type=Path, default=None,
                    help="write summary table to CSV")
     p.add_argument("--details-out", type=Path, default=None,
-                   help="write per-decision counterfactual CSV (only meaningful with a single SLO pair)")
+                   help="write per-decision counterfactual CSV (only meaningful with a single SLO combo)")
     return p.parse_args(argv)
 
 
@@ -342,11 +419,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         file=sys.stderr,
     )
 
-    combos: List[Tuple[float, float]] = [
-        (t, b) for t in args.ttft_slo for b in args.tbt_slo
+    combos: List[Tuple[float, float, float, float]] = [
+        (t, b, tr, br)
+        for t in args.ttft_slo
+        for b in args.tbt_slo
+        for tr in args.ttft_slo_ratio
+        for br in args.tbt_slo_ratio
     ]
     outcomes = [
-        evaluate_slo(rows, t, b, args.reactive_ratio) for (t, b) in combos
+        evaluate_slo(rows, t, b, tr, br, args.reactive_ratio)
+        for (t, b, tr, br) in combos
     ]
 
     print_summary(outcomes)
@@ -359,12 +441,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         if len(combos) != 1:
             print(
                 "[replay] WARN: --details-out is only meaningful with a single "
-                f"(ttft, tbt) pair; skipping (got {len(combos)} combos)",
+                f"SLO combo; skipping (got {len(combos)} combos)",
                 file=sys.stderr,
             )
         else:
-            t, b = combos[0]
-            write_details_csv(rows, t, b, args.reactive_ratio, args.details_out)
+            t, b, tr, br = combos[0]
+            write_details_csv(
+                rows, t, b, tr, br, args.reactive_ratio, args.details_out
+            )
             print(f"[replay] per-decision CSV: {args.details_out}", file=sys.stderr)
 
     return 0

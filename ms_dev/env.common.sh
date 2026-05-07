@@ -58,6 +58,11 @@ export MC_TCP_ENABLE_CONNECTION_POOL="${MC_TCP_ENABLE_CONNECTION_POOL:-1}"
 # lib_server.sh::append_admission_args.
 export SGLANG_ADMISSION_TTFT_SLO_MS="${SGLANG_ADMISSION_TTFT_SLO_MS:-}"
 export SGLANG_ADMISSION_TBT_SLO_MS="${SGLANG_ADMISSION_TBT_SLO_MS:-}"
+# Ratio SLOs — per-request slowdown bound vs solo-run baseline (e.g. 2.0 = "no
+# more than 2x slower than running alone"). Either or both can be set together
+# with the absolute SLOs above; first violation rejects.
+export SGLANG_ADMISSION_TTFT_SLO_RATIO="${SGLANG_ADMISSION_TTFT_SLO_RATIO:-}"
+export SGLANG_ADMISSION_TBT_SLO_RATIO="${SGLANG_ADMISSION_TBT_SLO_RATIO:-}"
 export SGLANG_ADMISSION_PREFILL_COST_MODEL="${SGLANG_ADMISSION_PREFILL_COST_MODEL:-}"
 export SGLANG_ADMISSION_TBT_COST_MODEL="${SGLANG_ADMISSION_TBT_COST_MODEL:-}"
 export SGLANG_ADMISSION_TBT_EWMA_ALPHA="${SGLANG_ADMISSION_TBT_EWMA_ALPHA:-}"

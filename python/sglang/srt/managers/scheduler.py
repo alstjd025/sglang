@@ -1190,6 +1190,8 @@ class Scheduler(
         config = AdmissionConfig(
             ttft_slo_ms=sa.admission_ttft_slo_ms,
             tbt_slo_ms=sa.admission_tbt_slo_ms,
+            ttft_slo_ratio=sa.admission_ttft_slo_ratio,
+            tbt_slo_ratio=sa.admission_tbt_slo_ratio,
             tbt_ewma_alpha=sa.admission_tbt_ewma_alpha,
             tbt_warm_up_steps=sa.admission_tbt_warm_up_steps,
             tbt_reactive_ratio=sa.admission_tbt_reactive_ratio,
@@ -1208,7 +1210,7 @@ class Scheduler(
                 alpha=config.tbt_ewma_alpha,
                 warm_up_steps=config.tbt_warm_up_steps,
             )
-            if config.stage2_3_enabled
+            if config.stage3_enabled
             else None
         )
         self.admission_controller = AdmissionController(
@@ -3592,6 +3594,8 @@ class Scheduler(
                 "dry_run": cfg.dry_run,
                 "ttft_slo_ms": cfg.ttft_slo_ms,
                 "tbt_slo_ms": cfg.tbt_slo_ms,
+                "ttft_slo_ratio": cfg.ttft_slo_ratio,
+                "tbt_slo_ratio": cfg.tbt_slo_ratio,
                 "tbt_reactive_ratio": cfg.tbt_reactive_ratio,
                 "tbt_ewma_ms": tracker.get() if tracker is not None else None,
                 "tbt_ewma_warm": tracker.is_warm() if tracker is not None else None,

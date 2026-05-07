@@ -365,6 +365,8 @@ class ServerArgs:
     # See managers/admission_control/CLAUDE.md.
     admission_ttft_slo_ms: Optional[float] = None
     admission_tbt_slo_ms: Optional[float] = None
+    admission_ttft_slo_ratio: Optional[float] = None
+    admission_tbt_slo_ratio: Optional[float] = None
     admission_prefill_cost_model_path: Optional[str] = None
     admission_tbt_cost_model_path: Optional[str] = None
     admission_tbt_ewma_alpha: float = 0.1
@@ -4524,6 +4526,18 @@ class ServerArgs:
             type=float,
             default=ServerArgs.admission_tbt_slo_ms,
             help="Predictive admission control: reject when predicted TBT (current batch + this request) or recent EWMA TBT exceeds this value (ms). Unset = disabled.",
+        )
+        parser.add_argument(
+            "--admission-ttft-slo-ratio",
+            type=float,
+            default=ServerArgs.admission_ttft_slo_ratio,
+            help="Per-request fairness: reject when predicted_ttft / solo_run_ttft exceeds this ratio (e.g. 2.0 means a request can be at most 2x slower than running alone). Unset = ratio check disabled.",
+        )
+        parser.add_argument(
+            "--admission-tbt-slo-ratio",
+            type=float,
+            default=ServerArgs.admission_tbt_slo_ratio,
+            help="Per-request fairness: reject when predicted_tbt / solo_run_tbt exceeds this ratio. Unset = ratio check disabled.",
         )
         parser.add_argument(
             "--admission-prefill-cost-model-path",
