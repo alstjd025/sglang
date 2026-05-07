@@ -83,6 +83,7 @@ from sglang.srt.managers.admission_control import (
     AdmissionConfig,
     AdmissionController,
     AdmissionDecision,
+    AdmissionMetrics,
     SchedulerSnapshot,
     TBTEwmaTracker,
     try_load_prefill_cost_model,
@@ -1195,6 +1196,7 @@ class Scheduler(
         )
         if not config.any_stage_enabled:
             self.admission_controller: Optional[AdmissionController] = None
+            self.admission_metrics: Optional[AdmissionMetrics] = None
             return
 
         prefill_cost = try_load_prefill_cost_model(sa.admission_prefill_cost_model_path)
@@ -1213,6 +1215,16 @@ class Scheduler(
             tbt_cost=tbt_cost,
             tbt_tracker=tbt_tracker,
         )
+        # Metrics: only register Prometheus collectors if --enable-metrics is on.
+        if (
+            self.server_args.enable_metrics
+            and getattr(self, "metrics_collector", None) is not None
+        ):
+            self.admission_metrics = AdmissionMetrics(
+                labels=self.metrics_collector.labels
+            )
+        else:
+            self.admission_metrics = None
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
@@ -2388,6 +2400,11 @@ class Scheduler(
         # t_queue can include it.
         recv_req._predicted_prefill_ms = decision.predicted_prefill_ms
 
+        # Prometheus: counter / histograms / gauges. No-op when metrics are off.
+        metrics = getattr(self, "admission_metrics", None)
+        if metrics is not None:
+            metrics.record_decision(decision)
+
         if decision.admit:
             if decision.dry_run_would_reject:
                 logger.info(
@@ -3541,6 +3558,39 @@ class Scheduler(
 
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
+
+        # admission control state — see managers/admission_control/CLAUDE.md
+        controller = getattr(self, "admission_controller", None)
+        if controller is not None:
+            cfg = controller.config
+            tracker = controller.tbt_tracker
+            recent = controller.recent_decisions()
+            ret["admission_state"] = {
+                "enabled": controller.is_active(),
+                "dry_run": cfg.dry_run,
+                "ttft_slo_ms": cfg.ttft_slo_ms,
+                "tbt_slo_ms": cfg.tbt_slo_ms,
+                "tbt_reactive_ratio": cfg.tbt_reactive_ratio,
+                "tbt_ewma_ms": tracker.get() if tracker is not None else None,
+                "tbt_ewma_warm": tracker.is_warm() if tracker is not None else None,
+                "tbt_ewma_samples": (
+                    tracker.sample_count() if tracker is not None else None
+                ),
+                "prefill_cost_loaded": controller.prefill_cost is not None,
+                "tbt_cost_loaded": controller.tbt_cost is not None,
+                "decisions_recent": [
+                    {
+                        "admit": d.admit,
+                        "reason": d.reason,
+                        "dry_run_would_reject": d.dry_run_would_reject,
+                        "predicted_ttft_ms": d.predicted_ttft_ms,
+                        "predicted_tbt_ms": d.predicted_tbt_ms,
+                        "tbt_ewma_ms": d.tbt_ewma_ms,
+                        "queue_predicted_ms": d.queue_predicted_ms,
+                    }
+                    for d in recent
+                ],
+            }
 
         # This field is not serializable.
         ret.pop("model_config", None)

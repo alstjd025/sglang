@@ -20,6 +20,7 @@ from sglang.srt.managers.admission_control.controller import (
     REASON_TTFT_PREDICTED,
     AdmissionConfig,
     AdmissionController,
+    AdmissionDecision,
     SchedulerSnapshot,
 )
 from sglang.srt.managers.admission_control.cost_model import (
@@ -29,6 +30,7 @@ from sglang.srt.managers.admission_control.cost_model import (
     try_load_prefill_cost_model,
     try_load_tbt_cost_model,
 )
+from sglang.srt.managers.admission_control.metrics import AdmissionMetrics
 from sglang.srt.managers.admission_control.tbt_tracker import TBTEwmaTracker
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -522,6 +524,89 @@ class TestAdmissionControllerRecentDecisions(unittest.TestCase):
             ctrl.decide(prompt_len=1, prefix_match_len=0, snapshot=_snapshot())
         recent = ctrl.recent_decisions()
         self.assertEqual(len(recent), 32)
+
+
+class TestAdmissionMetrics(unittest.TestCase):
+    """Smoke tests for AdmissionMetrics — uses an isolated CollectorRegistry."""
+
+    def _new_metrics(self) -> AdmissionMetrics:
+        from prometheus_client import CollectorRegistry
+
+        return AdmissionMetrics(
+            labels={"model_name": "test", "tp_rank": "0"},
+            registry=CollectorRegistry(),
+        )
+
+    def test_record_admit(self):
+        m = self._new_metrics()
+        d = AdmissionDecision(
+            admit=True,
+            reason=REASON_ADMIT,
+            predicted_ttft_ms=150.0,
+            predicted_tbt_ms=50.0,
+            queue_predicted_ms=100.0,
+            tbt_ewma_ms=45.0,
+        )
+        m.record_decision(d)  # should not raise
+
+    def test_record_reject(self):
+        m = self._new_metrics()
+        d = AdmissionDecision(
+            admit=False,
+            reason=REASON_TTFT_PREDICTED,
+            predicted_ttft_ms=99999.0,
+            queue_predicted_ms=80000.0,
+        )
+        m.record_decision(d)
+
+    def test_record_dryrun(self):
+        m = self._new_metrics()
+        d = AdmissionDecision(
+            admit=True,
+            reason=REASON_TBT_REACTIVE,
+            tbt_ewma_ms=300.0,
+            dry_run_would_reject=True,
+        )
+        m.record_decision(d)
+
+    def test_record_minimal_decision(self):
+        # disabled-path decisions carry no predicted values
+        m = self._new_metrics()
+        m.record_decision(AdmissionDecision(admit=True, reason=REASON_DISABLED))
+
+    def test_update_tbt_ewma(self):
+        m = self._new_metrics()
+        m.update_tbt_ewma(125.5)
+        m.update_tbt_ewma(None)  # no-op
+
+    def test_counter_label_distinguishes_decisions(self):
+        # Verify the counter actually carries the decision/reason labels.
+        from prometheus_client import CollectorRegistry
+
+        reg = CollectorRegistry()
+        m = AdmissionMetrics(labels={"model_name": "test"}, registry=reg)
+        m.record_decision(AdmissionDecision(admit=True, reason=REASON_ADMIT))
+        m.record_decision(
+            AdmissionDecision(admit=False, reason=REASON_TTFT_PREDICTED)
+        )
+        m.record_decision(
+            AdmissionDecision(admit=False, reason=REASON_TTFT_PREDICTED)
+        )
+
+        admit_value = reg.get_sample_value(
+            "sglang:admission_decisions_total",
+            {"model_name": "test", "decision": "admit", "reason": REASON_ADMIT},
+        )
+        reject_value = reg.get_sample_value(
+            "sglang:admission_decisions_total",
+            {
+                "model_name": "test",
+                "decision": "reject",
+                "reason": REASON_TTFT_PREDICTED,
+            },
+        )
+        self.assertEqual(admit_value, 1.0)
+        self.assertEqual(reject_value, 2.0)
 
 
 if __name__ == "__main__":

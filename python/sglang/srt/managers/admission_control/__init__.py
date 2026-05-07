@@ -19,12 +19,14 @@ from sglang.srt.managers.admission_control.cost_model import (
     try_load_prefill_cost_model,
     try_load_tbt_cost_model,
 )
+from sglang.srt.managers.admission_control.metrics import AdmissionMetrics
 from sglang.srt.managers.admission_control.tbt_tracker import TBTEwmaTracker
 
 __all__ = [
     "AdmissionConfig",
     "AdmissionController",
     "AdmissionDecision",
+    "AdmissionMetrics",
     "CostModelLoadError",
     "PrefillCostModel",
     "REASON_ADMIT",

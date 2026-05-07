@@ -518,6 +518,18 @@ class SchedulerMetricsMixin:
                 gap_latency / self.server_args.decode_log_interval
             )
 
+        # Feed measured per-step TBT into admission control's reactive EWMA.
+        # See managers/admission_control/CLAUDE.md.
+        controller = getattr(self, "admission_controller", None)
+        if controller is not None and controller.tbt_tracker is not None:
+            avg_step_ms = (
+                gap_latency / self.server_args.decode_log_interval * 1000.0
+            )
+            controller.tbt_tracker.update(avg_step_ms)
+            metrics = getattr(self, "admission_metrics", None)
+            if metrics is not None:
+                metrics.update_tbt_ewma(controller.tbt_tracker.get())
+
         iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
