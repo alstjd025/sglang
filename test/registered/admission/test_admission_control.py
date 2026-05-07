@@ -41,8 +41,25 @@ register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 class TestPrefillCostModel(unittest.TestCase):
     def test_estimate_quadratic(self):
         m = PrefillCostModel(alpha=2.0, beta=3.0, gamma=5.0)
-        # d = max(0, 10 - 4) = 6 → 2*36 + 3*6 + 5 = 72 + 18 + 5 = 95
+        # d = max(0, 10 - 4) = 6 → 2*36 + 3*6 + 5 + 0*4 = 95  (delta defaults to 0)
         self.assertAlmostEqual(m.estimate_ms(10, 4), 95.0)
+
+    def test_estimate_with_delta(self):
+        # T = 1*d² + 2*d + 10 + 0.05*p
+        m = PrefillCostModel(alpha=1.0, beta=2.0, gamma=10.0, delta=0.05)
+        # n=100, p=80 → d=20 → 400 + 40 + 10 + 4.0 = 454.0
+        self.assertAlmostEqual(m.estimate_ms(100, 80), 454.0)
+        # p=0 → no delta contribution
+        self.assertAlmostEqual(m.estimate_ms(20, 0), 1 * 400 + 2 * 20 + 10)
+
+    def test_back_compat_load_no_delta(self):
+        # Pre-delta JSONs must still load (delta defaults to 0).
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.json"
+            path.write_text(json.dumps({"alpha": 1.0, "beta": 2.0, "gamma": 3.0}))
+            m = PrefillCostModel.from_json(path)
+            self.assertEqual(m.delta, 0.0)
+            self.assertAlmostEqual(m.estimate_ms(10, 5), 1 * 25 + 2 * 5 + 3)
 
     def test_estimate_clamps_negative_d(self):
         # prefix longer than prompt should not produce negative time.

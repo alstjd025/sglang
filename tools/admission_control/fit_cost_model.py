@@ -222,54 +222,61 @@ def _measure_prefill_cell(
     return samples
 
 
-def _polyfit2(x: Sequence[float], y: Sequence[float]) -> Tuple[float, float, float]:
-    """Fit y = α·x² + β·x + γ via numpy.polyfit; pure stdlib fallback if numpy is missing.
+def _fit_prefill_4var(
+    d_list: Sequence[float], p_list: Sequence[float], t_list: Sequence[float]
+) -> Tuple[float, float, float, float]:
+    """Fit T = α·d² + β·d + γ + δ·p via numpy.linalg.lstsq with pure-Python fallback.
 
-    Falls back to a simple normal-equation solver implemented in pure Python.
+    Returns (alpha, beta, gamma, delta).
     """
     try:
         import numpy as np  # type: ignore
 
-        coeffs = np.polyfit(np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64), 2)
-        return float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
+        d = np.asarray(d_list, dtype=np.float64)
+        p = np.asarray(p_list, dtype=np.float64)
+        X = np.column_stack([d * d, d, np.ones_like(d), p])
+        y = np.asarray(t_list, dtype=np.float64)
+        coeffs, *_ = np.linalg.lstsq(X, y, rcond=None)
+        return float(coeffs[0]), float(coeffs[1]), float(coeffs[2]), float(coeffs[3])
     except ImportError:
         pass
 
-    # Pure-Python normal equations for 2nd-order polynomial.
-    n = len(x)
-    if n < 3:
-        raise RuntimeError("need at least 3 samples for quadratic fit")
-    s0 = float(n)
-    s1 = sum(x)
-    s2 = sum(xi * xi for xi in x)
-    s3 = sum(xi * xi * xi for xi in x)
-    s4 = sum(xi * xi * xi * xi for xi in x)
-    sy = sum(y)
-    sxy = sum(xi * yi for xi, yi in zip(x, y))
-    sx2y = sum(xi * xi * yi for xi, yi in zip(x, y))
-    A = [[s4, s3, s2], [s3, s2, s1], [s2, s1, s0]]
-    b = [sx2y, sxy, sy]
-    return _solve_3x3(A, b)
+    if len(t_list) < 4:
+        raise RuntimeError("need at least 4 samples for the 4-coef fit")
+    # Build X^T X (4x4) and X^T y for the design matrix [d², d, 1, p].
+    cols = [
+        [d * d for d in d_list],
+        list(d_list),
+        [1.0] * len(d_list),
+        list(p_list),
+    ]
+    A = [[0.0] * 4 for _ in range(4)]
+    b = [0.0] * 4
+    for i in range(4):
+        for j in range(4):
+            A[i][j] = sum(cols[i][k] * cols[j][k] for k in range(len(t_list)))
+        b[i] = sum(cols[i][k] * t_list[k] for k in range(len(t_list)))
+    coeffs = _solve_nxn(A, b)
+    return coeffs[0], coeffs[1], coeffs[2], coeffs[3]
 
 
-def _solve_3x3(A: List[List[float]], b: List[float]) -> Tuple[float, float, float]:
+def _solve_nxn(A: List[List[float]], b: List[float]) -> List[float]:
+    n = len(A)
     M = [row[:] + [bi] for row, bi in zip(A, b)]
-    n = 3
     for i in range(n):
-        # Partial pivot for numerical stability
         pivot = max(range(i, n), key=lambda r: abs(M[r][i]))
         M[i], M[pivot] = M[pivot], M[i]
         if abs(M[i][i]) < 1e-18:
-            raise RuntimeError("singular matrix in polyfit fallback")
+            raise RuntimeError("singular matrix")
         for j in range(i + 1, n):
             factor = M[j][i] / M[i][i]
             for k in range(i, n + 1):
                 M[j][k] -= factor * M[i][k]
-    x = [0.0, 0.0, 0.0]
+    x = [0.0] * n
     for i in range(n - 1, -1, -1):
         s = M[i][n] - sum(M[i][k] * x[k] for k in range(i + 1, n))
         x[i] = s / M[i][i]
-    return x[0], x[1], x[2]
+    return x
 
 
 def cmd_prefill(args: argparse.Namespace) -> int:
@@ -305,15 +312,20 @@ def cmd_prefill(args: argparse.Namespace) -> int:
             )
         )
 
-    if len(all_samples) < 3:
-        print(f"[fit] ERROR: only {len(all_samples)} samples; need >= 3", file=sys.stderr)
+    if len(all_samples) < 4:
+        print(f"[fit] ERROR: only {len(all_samples)} samples; need >= 4", file=sys.stderr)
         return 2
 
-    ds = [float(n - p) for (n, p, _, _) in all_samples]
+    # Use the observed cached_tokens (after page rounding) as p; n is what we sent.
+    ds = [float(n - cached) for (n, _, _, cached) in all_samples]
+    ps = [float(cached) for (_, _, _, cached) in all_samples]
     ts = [float(t) for (_, _, t, _) in all_samples]
-    alpha, beta, gamma = _polyfit2(ds, ts)
+    alpha, beta, gamma, delta = _fit_prefill_4var(ds, ps, ts)
     rmse = math.sqrt(
-        sum((alpha * d * d + beta * d + gamma - t) ** 2 for d, t in zip(ds, ts))
+        sum(
+            (alpha * d * d + beta * d + gamma + delta * p - t) ** 2
+            for d, p, t in zip(ds, ps, ts)
+        )
         / len(ds)
     )
 
@@ -321,11 +333,13 @@ def cmd_prefill(args: argparse.Namespace) -> int:
         "alpha": alpha,
         "beta": beta,
         "gamma": gamma,
+        "delta": delta,
         "fit_metadata": {
             "model": model,
             "server": server,
             "samples": len(all_samples),
             "rmse_ms": rmse,
+            "form": "T_ms = alpha*d^2 + beta*d + gamma + delta*p (d = n - p)",
             "fit_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "raw_samples": [
                 {"n": n, "p": p, "d": n - p, "ttft_ms": t, "cached": c}
@@ -339,7 +353,7 @@ def cmd_prefill(args: argparse.Namespace) -> int:
     out.write_text(json.dumps(payload, indent=2))
     print(
         f"[fit] prefill model written: {out}\n"
-        f"  alpha={alpha:.6g} beta={beta:.6g} gamma={gamma:.6g} "
+        f"  alpha={alpha:.6g} beta={beta:.6g} gamma={gamma:.6g} delta={delta:.6g} "
         f"RMSE={rmse:.2f}ms n_samples={len(all_samples)}",
         file=sys.stderr,
     )

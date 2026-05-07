@@ -29,20 +29,31 @@ class CostModelLoadError(Exception):
 class PrefillCostModel:
     """Estimate prefill latency from prompt length and prefix-cache match length.
 
-    The polynomial form mirrors Mooncake Eq. 1's quadratic-in-prompt-length term
-    (`a·n²·d_model + b·n·d_model²`) collapsed to coefficients fit per
-    (model, hardware, kernel config). `d = max(0, n - p)` is the number of
-    tokens that actually go through prefill (cache misses).
+    Form:    T_ms ≈ α·d² + β·d + γ + δ·p           where d = max(0, n - p)
+
+    - α, β capture the actual prefill compute (Mooncake Eq. 1's quadratic-in-
+      prompt-length term collapsed to fit coefficients per
+      (model, hardware, kernel config)).
+    - γ is the fixed per-request overhead.
+    - δ captures the cost of loading the matched prefix from radix cache —
+      empirically ~7 µs/token on B200×4 with Llama-3.3-70B. Older models
+      that omit `delta` from JSON load with δ=0 (backward-compatible).
     """
 
     alpha: float
     beta: float
     gamma: float
+    delta: float = 0.0
     metadata: Dict[str, Any] = None  # type: ignore[assignment]
 
     def estimate_ms(self, prompt_len: int, prefix_len: int) -> float:
         d = max(0, prompt_len - prefix_len)
-        return self.alpha * d * d + self.beta * d + self.gamma
+        return (
+            self.alpha * d * d
+            + self.beta * d
+            + self.gamma
+            + self.delta * prefix_len
+        )
 
     @classmethod
     def from_json(cls, path: str | Path) -> "PrefillCostModel":
@@ -52,6 +63,7 @@ class PrefillCostModel:
                 alpha=float(data["alpha"]),
                 beta=float(data["beta"]),
                 gamma=float(data["gamma"]),
+                delta=float(data.get("delta", 0.0)),  # back-compat: 0 if absent
                 metadata=data.get("fit_metadata", {}),
             )
         except (KeyError, TypeError, ValueError) as e:
@@ -65,6 +77,7 @@ class PrefillCostModel:
             "alpha": self.alpha,
             "beta": self.beta,
             "gamma": self.gamma,
+            "delta": self.delta,
             "fit_metadata": self.metadata or {},
         }
         Path(path).write_text(json.dumps(payload, indent=2))
