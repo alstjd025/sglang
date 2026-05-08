@@ -368,16 +368,21 @@ def cmd_prefill(args: argparse.Namespace) -> int:
 def _default_tbt_grid() -> List[Tuple[int, int]]:
     """Default (batch_size, per_request_prompt_len) grid.
 
-    Cell -> total_kv_tokens at decode start ≈ batch_size * per_request_prompt_len.
-    Workload median prompt_tokens is ~20k, max_running_requests defaults to
-    48; covering bs in {1,4,8,16,32} × prompt_len in {1k, 4k, 16k} samples
-    total_kv from ~1k up to ~512k.
+    Cell -> per_req_kv at decode start ≈ prompt_len; total_kv ≈ bs * prompt_len.
+    Cells with total_kv > _TBT_TOTAL_KV_CAP are skipped to stay within VRAM
+    and bracket the production envelope (production p99 total_kv ≈ 921k,
+    p99 per_req_kv ≈ 61k).
     """
     cells: List[Tuple[int, int]] = []
-    for bs in (1, 4, 8, 16, 32):
-        for prompt_len in (1024, 4096, 16384):
+    for bs in (1, 4, 8, 16, 24, 32):
+        for prompt_len in (1024, 4096, 16384, 32768, 65536):
+            if bs * prompt_len > _TBT_TOTAL_KV_CAP:
+                continue
             cells.append((bs, prompt_len))
     return cells
+
+
+_TBT_TOTAL_KV_CAP = 1_200_000
 
 
 def _stream_tbt_samples(
@@ -484,15 +489,15 @@ def _solve_3x3_general(A: List[List[float]], b: List[float]) -> List[float]:
 
 
 def _fit_linear_2var(
-    bs_list: Sequence[int], kv_list: Sequence[int], t_list: Sequence[float]
+    bs_list: Sequence[int], per_req_kv_list: Sequence[int], t_list: Sequence[float]
 ) -> Tuple[float, float, float]:
-    """Fit t = a + b·bs + c·kv via normal equations."""
+    """Fit t = a + b·bs + c·per_req_kv via normal equations."""
     try:
         import numpy as np  # type: ignore
 
         X = np.column_stack(
             [np.ones(len(bs_list)), np.asarray(bs_list, dtype=np.float64),
-             np.asarray(kv_list, dtype=np.float64)]
+             np.asarray(per_req_kv_list, dtype=np.float64)]
         )
         y = np.asarray(t_list, dtype=np.float64)
         coeffs, *_ = np.linalg.lstsq(X, y, rcond=None)
@@ -503,13 +508,13 @@ def _fit_linear_2var(
     n = len(bs_list)
     s0 = float(n)
     sb = float(sum(bs_list))
-    sk = float(sum(kv_list))
+    sk = float(sum(per_req_kv_list))
     sbb = float(sum(b * b for b in bs_list))
-    skk = float(sum(k * k for k in kv_list))
-    sbk = float(sum(b * k for b, k in zip(bs_list, kv_list)))
+    skk = float(sum(k * k for k in per_req_kv_list))
+    sbk = float(sum(b * k for b, k in zip(bs_list, per_req_kv_list)))
     st = float(sum(t_list))
     sbt = float(sum(b * t for b, t in zip(bs_list, t_list)))
-    skt = float(sum(k * t for k, t in zip(kv_list, t_list)))
+    skt = float(sum(k * t for k, t in zip(per_req_kv_list, t_list)))
     A = [[s0, sb, sk], [sb, sbb, sbk], [sk, sbk, skk]]
     rhs = [st, sbt, skt]
     a, b, c = _solve_3x3_general(A, rhs)
@@ -535,6 +540,7 @@ def cmd_tbt(args: argparse.Namespace) -> int:
 
     bs_list: List[int] = []
     kv_list: List[int] = []
+    per_req_kv_list: List[int] = []
     t_list: List[float] = []
     raw: List[Dict[str, Any]] = []
     for bs, prompt_len in cells:
@@ -550,18 +556,20 @@ def cmd_tbt(args: argparse.Namespace) -> int:
         if result is None:
             continue
         b_, k_, t_ = result
+        per_req = k_ // b_
         bs_list.append(b_)
         kv_list.append(k_)
+        per_req_kv_list.append(per_req)
         t_list.append(t_)
-        raw.append({"bs": b_, "kv": k_, "median_tbt_ms": t_})
+        raw.append({"bs": b_, "total_kv": k_, "per_req_kv": per_req, "median_tbt_ms": t_})
 
     if len(t_list) < 3:
         print(f"[fit] ERROR: only {len(t_list)} cells; need >= 3", file=sys.stderr)
         return 2
 
-    a, b, c = _fit_linear_2var(bs_list, kv_list, t_list)
+    a, b, c = _fit_linear_2var(bs_list, per_req_kv_list, t_list)
     rmse = math.sqrt(
-        sum((a + b * bv + c * kv - t) ** 2 for bv, kv, t in zip(bs_list, kv_list, t_list))
+        sum((a + b * bv + c * pk - t) ** 2 for bv, pk, t in zip(bs_list, per_req_kv_list, t_list))
         / len(t_list)
     )
 
@@ -574,6 +582,7 @@ def cmd_tbt(args: argparse.Namespace) -> int:
             "server": server,
             "samples": len(t_list),
             "rmse_ms": rmse,
+            "form": "TBT_ms = a + b*bs + c*per_req_kv",
             "fit_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "raw_samples": raw,
         },

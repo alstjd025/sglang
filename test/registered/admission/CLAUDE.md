@@ -47,7 +47,7 @@ Unit tests (no GPU, no server):
 
 - **PrefillCostModel**: load/save round-trip, estimate matches `α·d² + β·d + γ` exactly,
   graceful fallback on missing/malformed JSON.
-- **TBTCostModel**: same shape for `a + b·bs + c·kv`.
+- **TBTCostModel**: same shape for `a + b·bs + c·per_req_kv`.
 - **TBTEwmaTracker**: warm-up flag turns true after N updates; `get()` returns smoothed
   value; cold-start returns 0 and `is_warm()` is False.
 - **AdmissionController.decide()** decision matrix:

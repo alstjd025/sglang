@@ -3,7 +3,14 @@
 See managers/admission_control/CLAUDE.md for the full design.
 
 PrefillCostModel:  T_prefill_ms ≈ α·d² + β·d + γ        where d = max(0, n - p)
-TBTCostModel:      T_tbt_ms     ≈ a + b·batch_size + c·total_kv_tokens
+TBTCostModel:      T_tbt_ms     ≈ a + b·batch_size + c·per_req_kv
+
+Note: TBT regresses on per-request KV (= total_kv / batch_size), not total KV.
+Empirically the dominant TBT factor in this model+hardware is the per-request
+KV span (each step does attention against per-request KV), with batch_size
+contributing a smaller compute-side overhead. Fitting on `total_kv` instead
+forces the regression to absorb both signals into one coefficient and yielded
+a non-physical negative `b` on production data.
 
 Both load coefficients from a JSON file produced by
 tools/admission_control/fit_cost_model.py. Malformed / missing files raise a
@@ -87,9 +94,10 @@ class PrefillCostModel:
 class TBTCostModel:
     """Estimate per-step decode latency (TBT) given current batch composition.
 
-    Linear approximation: TBT grows with batch size (compute) and total KV
-    tokens (memory bandwidth). Higher-order terms are absorbed by re-fitting
-    when hardware/config changes.
+    Linear approximation: TBT grows with batch size (compute-side overhead)
+    and per-request KV span (attention memory bandwidth per step). The
+    caller is responsible for computing `per_req_kv = total_kv // batch_size`.
+    Higher-order terms are absorbed by re-fitting when hardware/config changes.
     """
 
     a: float
@@ -97,8 +105,8 @@ class TBTCostModel:
     c: float
     metadata: Dict[str, Any] = None  # type: ignore[assignment]
 
-    def estimate_ms(self, batch_size: int, total_kv_tokens: int) -> float:
-        return self.a + self.b * batch_size + self.c * total_kv_tokens
+    def estimate_ms(self, batch_size: int, per_req_kv: int) -> float:
+        return self.a + self.b * batch_size + self.c * per_req_kv
 
     @classmethod
     def from_json(cls, path: str | Path) -> "TBTCostModel":

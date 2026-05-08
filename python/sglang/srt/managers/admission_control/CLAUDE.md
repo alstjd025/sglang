@@ -25,7 +25,7 @@ This module is the canonical location for admission control logic. External touc
 ```
 managers/admission_control/
 ├── __init__.py          # public API: AdmissionController, AdmissionDecision
-├── cost_model.py        # PrefillCostModel (n,p → ms),  TBTCostModel (bs,kv → ms)
+├── cost_model.py        # PrefillCostModel (n,p → ms),  TBTCostModel (bs, per_req_kv → ms)
 ├── tbt_tracker.py       # TBTEwmaTracker  (per-step latency → smoothed estimate)
 └── controller.py        # AdmissionController.decide() — hybrid policy orchestration
 ```
@@ -35,7 +35,7 @@ managers/admission_control/
 | Class | Responsibility | State |
 |---|---|---|
 | `PrefillCostModel` | `T_prefill ≈ α·d² + β·d + γ` where `d = n − p` | (α,β,γ) loaded from JSON |
-| `TBTCostModel` | `TBT ≈ a + b·batch_size + c·total_kv_tokens` | (a,b,c) loaded from JSON |
+| `TBTCostModel` | `TBT ≈ a + b·batch_size + c·per_req_kv` (per_req_kv = total_kv // bs) | (a,b,c) loaded from JSON |
 | `TBTEwmaTracker` | EWMA of measured per-decode-step latency | rolling float, warm-up flag |
 | `AdmissionDecision` | dataclass: `admit`, `reason`, `predicted`, `slo` | immutable result |
 | `AdmissionController` | combines models + tracker, runs decision flow | references to scheduler state |
@@ -59,8 +59,8 @@ def decide(req, scheduler) -> AdmissionDecision:
     # ── Stage 2: TBT predicted (current batch approximation) ────────────
     if tbt_slo_ms:
         bs = len(scheduler.running_batch.reqs) + 1
-        kv = current_batch_total_kv(scheduler) + n
-        pred_tbt = tbt_cost.estimate_ms(bs, kv)
+        total_kv = current_batch_total_kv(scheduler) + n
+        pred_tbt = tbt_cost.estimate_ms(bs, total_kv // bs)  # cost model regresses on per_req_kv
         if pred_tbt > tbt_slo_ms:
             return REJECT("TBT_PREDICTED", pred_tbt, tbt_slo_ms)
 
@@ -171,6 +171,35 @@ Extends `get_internal_state` (`scheduler.py:3389` block) with:
   with the same spec config that will run in production.
 - Priority scheduling → priority-based eviction (`_abort_on_queued_limit`) runs first;
   admission gate never blocks a higher-priority request that would have evicted a queued one.
+
+## Known issues
+
+### TTFT queue model under-predicts queue pressure
+
+In production runs, `queue_predicted_ms` stays ≈ 0 for the vast majority of decisions
+(decision log shows `predicted_ttft / solo_ttft` ratio = 1.00 at p99). At the same time,
+the *measured* TTFT ratio reaches p95 ≈ 3.4x and p99 ≈ 5x — the queue pressure exists,
+but Stage 1 doesn't see it.
+
+Two suspected causes (not investigated yet):
+
+1. `t_queue = sum(r._predicted_prefill_ms for r in waiting_queue)` only counts requests
+   already past admission and parked in `waiting_queue`. If sglang's chunked prefill
+   drains `waiting_queue` quickly into the running batch, the visible queue length is
+   near-zero even when contention is high.
+2. The sum-of-prefill-costs model ignores interleaving with decode tokens (chunked
+   prefill amortizes prefill across decode steps), so the predicted wall-clock wait can
+   be much smaller than reality.
+
+Effect: under heavy contention scenarios, TTFT-ratio admission would not trigger as
+intended. In the analyzed run, TTFT actual-ratio > 3 was 10.4% of admitted requests
+(vs TBT 96.8%), so the queue-blindness is currently a latent issue rather than the
+main cause of SLO miss — but it will surface if workload concurrency rises.
+
+Recommendation when revisiting: instrument both `len(waiting_queue)` and
+`len(running_batch)` alongside `queue_predicted_ms` in decisions, and consider counting
+queue pressure from the running batch (or chunked-prefill backlog) rather than only
+from `waiting_queue`.
 
 ## Files quick reference
 

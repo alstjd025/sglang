@@ -23,8 +23,8 @@ Produces JSON consumable by `--admission-prefill-cost-model-path` and `--admissi
 
 - `--target prefill` — fits `T_prefill ≈ α·d² + β·d + γ` (d = n − p). Output:
   `{"alpha", "beta", "gamma", "fit_metadata": {...}}`.
-- `--target tbt` — fits `TBT ≈ a + b·batch_size + c·total_kv_tokens`. Output:
-  `{"a", "b", "c", "fit_metadata": {...}}`.
+- `--target tbt` — fits `TBT ≈ a + b·batch_size + c·per_req_kv` (per_req_kv = total_kv // bs).
+  Output: `{"a", "b", "c", "fit_metadata": {...}}`.
 
 ### Method (prefill)
 
@@ -64,10 +64,18 @@ For each (batch_size, prompt_len) cell:
    cell's TBT estimate. `total_kv ≈ batch_size * prompt_len` is the cell's
    KV occupancy proxy at decode start.
 
-Linear fit `TBT = a + b·bs + c·kv` via `numpy.linalg.lstsq` (or pure-Python
-normal equations as fallback). Caveat: TBT depends on more than just (bs,
-kv) — quantization, attention backend, sequence length distribution within
-the batch all matter — so re-fit when any of those change.
+Linear fit `TBT = a + b·bs + c·per_req_kv` (where per_req_kv = total_kv // bs)
+via `numpy.linalg.lstsq` (or pure-Python normal equations as fallback).
+
+The regressor used to be `total_kv` instead of `per_req_kv`; on production data
+that fitted a non-physical negative `b` because per-request KV (the dominant
+attention-bandwidth cost per step) is collinear with `bs` when cells have
+uniform per-request length. Switching to `per_req_kv` separates batch-size
+overhead from per-request memory cost cleanly.
+
+Caveat: TBT depends on more than just (bs, per_req_kv) — quantization,
+attention backend, sequence length distribution within the batch all matter —
+so re-fit when any of those change.
 
 ### Usage
 
@@ -91,12 +99,12 @@ python tools/admission_control/fit_cost_model.py prefill \
     --flush-each
 
 # TBT cost model — runs concurrent batches in-process; no other traffic should
-# hit the server during this run.
+# hit the server during this run. Default grid bs∈{1,4,8,16,24,32} ×
+# prompt_len∈{1k,4k,16k,32k,64k}, with cells whose total_kv > 1.2M skipped to
+# stay within VRAM and bracket production p99 (≈920k total_kv, ≈61k per_req_kv).
 python tools/admission_control/fit_cost_model.py tbt \
     --server http://localhost:31000 \
     --output ms_dev/runtime/cost_models/tbt_llama3-70b.json \
-    --batch-sizes 1 4 8 16 32 \
-    --prompt-lens 1024 4096 16384 \
     --warmup-tokens 10 --measure-tokens 30
 ```
 

@@ -268,13 +268,14 @@ class AdmissionController:
 
         # Solo-run TBT = TBT cost model at bs=1 with just this request's KV.
         # Predicted TBT = same model with running_batch + this request added.
+        # Cost model is c·per_req_kv (= total_kv / bs), so divide here.
         solo_tbt: Optional[float] = None
         pred_tbt: Optional[float] = None
         if self.tbt_cost is not None:
             solo_tbt = self.tbt_cost.estimate_ms(1, prompt_len)
             bs = snapshot.running_batch_size + 1
-            kv = snapshot.running_batch_total_kv_tokens + prompt_len
-            pred_tbt = self.tbt_cost.estimate_ms(bs, kv)
+            total_kv = snapshot.running_batch_total_kv_tokens + prompt_len
+            pred_tbt = self.tbt_cost.estimate_ms(bs, total_kv // bs)
 
         # ---- Stage 1a: TTFT absolute -------------------------------------
         if (
