@@ -285,7 +285,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=str(Path(__file__).resolve().parent.parent / "runtime" / "sessions"),
     )
-    p.add_argument("--session-name", type=str, default="")
+    p.add_argument(
+        "--session-name", type=str, default="",
+        help="Session folder name. Gets a YYMMDD_HHMM_ prefix unless already "
+             "prefixed by the caller. Empty → YYMMDD_HHMMSS.",
+    )
     p.add_argument("--scrape-interval", type=float, default=0.2)
     p.add_argument("--startup-timeout", type=float, default=180.0)
     p.add_argument("--metrics-timeout", type=float, default=3.0)
@@ -334,7 +338,18 @@ def main() -> int:
     started_at = datetime.now().astimezone()
     started_unix = time.time()
     use_color = (not args.no_color) and (args.force_color or (sys.stdout.isatty() and (os.environ.get("NO_COLOR") is None)))
-    session_name = args.session_name or started_at.strftime("%Y%m%d_%H%M%S")
+
+    # YYMMDD_HHMM prefix to prevent same-named re-runs from mixing data via
+    # append-mode log writes. Idempotent: callers (e.g. Agent_applications)
+    # may have prepended the prefix using their own clock — leave alone.
+    if args.session_name:
+        if re.match(r"^\d{6}_\d{4}_", args.session_name):
+            session_name = args.session_name
+        else:
+            session_name = f"{started_at.strftime('%y%m%d_%H%M')}_{args.session_name}"
+    else:
+        # No explicit name: keep seconds for collision safety.
+        session_name = started_at.strftime("%y%m%d_%H%M%S")
     session_dir = Path(args.session_root) / session_name
     process_log_dir = session_dir / "process_logs"
     raw_dir = session_dir / "raw"

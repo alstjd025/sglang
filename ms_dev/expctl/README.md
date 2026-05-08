@@ -3,7 +3,7 @@
 `run_experiment.py`는 세션 단위로 프로세스를 띄우고,
 프로세스 로그 + raw request log/request metrics + Prometheus 스크랩 메트릭 + GPU/시스템 메트릭을 함께 저장합니다.
 
-- 기본 세션 폴더: `/workspace/sglang/ms_dev/runtime/sessions/YYYYMMDD_HHMMSS`
+- 기본 세션 폴더: `/workspace/sglang/ms_dev/runtime/sessions/<YYMMDD_HHMM>_<name>`
 - 종료: `Ctrl+C` (graceful stop)
 
 ## Code Layout
@@ -48,7 +48,7 @@
 권장 세션 구조:
 
 ```text
-sessions/YYYYMMDD_HHMMSS/
+sessions/<YYMMDD_HHMM>_<name>/
 ├── meta/
 ├── metrics/
 ├── process_logs/
@@ -98,7 +98,7 @@ python3 /workspace/sglang/ms_dev/expctl/run_experiment.py --mode single
 
 ```bash
 python3 /workspace/sglang/ms_dev/expctl/export_session_csv.py \
-  --session-dir /workspace/sglang/ms_dev/runtime/sessions/YYYYMMDD_HHMMSS
+  --session-dir /workspace/sglang/ms_dev/runtime/sessions/<YYMMDD_HHMM>_<name>
 ```
 
 생성되는 대표 CSV:
@@ -117,7 +117,7 @@ python3 /workspace/sglang/ms_dev/expctl/export_session_csv.py \
 
 ```bash
 python3 /workspace/sglang/ms_dev/expctl/plot_session_metrics.py \
-  --session-dir /workspace/sglang/ms_dev/runtime/sessions/YYYYMMDD_HHMMSS
+  --session-dir /workspace/sglang/ms_dev/runtime/sessions/<YYMMDD_HHMM>_<name>
 ```
 
 기본 플롯:

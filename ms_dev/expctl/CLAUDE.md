@@ -20,7 +20,13 @@ them together. Don't merge concerns.
 
 ## Session layout
 
-Created under `SGLANG_RUNTIME_DIR/sessions/YYYYMMDD_HHMMSS/`:
+Created under `SGLANG_RUNTIME_DIR/sessions/<YYMMDD_HHMM>_<name>/` (e.g.
+`sessions/260509_1214_admission_lambda_0p2/`). The `YYMMDD_HHMM_` prefix is
+prepended automatically when `--session-name` is supplied; if the supplied
+name already starts with that pattern the prefix is left alone so callers
+(e.g. Agent_applications) can pass an already-prefixed name they want the
+fetch side to know. With no `--session-name`, the folder is just
+`YYMMDD_HHMMSS` (seconds for collision safety).
 
 ```
 sessions/<ts>/
