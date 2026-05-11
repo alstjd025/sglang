@@ -35,7 +35,9 @@ the calling shell, so anything `export`ed here flows all the way to
 | `admission_ratio_only.sh` | Admission control with ratio-based SLOs only (TTFT 2x, TBT 3x). No absolute caps. Stage 3 EWMA disabled by design. |
 | `admission_ratio_with_safety.sh` | Recommended for real runs: ratio SLOs + loose absolute caps as catastrophic-prevention safety net (Stage 3 EWMA active). |
 | `admission_absolute_only.sh` | Admission control with absolute ms SLOs only (TTFT 5s, TBT 200ms). All 3 stages active. |
+| `admission_ratio_ttft_only.sh` | Hybrid: TTFT ratio + absolute TBT SLO with reactive EWMA. Use when TBT cost model is brittle. |
 | `admission_dryrun.sh` | Same as `_with_safety.sh` but with dry-run on — for SLO tuning against real traffic. |
+| `admission_off.sh` | Unsets every `SGLANG_ADMISSION_*` env var so the next run launches sglang with no admission control at all. Useful as a clean baseline or after sourcing a wrapper you want to undo. |
 
 After running an experiment session, the resulting session folder contains
 `meta/run_meta.json` with an `admission_config` block recording which knobs
