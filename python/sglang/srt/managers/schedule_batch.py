@@ -607,6 +607,10 @@ class Req(ReqDllmMixin):
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
+        # HALO: Project Halo Phase 1 — job-level slowdown tracking.
+        # See managers/halo/CLAUDE.md.
+        halo_job_id: Optional[str] = None,
+        halo_slo: Optional[float] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -682,6 +686,17 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+
+        # HALO: Phase 1 job-level metadata stashed on the Req.
+        # halo_first_admitted_ts is set by the scheduler at admission time
+        # (see managers/halo/CLAUDE.md) and consumed by SlowdownTracker.
+        self.halo_job_id = halo_job_id
+        self.halo_slo = halo_slo
+        self.halo_first_admitted_ts: Optional[float] = None
+        # Prefix-cache match length captured at admission time (used by Halo
+        # to compute solo-run baseline; matches admission_control's snapshot
+        # of the same value).
+        self.halo_prefix_len_at_admission: int = 0
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None

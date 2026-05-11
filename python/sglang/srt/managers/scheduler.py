@@ -90,6 +90,15 @@ from sglang.srt.managers.admission_control import (
     try_load_prefill_cost_model,
     try_load_tbt_cost_model,
 )
+
+# HALO: Project Halo Phase 1 — job-level slowdown tracking.
+# See managers/halo/CLAUDE.md.
+from sglang.srt.managers.halo import (
+    HaloController,
+    HaloRejectError,
+    RequestExecutionInfo,
+    build_halo_controller_from_server_args,
+)
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -496,6 +505,10 @@ class Scheduler(
 
         # Init admission control — see managers/admission_control/CLAUDE.md
         self.init_admission_control()
+
+        # HALO: Project Halo Phase 1 — job-level slowdown tracking.
+        # See managers/halo/CLAUDE.md. Off by default; zero-cost when off.
+        self.init_halo()
 
         self.is_initializing = False
 
@@ -1243,6 +1256,22 @@ class Scheduler(
         else:
             self.admission_decision_logger = None
 
+    def init_halo(self):
+        """Initialize the Halo controller — see managers/halo/CLAUDE.md.
+
+        Off-by-default. Off ⇒ self.halo_controller is None and every hook
+        is a one-line null check. Same TP-dedup rationale as admission_control:
+        JSONL log writes are rank-0 only (factory consults is_rank0 arg).
+        """
+        sa = self.server_args
+        is_rank0 = getattr(self, "attn_tp_rank", 0) == 0
+        self.halo_controller: Optional[HaloController] = (
+            build_halo_controller_from_server_args(sa, is_rank0)
+        )
+        # Wall-clock guard for the 100ms sweep tick (used by
+        # scheduler_metrics_mixin to avoid sweeping every forward step).
+        self._halo_last_tick_monotonic: float = 0.0
+
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
@@ -1600,6 +1629,10 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
 
+            # HALO: Project Halo Phase 1 — wall-clock-gated 100ms tick.
+            # Cheap when not due. See managers/halo/CLAUDE.md.
+            self._halo_maybe_tick()
+
             # Update last_batch
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -1653,6 +1686,10 @@ class Scheduler(
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result)
+
+            # HALO: Project Halo Phase 1 — wall-clock-gated 100ms tick.
+            # See managers/halo/CLAUDE.md.
+            self._halo_maybe_tick()
 
             # Update last_batch
             self.last_batch = batch
@@ -2261,6 +2298,11 @@ class Scheduler(
             # admission control — see managers/admission_control/CLAUDE.md
             if self._abort_on_predicted_slo_violation(req):
                 return
+            # HALO: Phase 1 job-level register hook. Strict mode — rejects
+            # with HTTP 400 if --halo-enabled is on and req.halo_job_id is
+            # missing. See managers/halo/CLAUDE.md.
+            if self._halo_register_or_abort(req):
+                return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
@@ -2474,6 +2516,129 @@ class Scheduler(
             abort_info={"reason": message, "admission_reason": decision.reason}
         )
         return True
+
+    # ------------------------------------------------------------------
+    # HALO: Project Halo Phase 1 — see managers/halo/CLAUDE.md.
+    # ------------------------------------------------------------------
+
+    def _halo_register_or_abort(self, recv_req: Req) -> bool:
+        """Register the request with the Halo controller. Returns True iff
+        the request was rejected (HTTP 400 sent) so the caller skips queueing.
+
+        Phase 1 strict mode: when --halo-enabled, requests MUST carry
+        halo_job_id; missing → reject with HTTP 400. Missing halo_slo falls
+        back to --halo-default-slo (see HaloController).
+        """
+        controller = getattr(self, "halo_controller", None)
+        if controller is None:
+            return False
+        try:
+            controller.register_request(
+                rid=recv_req.rid,
+                halo_job_id=getattr(recv_req, "halo_job_id", None),
+                halo_slo=getattr(recv_req, "halo_slo", None),
+            )
+        except HaloRejectError as e:
+            message = (
+                "Halo rejected: missing halo_job_id (set --halo-enabled is on; "
+                "include halo_job_id in the request to enable per-job tracking)."
+            )
+            logger.info("[halo] REJECT rid=%s reason=%s", recv_req.rid, e.reason)
+            self.send_to_tokenizer.send_output(
+                AbortReq(
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.BAD_REQUEST,
+                        "message": message,
+                        "halo_reason": e.reason,
+                    },
+                    rid=recv_req.rid,
+                ),
+                recv_req,
+            )
+            recv_req.time_stats.trace_ctx.abort(
+                abort_info={"reason": message, "halo_reason": e.reason}
+            )
+            return True
+
+        # Mark admission timestamp + capture prefix match length for solo-run
+        # baseline. We reuse the admission_control prefix-len helper so the
+        # two paths see the exact same number (avoids drift).
+        recv_req.halo_first_admitted_ts = time.monotonic()
+        try:
+            recv_req.halo_prefix_len_at_admission = (
+                self._admission_match_prefix_len(recv_req)
+            )
+        except Exception:  # noqa: BLE001 — Halo must never crash request path
+            recv_req.halo_prefix_len_at_admission = 0
+        return False
+
+    def _halo_on_request_finished(self, req: Req) -> None:
+        """Called from the scheduler's per-request finish path. No-op if Halo off."""
+        controller = getattr(self, "halo_controller", None)
+        if controller is None:
+            return
+        controller.on_request_finished(req.rid)
+
+    def _halo_build_request_execution_infos(self) -> List[RequestExecutionInfo]:
+        """Snapshot the in-flight Halo-tracked requests for the periodic sweep.
+
+        Pulls from both the running batch and the waiting queue so that a job
+        whose request is waiting still shows up as "slow" if the queue is long.
+        Each info is a plain dataclass — no scheduler references leak into the
+        Halo module.
+        """
+        controller = getattr(self, "halo_controller", None)
+        if controller is None:
+            return []
+        infos: List[RequestExecutionInfo] = []
+        now = time.monotonic()
+
+        def _add(req: Req, kv_len_now: int, decoded_so_far: int) -> None:
+            if getattr(req, "halo_job_id", None) is None:
+                return
+            t0 = getattr(req, "halo_first_admitted_ts", None)
+            if t0 is None:
+                return
+            infos.append(
+                RequestExecutionInfo(
+                    rid=req.rid,
+                    job_id=req.halo_job_id,
+                    prompt_len=len(req.origin_input_ids or []),
+                    prefix_len_at_admission=getattr(
+                        req, "halo_prefix_len_at_admission", 0
+                    ),
+                    decoded_tokens_so_far=decoded_so_far,
+                    kv_len_now=kv_len_now,
+                    elapsed_ms=(now - t0) * 1000.0,
+                )
+            )
+
+        # Waiting queue: decoded_so_far=0, kv_len_now=0 (request hasn't run yet).
+        for req in self.waiting_queue:
+            _add(req, kv_len_now=0, decoded_so_far=0)
+
+        # Running batch: pull KV and decoded counters from each Req.
+        running = getattr(self, "running_batch", None)
+        if running is not None and getattr(running, "reqs", None):
+            for req in running.reqs:
+                kv_len = int(getattr(req, "kv_committed_len", 0) or 0)
+                decoded = len(getattr(req, "output_ids", []) or [])
+                _add(req, kv_len_now=kv_len, decoded_so_far=decoded)
+
+        return infos
+
+    def _halo_maybe_tick(self) -> None:
+        """Wall-clock-gated tick. Called once per scheduler-loop iteration.
+
+        The controller itself checks the wall-clock interval (`should_tick`)
+        and skips if not due — this keeps the hot-path cost to ~1 attribute
+        access + 1 monotonic() when off, and trivially cheap when on.
+        """
+        controller = getattr(self, "halo_controller", None)
+        if controller is None:
+            return
+        controller.tick(self._halo_build_request_execution_infos)
 
     def _abort_on_waiting_timeout(self):
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
@@ -3621,6 +3786,12 @@ class Scheduler(
                     for d in recent
                 ],
             }
+
+        # HALO: Project Halo Phase 1 — job-level slowdown state.
+        # See managers/halo/CLAUDE.md.
+        halo_controller = getattr(self, "halo_controller", None)
+        if halo_controller is not None:
+            ret["halo_state"] = halo_controller.snapshot()
 
         # This field is not serializable.
         ret.pop("model_config", None)

@@ -374,6 +374,15 @@ class ServerArgs:
     admission_tbt_reactive_ratio: float = 0.9
     admission_dry_run: bool = False
     admission_decision_log: Optional[str] = None
+    # HALO: Project Halo Phase 1 — job-level slowdown tracking.
+    # See managers/halo/CLAUDE.md. Off by default; when off, zero impact.
+    halo_enabled: bool = False
+    halo_default_slo: float = 5.0
+    halo_tick_interval_ms: float = 100.0
+    halo_aggregator: str = "max+mean"
+    halo_job_log: Optional[str] = None
+    halo_prefill_cost_model_path: Optional[str] = None
+    halo_tbt_cost_model_path: Optional[str] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
@@ -4580,6 +4589,50 @@ class ServerArgs:
             type=str,
             default=ServerArgs.admission_decision_log,
             help="Append every admission decision as a JSONL row to this path. Consumed by tools/admission_control/replay_admission.py.",
+        )
+        # HALO: Project Halo Phase 1 — job-level slowdown tracking.
+        # See managers/halo/CLAUDE.md.
+        parser.add_argument(
+            "--halo-enabled",
+            action="store_true",
+            default=ServerArgs.halo_enabled,
+            help="Enable Project Halo Phase 1 job-level slowdown tracking. Off by default. When enabled, requests MUST carry halo_job_id (HTTP 400 otherwise).",
+        )
+        parser.add_argument(
+            "--halo-default-slo",
+            type=float,
+            default=ServerArgs.halo_default_slo,
+            help="Default slowdown SLO (multiplier of solo-run) used when a request omits halo_slo. E.g., 5.0 means job e2e latency may be at most 5x its solo-run baseline.",
+        )
+        parser.add_argument(
+            "--halo-tick-interval-ms",
+            type=float,
+            default=ServerArgs.halo_tick_interval_ms,
+            help="Min wall-clock interval (ms) between Halo slowdown-tracker sweeps. Lower = finer time resolution at higher overhead.",
+        )
+        parser.add_argument(
+            "--halo-aggregator",
+            type=str,
+            default=ServerArgs.halo_aggregator,
+            help="Reserved. Phase 1 always tracks (max, mean). Phase 2 may use this to pick the policy-relevant aggregate.",
+        )
+        parser.add_argument(
+            "--halo-job-log",
+            type=str,
+            default=ServerArgs.halo_job_log,
+            help="Per-sweep job snapshot JSONL path (rank-0 only). Auto-routed by run_experiment.py to <session>/halo_jobs.jsonl.",
+        )
+        parser.add_argument(
+            "--halo-prefill-cost-model-path",
+            type=str,
+            default=ServerArgs.halo_prefill_cost_model_path,
+            help="Prefill cost model JSON for Halo slowdown computation. Same schema as admission_control. Missing/malformed → Halo tracks job counters only, no slowdown math.",
+        )
+        parser.add_argument(
+            "--halo-tbt-cost-model-path",
+            type=str,
+            default=ServerArgs.halo_tbt_cost_model_path,
+            help="TBT cost model JSON for Halo slowdown computation. Same schema as admission_control.",
         )
         parser.add_argument(
             "--max-total-tokens",

@@ -227,6 +227,13 @@ class GenerateReqInput(BaseReq):
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
+    # HALO: Project Halo Phase 1 — job-level slowdown tracking.
+    # See managers/halo/CLAUDE.md. Both fields are optional from the
+    # client side; when --halo-enabled is on, halo_job_id is required
+    # (server rejects HTTP 400 if absent).
+    halo_job_id: Optional[str] = None
+    halo_slo: Optional[float] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -685,6 +692,9 @@ class GenerateReqInput(BaseReq):
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
+            # HALO: passthrough fields to TokenizedGenerateReqInput.
+            halo_job_id=self.halo_job_id,
+            halo_slo=self.halo_slo,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -771,6 +781,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
+
+    # HALO: Project Halo Phase 1 — see managers/halo/CLAUDE.md.
+    halo_job_id: Optional[str] = None
+    halo_slo: Optional[float] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False

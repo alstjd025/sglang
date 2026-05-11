@@ -1015,6 +1015,10 @@ class SchedulerOutputProcessorMixin:
                     # because of the one additional delayed token. This "continue" prevented the dummy output.
                     continue
                 req.finished_output = True
+                # HALO: Project Halo Phase 1 — fire job-level finish hook
+                # exactly once per req. See managers/halo/CLAUDE.md.
+                if getattr(self, "halo_controller", None) is not None:
+                    self._halo_on_request_finished(req)
                 if req.finished_len is None:
                     req.finished_len = len(req.output_ids)
                 should_output = True

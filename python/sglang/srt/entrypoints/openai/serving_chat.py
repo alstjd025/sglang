@@ -414,6 +414,10 @@ class OpenAIServingChat(OpenAIServingBase):
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
+            # HALO: forward Project Halo Phase 1 job-level metadata.
+            # See managers/halo/CLAUDE.md.
+            halo_job_id=request.halo_job_id,
+            halo_slo=request.halo_slo,
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             image_max_dynamic_patch=img_max_dynamic_patch,

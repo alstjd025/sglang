@@ -1018,6 +1018,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,
+                # HALO: forward Project Halo Phase 1 job-level metadata.
+                # See managers/halo/CLAUDE.md.
+                halo_job_id=obj.halo_job_id,
+                halo_slo=obj.halo_slo,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
