@@ -535,6 +535,10 @@ async def health_generate(request: Request) -> Response:
             input_ids=[0],
             sampling_params=sampling_params,
             log_metrics=False,
+            # HALO: /health performs a tiny internal inference to probe
+            # the engine; same situation as warmup — bypass the Halo
+            # admission gate so strict mode doesn't reject it.
+            halo_bypass=True,
         )
         if (
             _global_state.tokenizer_manager.server_args.disaggregation_mode
