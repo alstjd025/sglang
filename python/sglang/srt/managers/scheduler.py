@@ -2130,6 +2130,15 @@ class Scheduler(
                 ),
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
+                # HALO: forward Project Halo Phase 1 job-level metadata so
+                # _halo_register_or_abort sees the same values the client
+                # sent. Phase 1's initial integration plumbed these into
+                # io_struct + Req but missed this Req(...) call site, so
+                # every LLM request ended up with halo_job_id=None →
+                # always-reject. See managers/halo/CLAUDE.md.
+                halo_job_id=recv_req.halo_job_id,
+                halo_slo=recv_req.halo_slo,
+                halo_bypass=recv_req.halo_bypass,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -2190,6 +2199,9 @@ class Scheduler(
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
+                # HALO: already-aborted error-path request — bypass the
+                # Halo gate so we don't double-reject with HALO_NO_JOB_ID.
+                halo_bypass=True,
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)
@@ -2758,6 +2770,9 @@ class Scheduler(
             http_worker_ipc=recv_req.http_worker_ipc,
             time_stats=recv_req.time_stats,
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,
+            # HALO: embedding requests aren't generation traffic; Halo
+            # Phase 1 is scoped to generation, so bypass the gate.
+            halo_bypass=True,
             multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
         )
         req.tokenizer = self.tokenizer
