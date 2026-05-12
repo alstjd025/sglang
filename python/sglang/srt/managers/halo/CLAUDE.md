@@ -24,11 +24,13 @@ fast request can mask a slow one in the same job, or vice versa.
 
 | In scope | Out of scope |
 |---|---|
-| Job dataclass + JobState enum | Job-level admission gate (Phase 2) |
-| JobRegistry (rid ↔ job lookup) | Job-level scheduling priority (Phase 2) |
-| 100ms periodic SlowdownTracker.sweep | DAG-aware orchestration (Phase 3) |
+| Job dataclass + JobState enum | Job-level admission gate decisions (Phase 2) |
+| JobRegistry (rid ↔ job lookup + pre-registration) | Job-level scheduling priority (Phase 2) |
+| 100ms periodic SlowdownTracker.sweep | DAG-aware orchestration logic (Phase 3) |
 | Reuse cost models from `admission_control/` | New cost-model fitting |
 | Off-by-default flag | Replacing `admission_control/` |
+| **Option A: `POST /halo/programs`** sets up future-state (call count, DAG) on the Job for Phase 2 to consume | Use of that info — Phase 1 stores it only |
+| **Option B: request body fields** `halo_job_id`, `halo_slo` as transport | n/a |
 
 ## Architecture
 
@@ -96,6 +98,37 @@ this as a known limitation; Phase 2 work should refine the cost model first.
 | `--halo-job-log` | `SGLANG_HALO_JOB_LOG` | `unset` (auto-routed by `run_experiment.py` to `<session>/halo_jobs.jsonl`) | Per-sweep snapshot JSONL. Rank-0 only |
 | `--halo-prefill-cost-model-path` | `SGLANG_HALO_PREFILL_COST_MODEL` | `unset` | Reuses `admission_control` cost model when shared |
 | `--halo-tbt-cost-model-path` | `SGLANG_HALO_TBT_COST_MODEL` | `unset` | Same |
+| `--halo-program-idle-timeout-seconds` | n/a | `300` | Drop pre-registered programs that never got a request after this many seconds (Q13). `0` disables |
+
+## Option A — `POST /halo/programs`
+
+Pre-register a job before its first LLM request. Strict mode (Q12): when
+Halo is enabled, every LLM request MUST come from a pre-registered job
+(missing → HTTP 400). The endpoint lives at `http_server.py`, routes via
+`TokenizerManager.register_halo_program` (auto-built communicator) →
+`Scheduler.register_halo_program` → `HaloController.register_program`.
+
+```json
+POST /halo/programs
+{
+  "job_id": "agent-42",                // required, str, non-empty
+  "slo": 5.0,                          // required, float > 0
+  "total_calls": 12,                   // optional, int
+  "stage_sequence": ["U","L","P",...], // optional, list[str]
+  "expected_input_lens": [...],        // optional, list[int]
+  "expected_output_lens": [...],       // optional, list[int]
+  "dag": { ... }                       // optional, JSON-able dict, ≤16 KiB
+}
+
+→ 200 {"registered": true,  "job_id": "...", "active_jobs": N}
+→ 409 {"registered": false, "reason": "JOB_ID_ALREADY_REGISTERED",
+       "existing": {...}}                              // Q11
+→ 400 {"registered": false, "reason": "HALO_DISABLED" | "BAD_JSON"
+       | "BAD_FIELDS" | "MISSING_FIELDS" | "BODY_TOO_LARGE"}
+```
+
+SLO conflict between pre-registered Job and a later request's `halo_slo`
+(Q10): **pre-registered wins**, request value logged as WARN.
 
 ### Behavior rules
 
@@ -104,24 +137,31 @@ this as a known limitation; Phase 2 work should refine the cost model first.
   (jobs are still registered & counted; only `slowdown_*` fields stay at SLO).
 - Both cost model paths set + missing/malformed ⇒ WARN, slowdown sweep skipped.
 - Request lacks `halo_job_id` while controller enabled ⇒ HTTP 400 reject
-  (per spec — strict mode for experiments).
-- Request has `halo_job_id` but no `halo_slo` ⇒ default SLO applied.
+  with reason `HALO_NO_JOB_ID` (Q7 — strict mode for experiments).
+- Request has `halo_job_id` but program **not pre-registered** ⇒ HTTP 400
+  reject with reason `HALO_PROGRAM_NOT_REGISTERED` (Q12). Client must call
+  `POST /halo/programs` before the first LLM call.
+- Request has `halo_job_id` + program pre-registered but no `halo_slo` ⇒
+  pre-registered SLO is used (anyway wins per Q10).
 
 ## External touchpoints (one-line `# HALO:` comments at each site)
 
 | File | What |
 |---|---|
-| `srt/managers/io_struct.py` | Add `halo_job_id: Optional[str]`, `halo_slo: Optional[float]` to `GenerateReqInput`, `TokenizedGenerateReqInput` |
-| `srt/entrypoints/openai/protocol.py` | Same two fields on `ChatCompletionRequest`, `CompletionRequest` |
-| `srt/entrypoints/openai/serving_chat.py`, `serving_completions.py` | Forward fields into `GenerateReqInput` |
-| `srt/managers/schedule_batch.py::Req` | Store `halo_job_id`, `halo_slo`, `halo_first_admitted_ts` |
+| `srt/managers/io_struct.py` | (B) `halo_job_id`, `halo_slo` on `GenerateReqInput` + `TokenizedGenerateReqInput`. (A) `HaloRegisterProgramReqInput` / `Output` dataclasses |
+| `srt/entrypoints/openai/protocol.py` | (B) Same two fields on `ChatCompletionRequest`, `CompletionRequest` |
+| `srt/entrypoints/openai/serving_chat.py`, `serving_completions.py` | (B) Forward fields into `GenerateReqInput` |
+| `srt/managers/schedule_batch.py::Req` | (B) Store `halo_job_id`, `halo_slo`, `halo_first_admitted_ts` |
+| `srt/managers/tokenizer_control_mixin.py` | (A) New `_COMMUNICATOR_SPECS` entry `register_halo_program`; async `register_halo_program(obj)` helper |
 | `srt/managers/scheduler.py::__init__` | `init_halo()`: build `HaloController` if `server_args.halo_enabled` |
-| `srt/managers/scheduler.py::_add_request_to_queue` | Call `halo_controller.register_request(req)` — returns 400 reject if job_id missing |
+| `srt/managers/scheduler.py::init_request_dispatcher` | (A) Register `HaloRegisterProgramReqInput → self.register_halo_program` |
+| `srt/managers/scheduler.py::_add_request_to_queue` | (B) Call `halo_controller.register_request(req)` — returns 400 reject if job_id missing or program not pre-registered |
 | `srt/managers/scheduler.py` finish path | `halo_controller.on_request_finished(req)` |
+| `srt/managers/scheduler.py::register_halo_program` | (A) Scheduler-side handler delegating to `HaloController.register_program` |
 | `srt/observability/scheduler_metrics_mixin.py` | 100ms wall-clock gate → `halo_controller.tick(build_infos_callable)` |
 | `srt/managers/scheduler.py::get_internal_state` | Append `halo_state` block |
-| `srt/server_args.py` | 6 new CLI flags + dataclass fields |
-| `srt/entrypoints/http_server.py` | 400 path for HALO_NO_JOB_ID reject (passthrough from scheduler) |
+| `srt/server_args.py` | 7 new CLI flags + dataclass fields (`--halo-program-idle-timeout-seconds` is the 7th) |
+| `srt/entrypoints/http_server.py` | (A) `POST /halo/programs` route. (B) HTTP 400 path for HALO_NO_JOB_ID / HALO_PROGRAM_NOT_REGISTERED |
 
 ## TP-rank-0 dedup
 
@@ -136,17 +176,27 @@ JSONL job log writes and any Prometheus counters initialized only when
   "enabled": true,
   "tick_interval_ms": 100,
   "default_slo": 5.0,
+  "aggregator": "max+mean",
+  "program_idle_timeout_seconds": 300.0,
+  "cost_models_loaded": {"prefill": true, "tbt": true},
   "active_jobs": 12,
+  "total_known_jobs": 18,
   "jobs": [
     {
-      "job_id": "agent-42-step3",
+      "job_id": "agent-42",
       "state": "running",
       "slo": 5.0,
       "slowdown_max": 2.8,
       "slowdown_mean": 1.4,
       "total_request_number": 4,
       "remaining_request_number": 2,
-      "slo_violation_count": 0
+      "slo_violation_count": 0,
+      "from_program": true,
+      "total_calls_expected": 12,
+      "stage_sequence": ["UNDERSTAND", "LOCATE", "..."],
+      "expected_input_lens": null,
+      "expected_output_lens": null,
+      "dag": null
     }
   ]
 }

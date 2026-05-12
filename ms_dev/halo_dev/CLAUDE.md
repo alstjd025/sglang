@@ -791,17 +791,31 @@ Q12 = "항상 reject" 결정에 따라 **Phase 1 의 기존 lazy-create 동작�
 Phase 1 은 §9 의 1~15 완료된 상태. **Option A 추가 작업 + Q12 영향 반영**:
 
 1. ✅ §13 사용자 컨펌 완료 (Q9~Q16)
-2. ⏳ `halo/job.py` — `Job` 구조 확장 (total_calls_expected 외 6필드 + from_program)
-3. ⏳ `halo/job_registry.py` — `register_program()` 메서드 추가 + **`record_admission` 의 lazy-create 분기를 400 reject 분기로 변경 (Q12)**
-4. ⏳ `halo/controller.py` — `register_program()` public API
-5. ⏳ `io_struct.py` — `HaloRegisterProgramReqInput`/`Output` 추가
-6. ⏳ `tokenizer_manager.py` — register_halo_program handler + zmq 라운드트립
-7. ⏳ `scheduler.py` — dispatch table 등록 + handler
-8. ⏳ `http_server.py` — `POST /halo/programs` route
-9. ⏳ `server_args.py` — `--halo-program-idle-timeout`, `--halo-require-program-registration`
-10. ⏳ 단위 테스트 (register, fallback, 409, slo conflict, GC)
-11. ⏳ 통합 smoke test (curl + LLM call)
-12. ⏳ `ms_dev/halo_dev/CLAUDE.md` + `python/sglang/srt/managers/halo/CLAUDE.md` 갱신
-13. ⏳ (별도 PR) Agent_applications client wiring
+2. ✅ `halo/job.py` — `Job` 구조 확장 (total_calls_expected 외 5필드 + from_program + is_idle helper)
+3. ✅ `halo/job_registry.py` — `register_program()` 메서드 추가 + **`record_admission` 의 lazy-create 분기를 `AdmissionResult(admit=False, reason=PROGRAM_NOT_REGISTERED)` 으로 변경 (Q12)** + `gc_idle_programs()` (Q13)
+4. ✅ `halo/controller.py` — `register_program()` public API + `HaloRegisterProgramResult` + tick에 idle GC 통합 + reject reason 상수
+5. ✅ `io_struct.py` — `HaloRegisterProgramReqInput`/`Output`
+6. ✅ `tokenizer_control_mixin.py` — `_COMMUNICATOR_SPECS` 에 추가, `register_halo_program(obj)` async helper
+7. ✅ `scheduler.py` — dispatch table 등록 + `register_halo_program` 핸들러 + reject reason 별 message
+8. ✅ `http_server.py` — `POST /halo/programs` route (16KB cap, status code 매핑)
+9. ✅ `server_args.py` — `--halo-program-idle-timeout-seconds` (디폴트 300s)
+10. ✅ 단위 테스트 — 31개 그린 (register fresh/409/SLO conflict/idle GC/strict reject/controller wiring)
+11. ⏳ 통합 smoke test (실제 server 띄우고 curl POST /halo/programs → register 200 → LLM call → 200, 미등록 LLM call → 400) — 사용자 실험 시 검증
+12. ✅ `ms_dev/halo_dev/CLAUDE.md` + `python/sglang/srt/managers/halo/CLAUDE.md` Option A 반영
+13. ⏳ (별도 PR) Agent_applications client wiring: register_halo_program helper + halo_job_id/halo_slo passthrough in ChatOpenAI
 
 각 단계 끝나면 커밋. push 는 사용자.
+
+## 15. Option A 추가 커밋 히스토리
+
+```
+18bf66a8b add(halo): Option A IPC + HTTP — POST /halo/programs end-to-end
+802c5bf20 add(halo): Option A core — Job extension, register_program, strict-mode admission
+2c3ebee91 docs(halo): A+B 둘 다 구현하는 방향으로 명세 갱신, Option A 디자인/위험/결정사항 추가
+```
+
+Option A 작업 전체: 3 커밋, ~720 LoC (코드) + ~430 LoC (문서/테스트). Phase 1 전체
+(Phase 1 만 = ~830 LoC) 대비 86% 증가 — 사전 추정 (~380 LoC) 대비 두 배. 주된 차이는
+SLO conflict / 16KB cap / 단위 테스트 추가 코드.
+
+다음 (필요 시): Agent_applications 측 client wiring (Q15) → 통합 실험.

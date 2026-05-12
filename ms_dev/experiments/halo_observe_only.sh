@@ -13,10 +13,19 @@
 # JSONL log is auto-routed to <session_dir>/halo_jobs.jsonl by
 # ms_dev/expctl/run_experiment.py.
 #
-# STRICT MODE: with Halo enabled, every request MUST carry halo_job_id;
-# otherwise the server rejects it with HTTP 400. Make sure the client
-# (Agent_applications/ or whatever workload generator you use) includes
-# halo_job_id (and ideally halo_slo) on each call.
+# STRICT MODE (Phase 1 Option A + B, decisions Q7 + Q12):
+#   * Every LLM request MUST carry halo_job_id in its body — missing field
+#     → HTTP 400 (HALO_NO_JOB_ID).
+#   * The job_id MUST already be pre-registered via POST /halo/programs
+#     before the first LLM call — missing pre-registration → HTTP 400
+#     (HALO_PROGRAM_NOT_REGISTERED). Lazy-create fallback is removed.
+#
+# Client integration recipe (per job, before any LLM call):
+#   curl -X POST $BASE_URL/halo/programs -H 'Content-Type: application/json' \
+#       -d '{"job_id":"agent-42", "slo":5.0, "total_calls":12,
+#            "stage_sequence":["UNDERSTAND","LOCATE",...]}'
+# Then issue chat.completions with body fields halo_job_id="agent-42",
+# halo_slo=5.0.
 #
 # Usage:
 #   source ms_dev/experiments/halo_observe_only.sh
