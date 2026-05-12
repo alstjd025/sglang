@@ -2,9 +2,15 @@
 
 Project Halo introduces three new responsibilities into SGLang, all scoped to
 *jobs* (client-supplied groupings of multiple LLM requests that share a single
-end-to-end SLO):
+end-to-end SLO).
 
-> Full project rationale + Phase plan: `ms_dev/halo_dev/CLAUDE.md`.
+> - **Project plan + decision log**: `ms_dev/halo_dev/CLAUDE.md`
+> - **Client-facing API reference** (endpoint schemas, request fields,
+>   curl/LangChain recipes): `ms_dev/halo_dev/halo_api_reference.md`
+>
+> This file is the *internal* design doc — touchpoints, classes,
+> invariants. API surface details are summarized here but the
+> authoritative source for client integrators is `halo_api_reference.md`.
 
 ## Halo's three roles
 
@@ -127,48 +133,24 @@ prediction range (~55 ms regardless of batch composition — see
 under-discriminates context, which propagates to slowdown estimates. Phase 1 ships
 this as a known limitation; Phase 2 work should refine the cost model first.
 
-## CLI flags (added in `server_args.py`)
+## CLI flags + endpoint surface
 
-| Flag | Env var | Default | Meaning |
-|---|---|---|---|
-| `--halo-enabled` | `SGLANG_HALO_ENABLED` | `False` | Master on/off. Off ⇒ zero-cost (no-op hooks) |
-| `--halo-default-slo` | `SGLANG_HALO_DEFAULT_SLO` | `5.0` | Used when request omits `halo_slo` |
-| `--halo-tick-interval-ms` | `SGLANG_HALO_TICK_INTERVAL_MS` | `100` | Min interval between sweeps |
-| `--halo-aggregator` | `SGLANG_HALO_AGGREGATOR` | `max+mean` | Reserved — Phase 1 always tracks both |
-| `--halo-job-log` | `SGLANG_HALO_JOB_LOG` | `unset` (auto-routed by `run_experiment.py` to `<session>/halo_jobs.jsonl`) | Per-sweep snapshot JSONL. Rank-0 only |
-| `--halo-prefill-cost-model-path` | `SGLANG_HALO_PREFILL_COST_MODEL` | `unset` | Reuses `admission_control` cost model when shared |
-| `--halo-tbt-cost-model-path` | `SGLANG_HALO_TBT_COST_MODEL` | `unset` | Same |
-| `--halo-program-idle-timeout-seconds` | n/a | `300` | Drop pre-registered programs that never got a request after this many seconds (Q13). `0` disables |
+There are 8 CLI flags (`--halo-*`) and one new endpoint (`POST /halo/programs`)
+plus extra body fields (`halo_job_id`, `halo_slo`, `halo_bypass`) on
+`/v1/chat/completions` and `/generate`. The **full schemas, status codes,
+body shapes, and client recipes** are in
+[`ms_dev/halo_dev/halo_api_reference.md`](../../../../../ms_dev/halo_dev/halo_api_reference.md).
 
-## Option A — `POST /halo/programs`
-
-Pre-register a job before its first LLM request. Strict mode (Q12): when
-Halo is enabled, every LLM request MUST come from a pre-registered job
-(missing → HTTP 400). The endpoint lives at `http_server.py`, routes via
-`TokenizerManager.register_halo_program` (auto-built communicator) →
-`Scheduler.register_halo_program` → `HaloController.register_program`.
-
-```json
-POST /halo/programs
-{
-  "job_id": "agent-42",                // required, str, non-empty
-  "slo": 5.0,                          // required, float > 0
-  "total_calls": 12,                   // optional, int
-  "stage_sequence": ["U","L","P",...], // optional, list[str]
-  "expected_input_lens": [...],        // optional, list[int]
-  "expected_output_lens": [...],       // optional, list[int]
-  "dag": { ... }                       // optional, JSON-able dict, ≤16 KiB
-}
-
-→ 200 {"registered": true,  "job_id": "...", "active_jobs": N}
-→ 409 {"registered": false, "reason": "JOB_ID_ALREADY_REGISTERED",
-       "existing": {...}}                              // Q11
-→ 400 {"registered": false, "reason": "HALO_DISABLED" | "BAD_JSON"
-       | "BAD_FIELDS" | "MISSING_FIELDS" | "BODY_TOO_LARGE"}
-```
-
-SLO conflict between pre-registered Job and a later request's `halo_slo`
-(Q10): **pre-registered wins**, request value logged as WARN.
+Internal-only knobs worth remembering here:
+- `--halo-enabled` is the master on/off — when off, controller is None and every
+  hook is a one-line null check (zero cost).
+- `--halo-program-idle-timeout-seconds` (default 300) drives
+  `JobRegistry.gc_idle_programs` from inside `tick()`. `0` disables it.
+- Q10 (SLO conflict): pre-registered wins, request value logged as WARN.
+- Q11 (re-register): HTTP 409, the existing Job's `to_dict()` is included
+  in the response body.
+- Q12 (no lazy-create): requests for unregistered job_ids → HTTP 400 with
+  reason `HALO_PROGRAM_NOT_REGISTERED`.
 
 ### Behavior rules
 

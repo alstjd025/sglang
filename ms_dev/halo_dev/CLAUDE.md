@@ -80,6 +80,16 @@ Project Halo
 > 본 섹션은 개발 명세 검토 + 코드베이스 스캔 결과 + 미결정 사항에 대한 의견을 정리.
 > **사용자 컨펌 받기 전에는 어떠한 코드 수정도 진행하지 않음.**
 
+> **분리된 문서**:
+> - **클라이언트/API 관점** (endpoint, request 필드, curl/LangChain 예제, 응답
+>   status code 표 등): [halo_api_reference.md](halo_api_reference.md)
+> - **모듈 내부 디자인** (touchpoints, 책임 경계, 클래스 표):
+>   [`python/sglang/srt/managers/halo/CLAUDE.md`](../../python/sglang/srt/managers/halo/CLAUDE.md)
+> - **검증/벤치마크**: [verify/CLAUDE.md](verify/CLAUDE.md)
+>
+> 이 파일은 **프로젝트 전체 디자인 결정 + 진행 로그**가 남는 곳. API 세부는
+> 별도로 분리해서 길이를 통제.
+
 ## 0. 작업 환경 (코딩 시작 전 셋업)
 
 - 현재 브랜치: `admission-control-mooncakelike`. 실험이 이 브랜치에서 진행 중이므로
@@ -467,38 +477,14 @@ Phase 2 admission/scheduling 알고리즘이 이 정보를 활용.
 `POST /halo/programs` — 신규 top-level route (admission_control 에는 대응 endpoint
 없음. Halo 만의 control plane).
 
-```json
-// Request body (application/json)
-{
-  "job_id": "agent-42",               // required, str
-  "slo": 5.0,                         // required, slowdown SLO
-  "total_calls": 12,                  // optional, int — chain_length
-  "stage_sequence": ["UNDERSTAND", "LOCATE", "LOCATE", "PLAN", ...],   // optional
-  "expected_input_lens": [200, 350, 410, ...],   // optional, per-call tokens
-  "expected_output_lens": [80, 120, 90, ...],    // optional, per-call tokens
-  "dag": { "type": "linear" }         // optional, free-form JSON-able
-}
+**전체 schema / status code / 응답 본문 형태**: [halo_api_reference.md](halo_api_reference.md)
+의 "`POST /halo/programs`" 섹션 참고. 여기서는 *내부 디자인 결정* 만 기록:
 
-// Response 200 (success)
-{
-  "registered": true,
-  "job_id": "agent-42",
-  "active_jobs": 13
-}
-
-// Response 409 (job_id already registered)
-{
-  "registered": false,
-  "reason": "JOB_ID_ALREADY_REGISTERED",
-  "existing": { ... existing Job to_dict() ... }
-}
-
-// Response 400 (Halo disabled)
-{
-  "registered": false,
-  "reason": "HALO_DISABLED"
-}
-```
+- 외부 routing: `http_server.py @app.post("/halo/programs")`
+- IPC: TokenizerManager `register_halo_program` communicator → Scheduler
+  `register_halo_program` 핸들러 → `HaloController.register_program`
+- body 크기 상한: 16 KiB (Q14, http_server.py 에서 강제)
+- status code 매핑: fresh=200 / dup=409 / disabled or malformed=400 (Q11)
 
 ### 11.3 신규 IO struct (io_struct.py)
 
@@ -625,24 +611,10 @@ def register_program(
 
 ### 11.8 클라이언트 (Agent_applications) 측 통합
 
-LangChain 환경에서는 ChatOpenAI 가 Option B path 를 담당 (변경 없음 — 매 call body 에
-`halo_job_id`/`halo_slo` 포함). Option A 는 별도 한 줄 헬퍼:
-
-```python
-# Agent_applications/agent_motivation_experiment/workloads/swe_bench_coding/agent.py
-# run_job 진입 시 한 번 호출.
-def register_halo_program(base_url: str, *, job_id: str, slo: float,
-                          total_calls: int, stages: list[str], ...) -> None:
-    httpx.post(f"{base_url}/halo/programs", json={
-        "job_id": job_id, "slo": slo,
-        "total_calls": total_calls,
-        "stage_sequence": stages,
-        # ... 필요시 expected_input/output_lens, dag ...
-    }, timeout=2.0)
-```
-
-`ChainState` 에 이미 `chain_length`, `stage_sequence`, `tool_results` 가 있어 그대로
-사용 가능.
+코드 예제와 단계별 wiring 가이드 (LangChain `ChatOpenAI` 의 `extra_body`,
+`run_job` 진입 시 `register_halo_program` 호출 등) 는
+[halo_api_reference.md](halo_api_reference.md) 의 "Client integration recipes"
+및 "Agent_applications" 섹션 참고.
 
 > Agent_applications 변경은 SGLang server 변경 commit/merge 후 별도 PR. Phase 1
 > 안에서는 server-side 만 완료하고 사용자가 직접 client wiring.
