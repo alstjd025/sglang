@@ -21,8 +21,8 @@ Project Halo
     - OpenAi-API 등(혹은 지금 Agent_application에서 사용 가능할 Api)을 약간 확장 또는 수정
         - Request 보내는 필드에 SLO와 program key (id) 넣어서 함께 보낼 수 있도록 함.
 
-  [고민] Option A가 가능한지 검토. Option A가 가능하다면, job-level scheduling이 좀 더 정교하게 될 수 있을듯. Option B는 구현이 좀 더 간단하겠으나 충분한 정보가 없을 수 있음.
-
+  Option A와 B를 일단 모두 구현. 개발 Phase 2에서 job 의 미래 상태 (call 수, DAG구조 등) 이 어느정도 필요할 것으로 예상됨. 
+  
 ### Job 자료구조 (상태구조)
 
 - Goal: 시스템에 존재하는 job 의 자료구조 정의 (linux 의 task_struct와 흡사)
@@ -110,23 +110,33 @@ slowdown 데이터를 수집/노출까지만. 결정 로직은 0건.
 
 ### Q1. Option A vs Option B — 인터페이스 형태
 
-**내 의견: Phase 1은 Option B 단독으로 가는 것을 강력 추천.**
+**갱신 (2026-05-12, 사용자 명세 재정의)**:
+> "Option A와 B를 일단 모두 구현. Phase 2 admission control 시 job 의 미래 상태
+> (call 수, DAG 구조 등) 이 필요할 것으로 예상됨."
 
-근거:
-1. 명세 원칙 "최소한의 수정으로 구현" 과 가장 부합. SGLang frontend DSL 수정은 그
-   자체로 큰 작업이고 Phase 1 deliverable (slowdown tracking) 과 직접 연결 안 됨.
-2. Phase 1의 목표는 *job-level 관찰* 인데, 이걸 위해 필요한 정보는 `job_id + SLO`
-   뿐. DAG 정보는 슬로우다운 계산에 안 쓰임 → Option A가 주는 정보 우위가 Phase 1
-   에서는 의미가 없음.
-3. Option B 의 메커니즘 (request에 metadata field 추가) 자체가 추후 Option A 의
-   *전송 계층* 이 됨. 즉 B는 A의 부분집합이라 future-compatible.
-4. 실험 application은 Agent_applications/ 의 OpenAI 호출 → 헤더/필드 한두개 추가만
-   하면 끝. 기존 LangGraph 코드 거의 수정 안 함.
+**최종 결정: A + B 둘 다 구현. B 는 transport 계층, A 는 그 위의 사전 등록 계층.**
 
-→ 단, **Option A 가능성 자체는 architecture 단에서 막지 않도록** 다음을 보장:
-- Job 자료구조에 `dag: Optional[Any]` 자리 비워두기 (None 허용).
-- JobRegistry 등록 API 가 "사후 등록" (request로부터 lazy 등록) + "사전 등록"
-  (compile 시점 등록) 양쪽 다 받을 수 있게 설계.
+두 옵션은 배타적이지 않고 **계층적**:
+
+```
+Layer 1 (Option B): 매 LLM request 의 body 에 {halo_job_id, halo_slo} 동봉
+                    → transport. job 단위 식별 + per-call SLO 전달.
+                    → 이미 Phase 1 에서 구현 완료.
+
+Layer 2 (Option A): POST /halo/programs 한 번 호출하여 미래 정보 동봉
+                    {job_id, slo, total_calls, stage_sequence, dag, ...}
+                    → control plane. Phase 2 admission/scheduling 결정 기반.
+                    → Phase 1 에서는 등록만 받고 *저장*. 활용은 Phase 2.
+```
+
+**핵심**: 사용자가 Option A 미사용 시 → 그대로 Option B 동작 (lazy-create).
+사용자가 Option A 사용 시 → 동일 transport 위에서 Job 객체가 더 풍부한 정보 보유.
+
+Phase 1 deliverable (slowdown 관찰) 만 두고 보면 A 의 추가 정보는 *현재* 활용 안 됨.
+그러나 Phase 2 lookahead admission ("앞으로 K call 더 올 거니까 지금 받으면 SLO 못
+맞춤") 에 필요. 명세대로 **Phase 1 에서 A 도 미리 깔아두자**.
+
+> 자세한 디자인은 §11 "Option A 디자인" 참고.
 
 ### Q2. Solo-run latency 도출 방식
 
@@ -341,7 +351,7 @@ python/sglang/srt/managers/halo/                ← 신규 패키지
 
 | # | 항목 | 결정 |
 |---|---|---|
-| 1 | 인터페이스 | **Option B 단독** — request에 `halo_job_id`, `halo_slo` 필드 추가. Option A 자리는 `Job.dag: Optional` 로 비워둠 |
+| 1 | 인터페이스 | ~~Option B 단독~~ → **A + B 둘 다** (2026-05-12 명세 갱신). B 는 transport, A 는 그 위의 사전 등록 계층. 자세한 디자인은 §11. |
 | 2 | 초기 `slowdown_ratio` | **SLO 값** (명세대로). 의미: 측정 전엔 worst-case로 둔다 (fail-safe) |
 | 3 | 집계 방식 | **max + mean 둘 다 보관** — `slowdown_max`, `slowdown_mean` 두 필드 유지 |
 | 4 | 브랜치명 | `project-halo-phase1` |
@@ -409,6 +419,389 @@ acdfc411f add(halo): Phase 1 module skeleton — Job, JobRegistry, SlowdownTrack
 e496ea707 docs(halo): Phase 1 plan + decisions in ms_dev/halo_dev/CLAUDE.md
 ```
 
-총 5개 커밋. push 는 사용자가 직접 (`git push -u origin project-halo-phase1`).
+총 5개 커밋 (+ Halo 진행상황 doc 커밋 1개 = `f321ff493`). push 는 사용자가 직접
+(`git push -u origin project-halo-phase1`).
 
 > 각 단계 끝나면 커밋. push 는 사용자가 직접.
+
+========================================================================
+# Option A 확장 — 2026-05-12 갱신 후 추가
+========================================================================
+
+## 11. Option A 디자인 (사전 등록 계층)
+
+### 11.1 개념
+
+**Option A = Option B 의 *superset*. transport 는 그대로, control plane 만 추가.**
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  Client (LangGraph run_job 진입)                                   │
+│                                                                    │
+│  ① POST /halo/programs  ← Option A — chain 시작 전 1회             │
+│     body: {job_id, slo, total_calls, stages, dag, ...}             │
+│                                                                    │
+│  ② POST /v1/chat/completions  ← Option B — 매 call                 │
+│     body: {model, messages, halo_job_id, halo_slo, ...}            │
+└────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌────────────────────────────────────────────────────────────────────┐
+│  SGLang server                                                     │
+│                                                                    │
+│  ① http_server → TokenizerManager (zmq) → Scheduler                │
+│     → HaloController.register_program(job_id, slo, **info)         │
+│     → JobRegistry: Job 객체 미리 생성 + 미래 정보 저장             │
+│                                                                    │
+│  ② tokenizer → scheduler → _add_request_to_queue                   │
+│     → _halo_register_or_abort                                      │
+│       case A: job_id 가 사전 등록 → 그 Job 의 rid 추가              │
+│       case B: job_id 가 미등록 → lazy-create (Option B 동작)        │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+Phase 1 에서는 Option A 의 미래 정보를 *저장만* 하고, slowdown 계산엔 미사용.
+Phase 2 admission/scheduling 알고리즘이 이 정보를 활용.
+
+### 11.2 신규 HTTP endpoint
+
+`POST /halo/programs` — 신규 top-level route (admission_control 에는 대응 endpoint
+없음. Halo 만의 control plane).
+
+```json
+// Request body (application/json)
+{
+  "job_id": "agent-42",               // required, str
+  "slo": 5.0,                         // required, slowdown SLO
+  "total_calls": 12,                  // optional, int — chain_length
+  "stage_sequence": ["UNDERSTAND", "LOCATE", "LOCATE", "PLAN", ...],   // optional
+  "expected_input_lens": [200, 350, 410, ...],   // optional, per-call tokens
+  "expected_output_lens": [80, 120, 90, ...],    // optional, per-call tokens
+  "dag": { "type": "linear" }         // optional, free-form JSON-able
+}
+
+// Response 200 (success)
+{
+  "registered": true,
+  "job_id": "agent-42",
+  "active_jobs": 13
+}
+
+// Response 409 (job_id already registered)
+{
+  "registered": false,
+  "reason": "JOB_ID_ALREADY_REGISTERED",
+  "existing": { ... existing Job to_dict() ... }
+}
+
+// Response 400 (Halo disabled)
+{
+  "registered": false,
+  "reason": "HALO_DISABLED"
+}
+```
+
+### 11.3 신규 IO struct (io_struct.py)
+
+```python
+# HALO: Option A — see managers/halo/CLAUDE.md.
+@dataclass
+class HaloRegisterProgramReqInput:
+    job_id: str
+    slo: float
+    total_calls: Optional[int] = None
+    stage_sequence: Optional[List[str]] = None
+    expected_input_lens: Optional[List[int]] = None
+    expected_output_lens: Optional[List[int]] = None
+    dag: Optional[Dict[str, Any]] = None
+
+@dataclass
+class HaloRegisterProgramReqOutput:
+    registered: bool
+    job_id: str
+    reason: Optional[str] = None         # set when registered=False
+    active_jobs: int = 0
+    existing: Optional[Dict[str, Any]] = None
+```
+
+### 11.4 Job 구조 확장
+
+```python
+@dataclass
+class Job:
+    # ... 기존 필드 ...
+
+    # HALO: Option A — pre-registered program metadata.
+    # All optional; None 이면 Option B (lazy-create) job.
+    total_calls_expected: Optional[int] = None
+    stage_sequence: Optional[List[str]] = None
+    expected_input_lens: Optional[List[int]] = None
+    expected_output_lens: Optional[List[int]] = None
+    dag: Optional[Dict[str, Any]] = None      # ← 기존 dag: Optional[Any] 자리 강화
+    from_program: bool = False                # True 면 사전 등록된 Job
+```
+
+`Job.to_dict()` 도 이 필드들을 dump 하도록 확장.
+
+### 11.5 JobRegistry 확장
+
+```python
+def register_program(
+    self,
+    job_id: str,
+    slo: float,
+    *,
+    total_calls: Optional[int] = None,
+    stage_sequence: Optional[List[str]] = None,
+    expected_input_lens: Optional[List[int]] = None,
+    expected_output_lens: Optional[List[int]] = None,
+    dag: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, Job]:
+    """
+    Pre-register a job before any LLM request arrives.
+
+    Returns (newly_registered: bool, job: Job).
+    - True  → fresh registration (200 OK)
+    - False → job_id already exists (409 Conflict by default)
+    """
+    existing = self._jobs.get(job_id)
+    if existing is not None:
+        return False, existing
+    job = Job(
+        job_id=job_id,
+        slo=slo,
+        total_calls_expected=total_calls,
+        stage_sequence=stage_sequence,
+        expected_input_lens=expected_input_lens,
+        expected_output_lens=expected_output_lens,
+        dag=dag,
+        from_program=True,
+    )
+    self._jobs[job_id] = job
+    return True, job
+```
+
+기존 `record_admission()` 도 수정:
+- job_id 가 이미 존재하고 `from_program=True` 이면 → 기존 Job 의 slo 우선. request 의
+  `halo_slo` 와 다르면 WARN 로그 (값은 무시).
+- 미존재면 → 현재 동작 그대로 (lazy-create, `from_program=False`).
+
+### 11.6 HaloController API
+
+```python
+def register_program(
+    self,
+    job_id: str,
+    slo: float,
+    **future_info,
+) -> HaloRegisterProgramReqOutput:
+    """Public entry for Option A pre-registration."""
+    if not self.config.enabled:
+        return HaloRegisterProgramReqOutput(
+            registered=False, job_id=job_id, reason="HALO_DISABLED")
+    fresh, job = self.registry.register_program(job_id, slo, **future_info)
+    if not fresh:
+        return HaloRegisterProgramReqOutput(
+            registered=False, job_id=job_id,
+            reason="JOB_ID_ALREADY_REGISTERED",
+            existing=job.to_dict())
+    if self._log is not None:
+        self._log.write({"ts": time.monotonic(), "event": "register_program",
+                         "job": job.to_dict()})
+    return HaloRegisterProgramReqOutput(
+        registered=True, job_id=job_id,
+        active_jobs=len(self.registry.active_jobs()))
+```
+
+### 11.7 IPC 경로 (TokenizerManager ↔ Scheduler)
+
+`flush_cache` / `get_internal_state` 패턴 그대로 mirror:
+
+1. `http_server.py` 에 `@app.post("/halo/programs")` 추가.
+2. Handler 는 body → `HaloRegisterProgramReqInput` → `tokenizer_manager.register_halo_program(req)` 호출.
+3. TokenizerManager: zmq 로 scheduler 에 forward, await response.
+4. Scheduler 의 dispatch table 에 `HaloRegisterProgramReqInput` 핸들러 등록 (event loop 의 `process_input_requests` 라우팅).
+5. Scheduler 가 `self.halo_controller.register_program(...)` 호출, 결과를 `HaloRegisterProgramReqOutput` 으로 tokenizer 에 반환.
+6. Tokenizer 가 HTTP response 로 변환.
+
+### 11.8 클라이언트 (Agent_applications) 측 통합
+
+LangChain 환경에서는 ChatOpenAI 가 Option B path 를 담당 (변경 없음 — 매 call body 에
+`halo_job_id`/`halo_slo` 포함). Option A 는 별도 한 줄 헬퍼:
+
+```python
+# Agent_applications/agent_motivation_experiment/workloads/swe_bench_coding/agent.py
+# run_job 진입 시 한 번 호출.
+def register_halo_program(base_url: str, *, job_id: str, slo: float,
+                          total_calls: int, stages: list[str], ...) -> None:
+    httpx.post(f"{base_url}/halo/programs", json={
+        "job_id": job_id, "slo": slo,
+        "total_calls": total_calls,
+        "stage_sequence": stages,
+        # ... 필요시 expected_input/output_lens, dag ...
+    }, timeout=2.0)
+```
+
+`ChainState` 에 이미 `chain_length`, `stage_sequence`, `tool_results` 가 있어 그대로
+사용 가능.
+
+> Agent_applications 변경은 SGLang server 변경 commit/merge 후 별도 PR. Phase 1
+> 안에서는 server-side 만 완료하고 사용자가 직접 client wiring.
+
+## 12. Option A 구현의 예상 어려움 + 위험
+
+### 12.1 LoC 추정
+
+| 작업 | LoC | 난이도 | 위치 |
+|---|---|---|---|
+| `Job` 구조 확장 | ~30 | 낮음 | `halo/job.py` |
+| `JobRegistry.register_program()` | ~30 | 낮음 | `halo/job_registry.py` |
+| `HaloController.register_program()` | ~25 | 낮음 | `halo/controller.py` |
+| `record_admission()` 사전 등록 인지 | ~15 | 낮음 | `halo/job_registry.py` |
+| 신규 IO struct | ~40 | 중 | `srt/managers/io_struct.py` |
+| TokenizerManager handler | ~40 | 중 | `srt/managers/tokenizer_manager.py` |
+| Scheduler dispatch + handler | ~40 | 중 | `srt/managers/scheduler.py` |
+| HTTP endpoint | ~50 | 중 | `srt/entrypoints/http_server.py` |
+| 단위 테스트 (register / fallback / 409) | ~80 | 낮음 | `test/registered/halo/` |
+| 통합 smoke test (curl + LLM call) | ~30 | 낮음 | manual or in test |
+| **합계** | **~380** | | |
+
+기존 Phase 1 코드 (~830 LoC) 대비 ~45% 증가. **substantial 하지만 모든 항목이 기존 패턴 mirror**.
+
+### 12.2 주요 위험 & 완화
+
+#### W1. HTTP 요청 도착 순서 race
+**문제**: `register_program` HTTP 요청과 첫 LLM request 가 거의 동시에 출발하면, 서버에
+LLM request 가 먼저 도착할 수도 있음 (둘 다 비동기).
+
+**시나리오**:
+1. Client: register_program 보냄 (TCP A)
+2. Client: 곧바로 chat.completions 보냄 (TCP B)
+3. Server: B 가 먼저 도착 → `record_admission` 이 lazy-create (`from_program=False`)
+4. Server: A 가 도착 → `register_program` 이 보니 이미 존재 → 409? 아니면 갱신?
+
+**완화 옵션**:
+- (a) 클라이언트 contract: register_program 200 받은 후 LLM 호출 — 가장 안전하지만 매번 RTT 1회 추가
+- (b) 서버 측 idempotent upgrade: lazy-create Job 에 `from_program=False` 인 상태면
+  나중 도착한 register_program 이 "사전 정보 보강" 으로 처리 (slo 충돌은 W3 정책 따름)
+- **권장: (a) + (b) 병행**. Contract 는 (a) 로 권장. 그러나 race 발생 시 (b) 동작도
+  지원해서 안전성 확보.
+
+#### W2. 동일 job_id 재등록 정책
+- (a) HTTP 409 (현재 권장)
+- (b) Idempotent — 두 번째가 새 값으로 덮어쓰기, WARN 로그
+- (c) Silently ignore
+
+권장 **(a)** 인데 W1 의 race 와 충돌 가능성 있음 → (b) 도 검토 가치 있음.
+사용자 확인 필요 (Q11).
+
+#### W3. SLO 충돌 (사전 등록 vs request body)
+- register_program 에서 slo=5.0 등록, 이후 chat.completions 에 halo_slo=3.0 도착.
+- 옵션:
+  - (a) 사전 등록 우선, request 의 halo_slo 는 WARN 후 무시
+  - (b) request 우선 (last-write-wins)
+  - (c) 모두 reject (HTTP 400)
+- **권장: (a)**. program 이 contract.
+
+#### W4. Multi-instance future-proofing
+Phase 2 에서 PD/multi-instance 가 되면, program registry 도 cross-scheduler 동기화
+필요. 현재 단일 scheduler 에 등록되므로 PD/DP-attn 등 멀티 rank 시 program 이 한
+rank 에만 알려질 수 있음.
+
+**완화**: 현재 `_add_request_to_queue` 는 rank 0 (또는 attn_tp_rank=0) 만 처리하는
+가정에 기대고 있는데, Halo 도 동일 가정 → 단일 scheduler 의 controller 만 program
+인지. 다른 rank 는 register_program 결과를 신경 안 써도 됨 (어차피 그 rank 가
+admission 안 함).
+
+**위험**: scheduler 가 멀티프로세스로 fork 되는 경우 (DP-attn N=4 등). program
+등록을 받은 scheduler 만 알고 있고 다른 ranks 는 모름 → request 가 다른 rank 로
+가면 lazy-create. 이건 Phase 2 multi-instance Conductor 작업 때 통합.
+
+→ Phase 1 에서는 **NULL disaggregation + single scheduler 만 보장**. 다른 모드면
+register_program 이 200 OK 를 주되 ("등록은 받음") 실제로는 무시 / WARN.
+
+#### W5. Program 객체의 빈-사용 GC
+- 사용자가 program 등록만 하고 LLM 호출은 하나도 안 보냈을 때, Job 이 계속 메모리에
+  남는다.
+- 현재 `gc_completed()` 는 state == COMPLETE 인 것만 정리.
+- **해결**: program 등록 후 일정 시간 (예: `--halo-program-idle-timeout` 디폴트 300s)
+  동안 request 가 0개면 GC. WARN 로그.
+
+#### W6. DAG 필드 크기
+- 자유 형식 dict → 너무 크면 안 됨.
+- **해결**: server 측 body 파싱 시 16KB hard cap. 초과 시 HTTP 400.
+
+#### W7. strict-mode 와 사전 등록 강제
+- 현재: `--halo-enabled` 만 ON → job_id 누락 시 400 (사전 등록 무관).
+- 추가 옵션: `--halo-require-program-registration` (디폴트 OFF). ON 이면 사전 등록 안
+  된 job_id 도 400. 실험 점검에 유용한 추가 엄격 모드.
+
+### 12.3 검증 포인트 (코딩 시작 전 확인 필요)
+
+1. **`ChatCompletionRequest` Pydantic `extra=` 기본 동작**: forbid 면 langchain
+   `model_kwargs` 가 reject 됨. 현재 protocol.py 에 명시적 `extra=` 없으면 기본
+   `ignore` → 통과. 사용자 실험 직전에 grep 한 번이면 끝.
+2. **TokenizerManager IPC pattern 정확한 위치**: 기존 `flush_cache`, `set_internal_state`
+   가 어떻게 구현돼 있는지 보고 그대로 mirror.
+3. **http_server.py 의 route 등록 컨벤션**: Halo 가 OpenAI namespace 가 아니므로
+   `/halo/programs` 라는 top-level path 가 SGLang 다른 internal endpoint 들과 충돌
+   안 하는지.
+
+## 13. 새 결정 사항 (Option A 추가에 따라, 2026-05-12 사용자 컨펌)
+
+| # | 항목 | 결정 |
+|---|---|---|
+| Q9 | API endpoint 경로 | **`POST /halo/programs`** (top-level neutral path) |
+| Q10 | 사전등록 SLO vs request `halo_slo` 충돌 | **사전 등록 우선 + WARN 로그**. request 의 `halo_slo` 는 ignore |
+| Q11 | 동일 job_id 재등록 | **HTTP 409 Conflict** (명시적). race 발생 시 client 가 처리 |
+| Q12 | 미사전등록 job_id 의 LLM request | **항상 reject (HTTP 400)** — Halo enabled 면 program 사전등록 *필수*. lazy-create fallback 제거 |
+| Q13 | Program idle GC | **새 옵션 `--halo-program-idle-timeout` 도입, 디폴트 300s**. register 후 N초간 request 0개면 GC + WARN |
+| Q14 | DAG 필드 형태 | **`Dict[str, Any]` (JSON-able) + 16KB 상한**. schema 강제 안 함 |
+| Q15 | Agent_applications 클라이언트 통합 시점 | **SGLang server 변경 완료 후 별도 PR**. Phase 1 안에서는 server-side 까지 |
+| Q16 | register_program JSONL 로깅 위치 | **기존 `halo_jobs.jsonl` 에 `event` 필드 추가**. event ∈ {register_program, sweep, complete} |
+
+### Q12 의 의미 — Phase 1 기존 동작 변경
+
+Q12 = "항상 reject" 결정에 따라 **Phase 1 의 기존 lazy-create 동작이 변경**:
+
+- 기존 (B 단독): Halo enabled + `halo_job_id` 있음 → 그 자리에서 Job 생성 (lazy-create).
+- 신규 (A+B): Halo enabled + `halo_job_id` 있음 + **사전등록 안 됨** → HTTP 400 reject.
+- 즉 클라이언트는 `register_program` 200 받은 후에 LLM call. 안 그러면 모든 call 이 400.
+
+**구현 영향**:
+- `JobRegistry.record_admission()` 의 "create new Job if not exists" 분기를 **400 reject**
+  분기로 변경. 분기 명만 바꾸면 됨 (~10 LoC).
+- `HaloController.register_request()` 의 reject 사유에 새 reason `HALO_PROGRAM_NOT_REGISTERED`
+  추가.
+- scheduler 의 `_halo_register_or_abort` 의 HTTP message 도 갱신.
+- 기존 단위 테스트 중 lazy-create 동작을 검증하던 1~2개는 변경 필요 (reject 동작으로).
+
+**운용 영향**:
+- 실험 진행 전 Agent_applications 의 client wiring (Q15) 이 *반드시 먼저* 완료돼야 함.
+  안 그러면 Halo enabled 한 실험은 모두 400 폭주.
+- server-side 작업이 끝난 직후 실험을 못 돌리고, Agent_applications PR 까지 끝나야 비로소 검증 가능.
+- 이건 Phase 1 deliverable 의 *통합 검증 시점* 이 클라이언트 PR 뒤로 미뤄진다는 뜻.
+  설계상 의도된 거라면 그대로 진행.
+
+위 영향이 의도와 맞는지 코딩 시작 전에 마지막으로 한 번 더 확인 권장 (혹시 "Option A
+미사용 시에는 B fallback 그대로 두는" 더 부드러운 운용을 원하시면 Q12 를 (a) 또는 (b)
+로 재고).
+
+## 14. 갱신된 작업 순서 (Option A 포함)
+
+Phase 1 은 §9 의 1~15 완료된 상태. **Option A 추가 작업 + Q12 영향 반영**:
+
+1. ✅ §13 사용자 컨펌 완료 (Q9~Q16)
+2. ⏳ `halo/job.py` — `Job` 구조 확장 (total_calls_expected 외 6필드 + from_program)
+3. ⏳ `halo/job_registry.py` — `register_program()` 메서드 추가 + **`record_admission` 의 lazy-create 분기를 400 reject 분기로 변경 (Q12)**
+4. ⏳ `halo/controller.py` — `register_program()` public API
+5. ⏳ `io_struct.py` — `HaloRegisterProgramReqInput`/`Output` 추가
+6. ⏳ `tokenizer_manager.py` — register_halo_program handler + zmq 라운드트립
+7. ⏳ `scheduler.py` — dispatch table 등록 + handler
+8. ⏳ `http_server.py` — `POST /halo/programs` route
+9. ⏳ `server_args.py` — `--halo-program-idle-timeout`, `--halo-require-program-registration`
+10. ⏳ 단위 테스트 (register, fallback, 409, slo conflict, GC)
+11. ⏳ 통합 smoke test (curl + LLM call)
+12. ⏳ `ms_dev/halo_dev/CLAUDE.md` + `python/sglang/srt/managers/halo/CLAUDE.md` 갱신
+13. ⏳ (별도 PR) Agent_applications client wiring
+
+각 단계 끝나면 커밋. push 는 사용자.
