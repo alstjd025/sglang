@@ -109,6 +109,12 @@ class HaloConfig:
     # Q13: pre-registered programs that never receive an LLM request get
     # dropped after this many seconds. 0 disables idle GC.
     program_idle_timeout_seconds: float = 300.0
+    # JSONL job-log write interval (seconds). Sweeps run every
+    # `tick_interval_ms`, but the log captures a full active-jobs
+    # snapshot which is verbose; writing it every sweep blows up the
+    # file. Default to one log line every 10s; metrics gauges still
+    # update every sweep. 0 → write every sweep (legacy behavior).
+    job_log_interval_seconds: float = 10.0
 
 
 class _JobLogger:
@@ -175,6 +181,9 @@ class HaloController:
 
         self._last_tick_monotonic: float = 0.0
         self._tick_interval_s: float = max(config.tick_interval_ms, 0.0) / 1000.0
+        # Independent gate for the JSONL job log — see HaloConfig.
+        self._last_log_monotonic: float = 0.0
+        self._log_interval_s: float = max(config.job_log_interval_seconds, 0.0)
 
         logger.info(
             "halo: enabled (default_slo=%.2f tick_interval_ms=%.1f rank0=%s log=%s)",
@@ -317,13 +326,23 @@ class HaloController:
         if infos:
             self.tracker.sweep(infos)
 
-        if self._log is not None:
+        # JSONL log is gated independently from the sweep — the sweep
+        # itself stays high-frequency (so per-job slowdown_max/mean and
+        # the metrics gauges update every tick), but the verbose
+        # per-sweep snapshot only lands on disk every
+        # config.job_log_interval_seconds. Set the gate to 0 to write
+        # every sweep (legacy behavior, useful for very short tests).
+        if self._log is not None and (
+            self._log_interval_s <= 0.0
+            or (now - self._last_log_monotonic) >= self._log_interval_s
+        ):
             self._log.write(
                 {
                     "ts": now,
                     "active_jobs": [j.to_dict() for j in self.registry.active_jobs()],
                 }
             )
+            self._last_log_monotonic = now
 
         # GC completed jobs older than retain window — bounded memory.
         self.registry.gc_completed(self.config.gc_retain_seconds)
@@ -396,6 +415,9 @@ def build_halo_controller_from_server_args(
         ),
         program_idle_timeout_seconds=float(
             getattr(server_args, "halo_program_idle_timeout_seconds", 300.0)
+        ),
+        job_log_interval_seconds=float(
+            getattr(server_args, "halo_job_log_interval_seconds", 10.0)
         ),
     )
     return HaloController(config=config, is_rank0=is_rank0)

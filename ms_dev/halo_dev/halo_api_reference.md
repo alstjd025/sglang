@@ -35,6 +35,7 @@ python3 ms_dev/expctl/run_experiment.py --mode single
 | `--halo-prefill-cost-model-path` | unset | Same JSON schema as admission_control's prefill cost model |
 | `--halo-tbt-cost-model-path` | unset | Same for TBT |
 | `--halo-program-idle-timeout-seconds` | `300` | Pre-registered programs that never receive a request get GC'd after this many seconds. `0` disables idle GC |
+| `--halo-job-log-interval-seconds` | `10` | How often (seconds) `halo_jobs.jsonl` gets a full active-jobs snapshot. Slowdown sweep + Prometheus gauges still tick at `--halo-tick-interval-ms`; only the verbose JSONL log is throttled. `0` reverts to per-sweep logging |
 
 ### Env-var equivalents (translated to flags by `lib_server.sh::append_halo_args`)
 

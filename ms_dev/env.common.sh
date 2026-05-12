@@ -82,6 +82,7 @@ export SGLANG_HALO_AGGREGATOR="${SGLANG_HALO_AGGREGATOR:-}"
 export SGLANG_HALO_JOB_LOG="${SGLANG_HALO_JOB_LOG:-}"
 export SGLANG_HALO_PREFILL_COST_MODEL="${SGLANG_HALO_PREFILL_COST_MODEL:-}"
 export SGLANG_HALO_TBT_COST_MODEL="${SGLANG_HALO_TBT_COST_MODEL:-}"
+export SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS="${SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS:-}"
 
 # Some environments mount /tmp with noexec, which breaks Triton /
 # torchinductor when they try to mmap compiled .so files. Redirect their

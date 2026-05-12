@@ -386,6 +386,11 @@ class ServerArgs:
     # Q13: pre-registered programs that never get an LLM request are dropped
     # after this many seconds. Set to 0 to keep them indefinitely.
     halo_program_idle_timeout_seconds: float = 300.0
+    # JSONL job-log write interval (seconds). The slowdown sweep itself
+    # runs every halo_tick_interval_ms, but the log gets a verbose
+    # per-sweep snapshot — writing every sweep blows up jsonl size on
+    # long runs. 0 → write every sweep.
+    halo_job_log_interval_seconds: float = 10.0
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
@@ -4642,6 +4647,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.halo_program_idle_timeout_seconds,
             help="HALO Option A: drop pre-registered programs that never receive an LLM request after this many seconds (default 300). Set to 0 to keep them indefinitely.",
+        )
+        parser.add_argument(
+            "--halo-job-log-interval-seconds",
+            type=float,
+            default=ServerArgs.halo_job_log_interval_seconds,
+            help="HALO: how often (seconds) to append a full active-jobs snapshot to halo_jobs.jsonl. Default 10. Slowdown sweep + Prometheus gauges still update every tick_interval_ms; only the verbose JSONL log is throttled. Set to 0 to write every sweep (legacy).",
         )
         parser.add_argument(
             "--max-total-tokens",

@@ -207,6 +207,9 @@ append_halo_args() {
   if [[ -n "${SGLANG_HALO_TBT_COST_MODEL:-}" ]]; then
     _halo_out+=(--halo-tbt-cost-model-path "${SGLANG_HALO_TBT_COST_MODEL}")
   fi
+  if [[ -n "${SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS:-}" ]]; then
+    _halo_out+=(--halo-job-log-interval-seconds "${SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS}")
+  fi
 }
 
 # launch_server <cmd...>
