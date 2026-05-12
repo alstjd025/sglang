@@ -28,26 +28,71 @@ from sglang.srt.managers.admission_control.cost_model import (
     try_load_tbt_cost_model,
 )
 from sglang.srt.managers.halo.job import Job, JobState
-from sglang.srt.managers.halo.job_registry import JobRegistry
+from sglang.srt.managers.halo.job_registry import (
+    REASON_PROGRAM_NOT_REGISTERED,
+    AdmissionResult,
+    JobRegistry,
+)
 from sglang.srt.managers.halo.slowdown_tracker import (
     RequestExecutionInfo,
     SlowdownTracker,
 )
 
+
+# Reject reason constants returned to the scheduler. Used to build the HTTP
+# error payload and the decision-log entry. Mirror of admission_control's
+# REASON_* convention.
+REASON_NO_JOB_ID = "HALO_NO_JOB_ID"
+REASON_DISABLED = "HALO_DISABLED"
+REASON_JOB_ID_ALREADY_REGISTERED = "JOB_ID_ALREADY_REGISTERED"
+# Re-export from job_registry so external callers only import controller.
+__all__ = [
+    "HaloConfig",
+    "HaloController",
+    "HaloRejectError",
+    "HaloRegisterProgramResult",
+    "REASON_DISABLED",
+    "REASON_JOB_ID_ALREADY_REGISTERED",
+    "REASON_NO_JOB_ID",
+    "REASON_PROGRAM_NOT_REGISTERED",
+]
+
 logger = logging.getLogger(__name__)
 
 
 class HaloRejectError(Exception):
-    """Raised by HaloController.register_request when the request lacks a
-    halo_job_id while Halo is enabled (strict-mode rejection — per spec).
+    """Raised by HaloController.register_request when a request fails the
+    strict-mode admission check (per Q7 + Q12):
 
-    The scheduler catches this and converts it into an HTTP 400 abort.
+    - reason == REASON_NO_JOB_ID            → request has no halo_job_id
+    - reason == REASON_PROGRAM_NOT_REGISTERED → job_id was not pre-registered
+
+    Both are converted to HTTP 400 by the scheduler with a reason-specific
+    message.
     """
 
     def __init__(self, reason: str, rid: str) -> None:
         super().__init__(f"halo reject rid={rid} reason={reason}")
         self.reason = reason
         self.rid = rid
+
+
+@dataclass
+class HaloRegisterProgramResult:
+    """Return value of `HaloController.register_program`.
+
+    `registered=True`   → fresh registration, http 200.
+    `registered=False`  → reason set:
+        REASON_DISABLED                 → halo is off; http 400
+        REASON_JOB_ID_ALREADY_REGISTERED → conflict; http 409, `existing` is
+                                          the current Job.to_dict()
+    """
+
+    registered: bool
+    job_id: str
+    reason: Optional[str] = None
+    active_jobs: int = 0
+    existing: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -60,6 +105,9 @@ class HaloConfig:
     prefill_cost_model_path: Optional[str] = None
     tbt_cost_model_path: Optional[str] = None
     gc_retain_seconds: float = 5.0
+    # Q13: pre-registered programs that never receive an LLM request get
+    # dropped after this many seconds. 0 disables idle GC.
+    program_idle_timeout_seconds: float = 300.0
 
 
 class _JobLogger:
@@ -137,18 +185,88 @@ class HaloController:
         halo_job_id: Optional[str],
         halo_slo: Optional[float],
     ) -> Job:
-        """Strict-mode admission hook.
+        """Strict-mode admission hook (Option B transport).
 
-        Per spec (decision Q7): Halo enabled ⇒ `halo_job_id` is REQUIRED.
-        Missing → raise HaloRejectError (scheduler converts to HTTP 400).
+        Per spec:
+        - Q7: Halo enabled ⇒ `halo_job_id` REQUIRED. Missing → 400.
+        - Q12: Halo enabled + job_id NOT pre-registered → 400. No lazy-create.
 
-        Missing `halo_slo` → use `config.default_slo`.
+        Missing `halo_slo` → use `config.default_slo` (the registry's
+        pre-registered slo wins anyway, see Q10).
         """
         if halo_job_id is None or halo_job_id == "":
-            raise HaloRejectError(reason="HALO_NO_JOB_ID", rid=rid)
+            raise HaloRejectError(reason=REASON_NO_JOB_ID, rid=rid)
         slo = halo_slo if halo_slo is not None else self.config.default_slo
-        job = self.registry.record_admission(halo_job_id, slo, rid)
-        return job
+        result: AdmissionResult = self.registry.record_admission(
+            halo_job_id, slo, rid
+        )
+        if not result.admit:
+            # Q12 path: program was not pre-registered.
+            raise HaloRejectError(
+                reason=result.reason or REASON_PROGRAM_NOT_REGISTERED,
+                rid=rid,
+            )
+        return result.job
+
+    def register_program(
+        self,
+        job_id: str,
+        slo: float,
+        *,
+        total_calls: Optional[int] = None,
+        stage_sequence: Optional[List[str]] = None,
+        expected_input_lens: Optional[List[int]] = None,
+        expected_output_lens: Optional[List[int]] = None,
+        dag: Optional[Dict[str, Any]] = None,
+    ) -> HaloRegisterProgramResult:
+        """Pre-register a job (Option A — `POST /halo/programs`).
+
+        Behavior per §13:
+        - Halo disabled (controller wouldn't be constructed, but defensive):
+          returns `registered=False, reason=REASON_DISABLED`.
+        - Fresh `job_id` (Q11): registered=True. http 200.
+        - Duplicate `job_id` (Q11): registered=False,
+          reason=REASON_JOB_ID_ALREADY_REGISTERED; carries existing job dict.
+        """
+        if not self.config.enabled:
+            return HaloRegisterProgramResult(
+                registered=False, job_id=job_id, reason=REASON_DISABLED
+            )
+
+        fresh, job = self.registry.register_program(
+            job_id=job_id,
+            slo=slo,
+            total_calls=total_calls,
+            stage_sequence=stage_sequence,
+            expected_input_lens=expected_input_lens,
+            expected_output_lens=expected_output_lens,
+            dag=dag,
+        )
+        if not fresh:
+            return HaloRegisterProgramResult(
+                registered=False,
+                job_id=job_id,
+                reason=REASON_JOB_ID_ALREADY_REGISTERED,
+                existing=job.to_dict(),
+            )
+
+        if self._log is not None:
+            self._log.write(
+                {
+                    "ts": time.monotonic(),
+                    "event": "register_program",
+                    "job": job.to_dict(),
+                }
+            )
+        logger.info(
+            "halo: registered program job_id=%s slo=%.2f total_calls=%s",
+            job_id, slo, total_calls,
+        )
+        return HaloRegisterProgramResult(
+            registered=True,
+            job_id=job_id,
+            active_jobs=len(self.registry.active_jobs()),
+        )
 
     def on_request_finished(self, rid: str) -> None:
         """Called from the scheduler's finish path."""
@@ -188,6 +306,8 @@ class HaloController:
 
         # GC completed jobs older than retain window — bounded memory.
         self.registry.gc_completed(self.config.gc_retain_seconds)
+        # Q13: drop pre-registered programs that never received a request.
+        self.registry.gc_idle_programs(self.config.program_idle_timeout_seconds)
 
     # ------------------------------------------------------------------
     # Observability
@@ -200,6 +320,7 @@ class HaloController:
             "default_slo": self.config.default_slo,
             "tick_interval_ms": self.config.tick_interval_ms,
             "aggregator": self.config.aggregator,
+            "program_idle_timeout_seconds": self.config.program_idle_timeout_seconds,
             "cost_models_loaded": {
                 "prefill": self.tracker.prefill_cost is not None,
                 "tbt": self.tracker.tbt_cost is not None,
@@ -237,6 +358,9 @@ def build_halo_controller_from_server_args(
         ),
         tbt_cost_model_path=getattr(
             server_args, "halo_tbt_cost_model_path", None
+        ),
+        program_idle_timeout_seconds=float(
+            getattr(server_args, "halo_program_idle_timeout_seconds", 300.0)
         ),
     )
     return HaloController(config=config, is_rank0=is_rank0)

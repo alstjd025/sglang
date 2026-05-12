@@ -2539,10 +2539,20 @@ class Scheduler(
                 halo_slo=getattr(recv_req, "halo_slo", None),
             )
         except HaloRejectError as e:
-            message = (
-                "Halo rejected: missing halo_job_id (set --halo-enabled is on; "
-                "include halo_job_id in the request to enable per-job tracking)."
-            )
+            # HALO: per managers/halo/CLAUDE.md §13 Q7 + Q12. Reason-specific
+            # message so the client can tell apart "missing field" vs "missing
+            # pre-registration call".
+            if e.reason == "HALO_PROGRAM_NOT_REGISTERED":
+                message = (
+                    "Halo rejected: program not pre-registered. Call "
+                    "POST /halo/programs with this halo_job_id before issuing "
+                    "LLM requests."
+                )
+            else:
+                message = (
+                    "Halo rejected: missing halo_job_id. --halo-enabled is on; "
+                    "include halo_job_id in the request body."
+                )
             logger.info("[halo] REJECT rid=%s reason=%s", recv_req.rid, e.reason)
             self.send_to_tokenizer.send_output(
                 AbortReq(

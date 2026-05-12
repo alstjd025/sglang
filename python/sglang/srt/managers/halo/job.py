@@ -16,7 +16,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Deque, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 
 class JobState(Enum):
@@ -39,9 +39,18 @@ class Job:
     1.0 — meaning "no measurement yet, treat as worst-case (SLO bound) for
     Phase 2 admission decisions". This is overwritten on the first sweep.
 
-    Note on `dag`: placeholder for Option A (Phase 2/3) program-compile
-    interface. In Phase 1 we only support Option B (per-request `halo_job_id`
-    + `halo_slo`), so this stays None.
+    Option A pre-registration fields (`total_calls_expected`, `stage_sequence`,
+    expected input/output token lengths, `dag`) are populated only when the
+    job arrives via `POST /halo/programs`. They are stored in Phase 1 but not
+    used by the slowdown sweep math — they are reserved for Phase 2
+    admission/scheduling decisions that need lookahead information.
+
+    `from_program=True` distinguishes pre-registered jobs from jobs that
+    arrived via the request body (Option B). Phase 1 Q12 says: when Halo is
+    enabled, a request whose job_id has not been pre-registered is rejected
+    with HTTP 400. So in Phase 1 every active Job should have
+    `from_program=True`. The flag exists primarily for the registry to tell
+    pre-registration apart from accidental lazy-create paths during testing.
     """
 
     job_id: str
@@ -70,8 +79,19 @@ class Job:
         default_factory=lambda: deque(maxlen=64)
     )
 
-    # Phase 2/3 extension placeholder; stays None in Phase 1.
-    dag: Optional[Any] = None
+    # ---- Option A (pre-registration) metadata ----
+    # All optional: None for jobs created without pre-registration (forbidden
+    # in strict mode, but allowed in unit tests that build Job directly).
+    # Phase 1 just stores these; Phase 2 admission/scheduling will read them.
+    total_calls_expected: Optional[int] = None
+    stage_sequence: Optional[List[str]] = None
+    expected_input_lens: Optional[List[int]] = None
+    expected_output_lens: Optional[List[int]] = None
+    # Free-form JSON-able DAG description. Caps enforced at the registration
+    # boundary (HTTP body parser limits to 16KB), not here.
+    dag: Optional[Dict[str, Any]] = None
+    # Distinguishes pre-registered jobs from jobs built directly (tests, etc).
+    from_program: bool = False
 
     def __post_init__(self) -> None:
         # Honor the spec: initial slowdown == SLO (worst-case fallback).
@@ -127,4 +147,25 @@ class Job:
             "slo_violation_count": self.slo_violation_count,
             "first_seen_ts": self.first_seen_ts,
             "last_update_ts": self.last_update_ts,
+            # Option A pre-registration fields (None when not pre-registered).
+            "from_program": self.from_program,
+            "total_calls_expected": self.total_calls_expected,
+            "stage_sequence": self.stage_sequence,
+            "expected_input_lens": self.expected_input_lens,
+            "expected_output_lens": self.expected_output_lens,
+            "dag": self.dag,
         }
+
+    def is_idle(self) -> bool:
+        """True iff this job has zero in-flight requests and never had any.
+
+        Used by `JobRegistry.gc_idle_programs()` to identify pre-registered
+        programs that never received a single LLM request — candidates for
+        timeout-based GC. A Job that received at least one request and then
+        completed transitions to JobState.COMPLETE instead.
+        """
+        return (
+            self.state == JobState.QUEUED
+            and self.total_request_number == 0
+            and not self.request_ids
+        )
