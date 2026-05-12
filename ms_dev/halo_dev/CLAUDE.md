@@ -377,7 +377,9 @@ class Job:
     dag: Optional[Any] = None            # Option A 자리 (Phase 1엔 None)
 ```
 
-## 9. 확정된 코딩 작업 순서
+## 9. 확정된 코딩 작업 순서 + 진행 상황
+
+> ✅ = 완료, ⏳ = 사용자가 직접 진행할 단계.
 
 1. ✅ `project-halo-phase1` 브랜치 분기
 2. ✅ `python/sglang/srt/managers/halo/__init__.py` + 모듈 CLAUDE.md 골격
@@ -385,16 +387,28 @@ class Job:
 4. ✅ `halo/job_registry.py` — `JobRegistry` (rid↔job 매핑, scheduler 호출)
 5. ✅ `halo/slowdown_tracker.py` — `SlowdownTracker.sweep()` (cost model 재사용)
 6. ✅ `halo/controller.py` — `HaloController` 조립 + on/off
-7. ✅ `server_args.py` — `--halo-enabled`, `--halo-default-slo`, `--halo-tick-interval-ms`, `--halo-decision-log` 등
-8. ✅ `io_struct.py` / `protocol.py` / `serving_chat.py` / `serving_completions.py` / `schedule_batch.py::Req` — 메타데이터 패스스루
-9. ✅ `scheduler.py::__init__` — controller 초기화
-10. ✅ `scheduler.py::_add_request_to_queue` — JobRegistry 등록 (job_id 없으면 400 reject)
-11. ✅ `scheduler.py` finish path — remaining_request_number 감소 + state 갱신
-12. ✅ `scheduler_metrics_mixin.py` — 100ms tick → `halo_controller.tick()`
+7. ✅ `server_args.py` — `--halo-enabled`, `--halo-default-slo`, `--halo-tick-interval-ms`, `--halo-job-log`, cost model paths
+8. ✅ `io_struct.py` / `protocol.py` / `serving_chat.py` / `serving_completions.py` / `schedule_batch.py::Req` / `tokenizer_manager.py` — 메타데이터 패스스루
+9. ✅ `scheduler.py::__init__` → `init_halo()`
+10. ✅ `scheduler.py::_add_request_to_queue` — `_halo_register_or_abort` (400 reject)
+11. ✅ `scheduler_output_processor_mixin.py` finish path — `_halo_on_request_finished`
+12. ✅ `scheduler.py` event loops — 100ms wall-clock-gated `_halo_maybe_tick()`
 13. ✅ `/server_info` halo_state 노출
-14. ✅ `test/registered/halo/test_halo_phase1.py` 작성
+14. ✅ `test/registered/halo/test_halo_phase1.py` — 19 tests, all green (CPU stage-a)
 15. ✅ `ms_dev/` 통합 (env vars, lib_server.sh, experiments wrapper, expctl monitoring)
-16. ✅ 짧은 통합 실험 1회 + 결과 캡처
-17. ✅ 최종 문서 갱신
+16. ⏳ 짧은 통합 실험 1회 + 결과 캡처 (사용자 실행 필요 — `source ms_dev/experiments/halo_observe_only.sh && python3 ms_dev/expctl/run_experiment.py --mode single`)
+17. ⏳ Agent_applications 클라이언트 측에 `halo_job_id` / `halo_slo` 필드 추가 (Phase 1 strict mode → 빠지면 400)
+
+## 10. 커밋 히스토리 (project-halo-phase1)
+
+```
+c72f90286 add(halo): Phase 1 ms_dev tooling — env vars, launcher, experiments, expctl panel
+37200978d test(halo): Phase 1 unit tests — Job, Registry, Tracker, Controller, factory
+3334bf55e add(halo): Phase 1 scheduler integration + request-metadata passthrough
+acdfc411f add(halo): Phase 1 module skeleton — Job, JobRegistry, SlowdownTracker, HaloController
+e496ea707 docs(halo): Phase 1 plan + decisions in ms_dev/halo_dev/CLAUDE.md
+```
+
+총 5개 커밋. push 는 사용자가 직접 (`git push -u origin project-halo-phase1`).
 
 > 각 단계 끝나면 커밋. push 는 사용자가 직접.
