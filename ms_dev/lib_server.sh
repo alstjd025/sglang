@@ -161,6 +161,54 @@ append_admission_args() {
   fi
 }
 
+# append_halo_args <out-array-name> [mode]
+#
+# HALO: Translates SGLANG_HALO_* env vars (set in env.common.sh) into --halo-*
+# CLI args. Off-by-default (SGLANG_HALO_ENABLED=0); non-zero values turn it on.
+# Each optional knob (default SLO, tick interval, cost-model paths, job log)
+# only forwards when explicitly set, falling back to sglang CLI defaults.
+#
+# Arguments:
+#   $1 — array variable name (passed by reference).
+#   $2 — optional launcher mode: "single" (default), "pd-prefill", "pd-decode".
+#        Phase 1 only supports NULL disaggregation; in PD modes we emit a
+#        one-line warning and still pass the flag so the rejection path is
+#        visible (HaloController itself is a no-op outside NULL disagg).
+#
+# See managers/halo/CLAUDE.md and ms_dev/halo_dev/CLAUDE.md.
+append_halo_args() {
+  local -n _halo_out="$1"
+  local mode="${2:-single}"
+
+  if [[ "${SGLANG_HALO_ENABLED:-0}" != "1" ]]; then
+    return 0
+  fi
+
+  if [[ "${mode}" != "single" ]]; then
+    echo "[lib_server] HALO Phase 1 is single-instance only — flag will be passed but the controller is a no-op outside NULL disaggregation" >&2
+  fi
+
+  _halo_out+=(--halo-enabled)
+  if [[ -n "${SGLANG_HALO_DEFAULT_SLO:-}" ]]; then
+    _halo_out+=(--halo-default-slo "${SGLANG_HALO_DEFAULT_SLO}")
+  fi
+  if [[ -n "${SGLANG_HALO_TICK_INTERVAL_MS:-}" ]]; then
+    _halo_out+=(--halo-tick-interval-ms "${SGLANG_HALO_TICK_INTERVAL_MS}")
+  fi
+  if [[ -n "${SGLANG_HALO_AGGREGATOR:-}" ]]; then
+    _halo_out+=(--halo-aggregator "${SGLANG_HALO_AGGREGATOR}")
+  fi
+  if [[ -n "${SGLANG_HALO_JOB_LOG:-}" ]]; then
+    _halo_out+=(--halo-job-log "${SGLANG_HALO_JOB_LOG}")
+  fi
+  if [[ -n "${SGLANG_HALO_PREFILL_COST_MODEL:-}" ]]; then
+    _halo_out+=(--halo-prefill-cost-model-path "${SGLANG_HALO_PREFILL_COST_MODEL}")
+  fi
+  if [[ -n "${SGLANG_HALO_TBT_COST_MODEL:-}" ]]; then
+    _halo_out+=(--halo-tbt-cost-model-path "${SGLANG_HALO_TBT_COST_MODEL}")
+  fi
+}
+
 # launch_server <cmd...>
 #
 # Prints a quoted command line and execs it (replacing the shell).

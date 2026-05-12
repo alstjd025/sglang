@@ -70,6 +70,19 @@ export SGLANG_ADMISSION_TBT_REACTIVE_RATIO="${SGLANG_ADMISSION_TBT_REACTIVE_RATI
 export SGLANG_ADMISSION_DRY_RUN="${SGLANG_ADMISSION_DRY_RUN:-0}"
 export SGLANG_ADMISSION_DECISION_LOG="${SGLANG_ADMISSION_DECISION_LOG:-}"
 
+# HALO: Project Halo Phase 1 — job-level slowdown tracking.
+# Off by default. See managers/halo/CLAUDE.md and ms_dev/halo_dev/CLAUDE.md.
+# Translated to --halo-* CLI flags by lib_server.sh::append_halo_args.
+# To turn on for an experiment, set SGLANG_HALO_ENABLED=1 (one-off) or
+# source ms_dev/experiments/halo_observe_only.sh.
+export SGLANG_HALO_ENABLED="${SGLANG_HALO_ENABLED:-0}"
+export SGLANG_HALO_DEFAULT_SLO="${SGLANG_HALO_DEFAULT_SLO:-}"
+export SGLANG_HALO_TICK_INTERVAL_MS="${SGLANG_HALO_TICK_INTERVAL_MS:-}"
+export SGLANG_HALO_AGGREGATOR="${SGLANG_HALO_AGGREGATOR:-}"
+export SGLANG_HALO_JOB_LOG="${SGLANG_HALO_JOB_LOG:-}"
+export SGLANG_HALO_PREFILL_COST_MODEL="${SGLANG_HALO_PREFILL_COST_MODEL:-}"
+export SGLANG_HALO_TBT_COST_MODEL="${SGLANG_HALO_TBT_COST_MODEL:-}"
+
 # Some environments mount /tmp with noexec, which breaks Triton /
 # torchinductor when they try to mmap compiled .so files. Redirect their
 # caches under the runtime dir (which lives on the repo FS and allows exec).

@@ -67,6 +67,11 @@ fi
 admission_args=()
 append_admission_args admission_args "single"
 
+# HALO: Project Halo Phase 1 — job-level slowdown tracking.
+# Off by default. See managers/halo/CLAUDE.md and ms_dev/halo_dev/CLAUDE.md.
+halo_args=()
+append_halo_args halo_args "single"
+
 cd "${SGLANG_REPO_ROOT}"
 
 launch_server \
@@ -82,5 +87,6 @@ launch_server \
   "${obs_args[@]}" \
   "${hicache_args[@]}" \
   "${admission_args[@]}" \
+  "${halo_args[@]}" \
   "${extra_args[@]}" \
   "${OBS_REMAINING_ARGS[@]}"

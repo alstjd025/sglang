@@ -243,6 +243,11 @@ def detect_runtime_feature_flags(
         "server_admission_tbt_slo_ms": None,
         "server_admission_ttft_slo_ratio": None,
         "server_admission_tbt_slo_ratio": None,
+        # HALO: Project Halo Phase 1 — job-level slowdown tracking.
+        # Single-server only in Phase 1; PD modes show N/A.
+        "server_halo": None,
+        "server_halo_default_slo": None,
+        "server_halo_tick_interval_ms": None,
     }
 
     if enabled_roles.get("prefill", False):
@@ -290,6 +295,17 @@ def detect_runtime_feature_flags(
         states["server_admission_dry_run"] = detect_launch_flag(
             process_log_dir, "server", "--admission-dry-run"
         )
+        # HALO: Project Halo Phase 1 detection. --halo-enabled is a bare flag;
+        # --halo-default-slo / --halo-tick-interval-ms carry display values.
+        states["server_halo"] = detect_launch_flag(
+            process_log_dir, "server", "--halo-enabled"
+        )
+        states["server_halo_default_slo"] = detect_launch_arg(
+            process_log_dir, "server", "--halo-default-slo"
+        )  # type: ignore[assignment]
+        states["server_halo_tick_interval_ms"] = detect_launch_arg(
+            process_log_dir, "server", "--halo-tick-interval-ms"
+        )  # type: ignore[assignment]
 
     return states
 
@@ -379,6 +395,46 @@ def admission_state_text(
     suffix = (" " + " ".join(parts)) if parts else ""
     if feature_states.get("server_admission_dry_run"):
         return colorize(f"DRY_RUN{suffix}", "warn", use_color)
+    return colorize(f"ON{suffix}", "ok", use_color)
+
+
+def halo_state_text(
+    feature_states: Dict[str, Optional[bool]],
+    role: str,
+    role_enabled: bool,
+    use_color: bool,
+) -> str:
+    """HALO: Render the Project Halo Phase 1 feature cell.
+
+    Phase 1 is single-instance only (NULL disaggregation). PD prefill/decode
+    show N/A. Active iff `--halo-enabled` was on the launch command line.
+    """
+    if not role_enabled:
+        return colorize("N/A", "muted", use_color)
+    if role != "server":
+        return colorize("N/A", "muted", use_color)
+
+    enabled = feature_states.get("server_halo")
+    if enabled is None:
+        return colorize("UNKNOWN", "warn", use_color)
+    if not enabled:
+        return colorize("OFF", "muted", use_color)
+
+    default_slo = feature_states.get("server_halo_default_slo")
+    tick_ms = feature_states.get("server_halo_tick_interval_ms")
+    parts: List[str] = []
+    if default_slo is not None:
+        try:
+            parts.append(f"slo={float(default_slo):g}x")
+        except (TypeError, ValueError):
+            parts.append(f"slo={default_slo}")
+    if tick_ms is not None:
+        try:
+            parts.append(f"tick={float(tick_ms):g}ms")
+        except (TypeError, ValueError):
+            parts.append(f"tick={tick_ms}")
+
+    suffix = (" " + " ".join(parts)) if parts else ""
     return colorize(f"ON{suffix}", "ok", use_color)
 
 
@@ -627,6 +683,13 @@ def render_status(
         enabled_roles.get("prefill", False),
         use_color,
     )
+    # HALO: Phase 1 is single-instance only; PD shows N/A.
+    pd_halo_text = halo_state_text(
+        feature_states,
+        "prefill",
+        enabled_roles.get("prefill", False),
+        use_color,
+    )
 
     lines = []
     lines.append(colorize("=" * 118, "muted", use_color))
@@ -666,12 +729,14 @@ def render_status(
                 f"decode_hicache_l2={decode_hicache_l2_text}",
                 f"decode_pd_offload={decode_offload_text}",
                 f"admission={pd_admission_text}",
+                f"halo={pd_halo_text}",
             ]
         )
     )
     lines.append(
         "legend: hicache=L1/L2/L3 tiered cache, pd_offload=PD decode-specific KV offload path, "
-        "admission=Mooncake-style SLO admission (Phase A: single-mode only)"
+        "admission=Mooncake-style SLO admission (Phase A: single-mode only), "
+        "halo=Project Halo Phase 1 (single-mode only)"
     )
     lines.append(colorize("-" * 118, "muted", use_color))
 
@@ -902,6 +967,13 @@ def render_status_single(
         enabled_roles.get("server", False),
         use_color,
     )
+    # HALO: Phase 1 job-level slowdown tracking cell.
+    server_halo_text = halo_state_text(
+        feature_states,
+        "server",
+        enabled_roles.get("server", False),
+        use_color,
+    )
     # Admission counter sums (counter is registered on attn_tp_rank=0 only,
     # so series_sum returns the actual count not tp_size×).
     server_admit_n = series_sum(
@@ -934,12 +1006,14 @@ def render_status_single(
                 f"server_hicache_l2={server_hicache_text}",
                 f"server_hicache_l3={server_l3_text}",
                 f"admission={server_admission_text}",
+                f"halo={server_halo_text}",
             ]
         )
     )
     lines.append(
         "legend: hicache_l2=host memory tier, hicache_l3=storage tier, "
-        "admission=Mooncake-style predictive SLO admission control"
+        "admission=Mooncake-style predictive SLO admission control, "
+        "halo=Project Halo Phase 1 job-level slowdown tracking"
     )
     lines.append(colorize("-" * 118, "muted", use_color))
 

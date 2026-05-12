@@ -413,6 +413,34 @@ def main() -> int:
                 admission_decision_log_path
             )
 
+    # ------------------------------------------------------------------
+    # HALO: Project Halo Phase 1 — job-level slowdown tracking.
+    # See managers/halo/CLAUDE.md and ms_dev/halo_dev/CLAUDE.md.
+    # ------------------------------------------------------------------
+    halo_env_keys = (
+        "SGLANG_HALO_ENABLED",
+        "SGLANG_HALO_DEFAULT_SLO",
+        "SGLANG_HALO_TICK_INTERVAL_MS",
+        "SGLANG_HALO_AGGREGATOR",
+        "SGLANG_HALO_JOB_LOG",
+        "SGLANG_HALO_PREFILL_COST_MODEL",
+        "SGLANG_HALO_TBT_COST_MODEL",
+    )
+    halo_config_snapshot = {
+        k: os.environ[k] for k in halo_env_keys if os.environ.get(k)
+    }
+    halo_enabled = halo_config_snapshot.get("SGLANG_HALO_ENABLED") == "1"
+    # Auto-route the per-sweep job log into the session folder unless pinned.
+    halo_job_log_path: Optional[Path] = None
+    if halo_enabled:
+        if halo_config_snapshot.get("SGLANG_HALO_JOB_LOG"):
+            halo_job_log_path = Path(
+                halo_config_snapshot["SGLANG_HALO_JOB_LOG"]
+            )
+        else:
+            halo_job_log_path = session_dir / "halo_jobs.jsonl"
+            halo_config_snapshot["SGLANG_HALO_JOB_LOG"] = str(halo_job_log_path)
+
     sglang_exact = [
         "sglang:gen_throughput",
         "sglang:num_running_reqs",
@@ -575,6 +603,11 @@ def main() -> int:
             launch_env_overrides["server"]["SGLANG_ADMISSION_DECISION_LOG"] = str(
                 admission_decision_log_path
             )
+        # HALO: auto-route per-sweep job log into the session folder.
+        if halo_enabled and halo_job_log_path is not None:
+            launch_env_overrides["server"]["SGLANG_HALO_JOB_LOG"] = str(
+                halo_job_log_path
+            )
 
     if args.cleanup_extra_ports.strip():
         for item in args.cleanup_extra_ports.split(","):
@@ -667,6 +700,18 @@ def main() -> int:
             "decision_log_path": (
                 str(admission_decision_log_path)
                 if admission_decision_log_path is not None
+                else None
+            ),
+        },
+        # HALO: Project Halo Phase 1 — snapshot of SGLANG_HALO_* env vars.
+        # See managers/halo/CLAUDE.md.
+        "halo_config": {
+            "enabled": halo_enabled,
+            "applied_in_mode": halo_enabled and mode == "single",
+            "env": halo_config_snapshot,
+            "job_log_path": (
+                str(halo_job_log_path)
+                if halo_job_log_path is not None
                 else None
             ),
         },
