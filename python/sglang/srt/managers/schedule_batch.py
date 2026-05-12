@@ -611,6 +611,7 @@ class Req(ReqDllmMixin):
         # See managers/halo/CLAUDE.md.
         halo_job_id: Optional[str] = None,
         halo_slo: Optional[float] = None,
+        halo_bypass: bool = False,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -690,8 +691,11 @@ class Req(ReqDllmMixin):
         # HALO: Phase 1 job-level metadata stashed on the Req.
         # halo_first_admitted_ts is set by the scheduler at admission time
         # (see managers/halo/CLAUDE.md) and consumed by SlowdownTracker.
+        # halo_bypass=True means "skip the Halo admission gate" — used by
+        # server-internal traffic (warmup, self-loopback).
         self.halo_job_id = halo_job_id
         self.halo_slo = halo_slo
+        self.halo_bypass = halo_bypass
         self.halo_first_admitted_ts: Optional[float] = None
         # Prefix-cache match length captured at admission time (used by Halo
         # to compute solo-run baseline; matches admission_control's snapshot

@@ -2552,6 +2552,11 @@ class Scheduler(
         controller = getattr(self, "halo_controller", None)
         if controller is None:
             return False
+        # HALO: server-internal requests (warmup, self-loopback) bypass the
+        # admission gate entirely so strict mode (Q7/Q12) doesn't reject
+        # traffic the user never issued.
+        if getattr(recv_req, "halo_bypass", False):
+            return False
         try:
             controller.register_request(
                 rid=recv_req.rid,

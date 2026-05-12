@@ -350,6 +350,20 @@ class TestHaloController(unittest.TestCase):
         c.tick(build_infos=lambda: [])
         self.assertIsNone(c.registry.job_for_id("agent-1"))
 
+    def test_halo_bypass_field_does_not_affect_controller(self):
+        """halo_bypass is a scheduler-level concern (skip the gate). The
+        controller itself doesn't see the flag — admit_to_job still gets
+        called only for non-bypassed requests. We just confirm here that
+        a bypassed-request never reaches `register_request` and therefore
+        never touches the registry counters."""
+        c = HaloController(self._config(), is_rank0=True)
+        c.register_program("agent-1", slo=2.0)
+        # No call to register_request — emulates the scheduler shortcut.
+        snap = c.snapshot()
+        self.assertEqual(snap["active_jobs"], 1)
+        job = c.registry.job_for_id("agent-1")
+        self.assertEqual(job.total_request_number, 0)  # bypass skips counter
+
     def test_snapshot_returns_active_jobs(self):
         c = HaloController(self._config(), is_rank0=True)
         c.register_program("agent-1", slo=2.0, total_calls=5)

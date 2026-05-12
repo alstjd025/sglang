@@ -233,6 +233,12 @@ class GenerateReqInput(BaseReq):
     # (server rejects HTTP 400 if absent).
     halo_job_id: Optional[str] = None
     halo_slo: Optional[float] = None
+    # HALO: skip the Halo admission gate entirely for this request. Used
+    # by server-internal traffic (warmup, self-loopback) so strict mode
+    # doesn't trip on requests the user never issued. Real clients should
+    # leave this False — it's not a security boundary, just a way to mark
+    # server-emitted requests as "not real user traffic".
+    halo_bypass: bool = False
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -695,6 +701,7 @@ class GenerateReqInput(BaseReq):
             # HALO: passthrough fields to TokenizedGenerateReqInput.
             halo_job_id=self.halo_job_id,
             halo_slo=self.halo_slo,
+            halo_bypass=self.halo_bypass,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -785,6 +792,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # HALO: Project Halo Phase 1 — see managers/halo/CLAUDE.md.
     halo_job_id: Optional[str] = None
     halo_slo: Optional[float] = None
+    halo_bypass: bool = False
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False

@@ -1977,6 +1977,11 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
         },
+        # HALO: this is server-internal warmup traffic, not a real user
+        # request. Mark it so the Halo admission gate (when --halo-enabled
+        # is on) skips it instead of rejecting on missing halo_job_id.
+        # See managers/halo/CLAUDE.md.
+        "halo_bypass": True,
     }
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
@@ -2012,6 +2017,9 @@ def _execute_server_warmup(server_args: ServerArgs):
             "max_tokens": max_new_tokens,
             "stream": False,
             "temperature": 0.0,
+            # HALO: skip the admission gate — same rationale as the
+            # /generate warmup payload above.
+            "halo_bypass": True,
         }
     else:
         json_data["text"] = ["The capital city of France is"] * server_args.dp_size
@@ -2057,6 +2065,10 @@ def _execute_server_warmup(server_args: ServerArgs):
                     for i in range(server_args.dp_size)
                 ],
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
+                # HALO: server-internal PD warmup traffic — bypass the
+                # admission gate. Halo is single-instance only in Phase 1
+                # but the field passes through harmlessly even in PD mode.
+                "halo_bypass": True,
             }
             res = requests.post(
                 url + request_name,

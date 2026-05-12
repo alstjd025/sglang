@@ -418,6 +418,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # See managers/halo/CLAUDE.md.
             halo_job_id=request.halo_job_id,
             halo_slo=request.halo_slo,
+            halo_bypass=bool(request.halo_bypass),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             image_max_dynamic_patch=img_max_dynamic_patch,

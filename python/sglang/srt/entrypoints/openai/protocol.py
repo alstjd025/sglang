@@ -320,6 +320,7 @@ class CompletionRequest(BaseModel):
     # See managers/halo/CLAUDE.md.
     halo_job_id: Optional[str] = None
     halo_slo: Optional[float] = None
+    halo_bypass: Optional[bool] = False
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -672,6 +673,7 @@ class ChatCompletionRequest(BaseModel):
     # See managers/halo/CLAUDE.md.
     halo_job_id: Optional[str] = None
     halo_slo: Optional[float] = None
+    halo_bypass: Optional[bool] = False
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
