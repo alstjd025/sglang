@@ -10,10 +10,13 @@
 #
 #   # Terminal 1
 #   source ms_dev/experiments/halo_observe_only.sh
-#   python3 ms_dev/expctl/run_experiment.py --mode single --metrics on
+#   python3 ms_dev/expctl/run_experiment.py --mode single
 #
 #   # Terminal 2 — wait for "Server ready" in terminal 1, then:
 #   bash ms_dev/halo_dev/verify/e2e_smoke.sh
+#
+# Note: --metrics is a launcher OBS flag (start_server_no_pd.sh), not a
+# run_experiment.py flag. Metrics + request logs are on by default.
 #
 # As this script fires requests the panel in terminal 1 should show:
 #   - features: halo=ON slo=5x tick=100ms

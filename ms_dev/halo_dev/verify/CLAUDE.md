@@ -41,7 +41,9 @@ tick → sweep should stay well under 1 ms).
 ```bash
 # Terminal 1
 source ms_dev/experiments/halo_observe_only.sh
-python3 ms_dev/expctl/run_experiment.py --mode single --metrics on
+python3 ms_dev/expctl/run_experiment.py --mode single
+# (metrics + request-logs are default-on for the launcher; --metrics is a
+#  launcher OBS flag, not a run_experiment.py flag, so don't pass it here.)
 
 # Terminal 2 (after "Server ready" appears in terminal 1)
 bash ms_dev/halo_dev/verify/e2e_smoke.sh
