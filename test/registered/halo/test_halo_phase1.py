@@ -78,6 +78,27 @@ class TestJob(unittest.TestCase):
         self.assertEqual(job.slo_violation_count, 1)
         self.assertEqual(len(job.slowdown_history), 2)
 
+    def test_completion_does_not_mark_complete_mid_chain(self):
+        """Multi-round chains (e.g. parallel_tool_delay) finish each round
+        then sleep before the next. `remaining=0` between rounds must NOT
+        flip the job to COMPLETE — otherwise gc_completed would drop it
+        and the next round would hit HALO_PROGRAM_NOT_REGISTERED.
+        """
+        job = Job(job_id="agent-1", slo=5.0, total_calls_expected=4)
+        # Round 1: 2 calls admit → both finish → remaining briefly 0.
+        job.on_request_admitted("r1")
+        job.on_request_admitted("r2")
+        job.on_request_completed("r1")
+        job.on_request_completed("r2")
+        self.assertEqual(job.remaining_request_number, 0)
+        self.assertNotEqual(job.state, JobState.COMPLETE)  # ← key check
+        # Round 2: 2 more calls.
+        job.on_request_admitted("r3")
+        job.on_request_admitted("r4")
+        job.on_request_completed("r3")
+        job.on_request_completed("r4")
+        self.assertEqual(job.state, JobState.COMPLETE)  # now all 4 expected
+
     def test_is_idle(self):
         """A pre-registered job with zero requests is idle."""
         job = Job(job_id="agent-1", slo=5.0, from_program=True)

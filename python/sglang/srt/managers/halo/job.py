@@ -113,13 +113,25 @@ class Job:
             self.state = JobState.RUNNING
 
     def on_request_completed(self, rid: str) -> None:
-        """Called when a request finishes (success or abort)."""
+        """Called when a request finishes (success or abort).
+
+        Only mark the job COMPLETE when every expected call has actually
+        been admitted (or, for jobs registered without total_calls_expected,
+        when no in-flight request remains and there's no expected count to
+        wait for). Otherwise a chain with gaps between calls — e.g.
+        parallel_tool_delay's round → tool_delay → next round — would
+        flip to COMPLETE during the delay, get GC'd by gc_completed after
+        retain_seconds, and reject the next round's calls with
+        HALO_PROGRAM_NOT_REGISTERED. See ms_dev/halo_dev/CLAUDE.md.
+        """
         self.request_ids.discard(rid)
         if self.remaining_request_number > 0:
             self.remaining_request_number -= 1
         self.last_update_ts = _now_monotonic()
         if self.remaining_request_number == 0 and not self.request_ids:
-            self.state = JobState.COMPLETE
+            expected = self.total_calls_expected
+            if expected is None or self.total_request_number >= expected:
+                self.state = JobState.COMPLETE
 
     def record_sweep(self, max_ratio: float, mean_ratio: float) -> None:
         """Called from SlowdownTracker after each periodic sweep."""
