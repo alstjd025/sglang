@@ -774,6 +774,35 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 _HALO_BODY_MAX_BYTES = 16 * 1024  # Q14: cap DAG / metadata size at 16 KiB
 
 
+@app.get("/halo/status")
+async def halo_status():
+    """HALO: lightweight server-status probe for client integrators.
+
+    Lets a client (Agent_applications, etc.) check at startup whether the
+    server has Halo enabled before issuing any LLM traffic, so a
+    client-on / server-off mismatch can abort the run immediately rather
+    than failing the first LLM call with HALO_NO_JOB_ID.
+
+    Does not touch the scheduler — just reflects server_args. Always 200.
+    """
+    sa = _global_state.tokenizer_manager.server_args
+    return ORJSONResponse(
+        {
+            "enabled": bool(getattr(sa, "halo_enabled", False)),
+            "default_slo": getattr(sa, "halo_default_slo", None),
+            "tick_interval_ms": getattr(sa, "halo_tick_interval_ms", None),
+            "program_idle_timeout_seconds": getattr(
+                sa, "halo_program_idle_timeout_seconds", None
+            ),
+            "cost_models": {
+                "prefill_path": getattr(sa, "halo_prefill_cost_model_path", None),
+                "tbt_path": getattr(sa, "halo_tbt_cost_model_path", None),
+            },
+        },
+        status_code=200,
+    )
+
+
 @app.post("/halo/programs")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def halo_register_program(request: Request):

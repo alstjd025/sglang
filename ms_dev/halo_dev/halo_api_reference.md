@@ -46,6 +46,35 @@ under `ms_dev/experiments/`.
 
 ## Endpoints
 
+### `GET /halo/status` — server-side Halo configuration probe
+
+Lightweight, scheduler-free. Lets a client check whether the server has
+`--halo-enabled` on, plus the relevant defaults, before issuing LLM
+traffic. A client that wants Halo on should call this at startup and
+abort if `enabled` is false (avoids `HALO_NO_JOB_ID` rejecting every
+request later).
+
+**No request body.** Always returns 200:
+
+```json
+{
+  "enabled": true,
+  "default_slo": 5.0,
+  "tick_interval_ms": 100.0,
+  "program_idle_timeout_seconds": 300.0,
+  "cost_models": {
+    "prefill_path": "/path/to/prefill.json",
+    "tbt_path": "/path/to/tbt.json"
+  }
+}
+```
+
+**Curl:**
+
+```bash
+curl http://127.0.0.1:31000/halo/status
+```
+
 ### `POST /halo/programs` — pre-register a job (Option A)
 
 Required before the job's first LLM call when Halo is enabled. Carries
