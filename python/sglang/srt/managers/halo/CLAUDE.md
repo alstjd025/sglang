@@ -1,19 +1,58 @@
-# Halo Module — Job-level Slowdown Tracking (Phase 1)
+# Halo Module — Job-level subsystem for SGLang
 
-HALO Phase 1: a job-level observability layer for SGLang. Tracks each job's actual
-slowdown ratio (`actual_elapsed / solo_run_elapsed`) versus its SLO. Phase 1
-**does not** make admission or scheduling decisions — it only observes.
+Project Halo introduces three new responsibilities into SGLang, all scoped to
+*jobs* (client-supplied groupings of multiple LLM requests that share a single
+end-to-end SLO):
 
 > Full project rationale + Phase plan: `ms_dev/halo_dev/CLAUDE.md`.
-> Phase 2/3 (job-level admission/scheduling) will reuse this module's Job/Registry/
-> Tracker primitives without re-defining them.
+
+## Halo's three roles
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Project Halo                                                        │
+│                                                                      │
+│  Role 1. Job-level slowdown tracking                  [Phase 1: ON]  │
+│          - SlowdownTracker.sweep() every ~100ms                      │
+│          - per-job slowdown_max / slowdown_mean                      │
+│                                                                      │
+│  Role 2. Job-level admission gate                     [Phase 1: ON]  │
+│          - JobRegistry.admit_to_job() — strict validation:           │
+│            request must carry halo_job_id AND be pre-registered      │
+│          - Phase 2 will add predictive lookahead admission           │
+│            that reads Role 1's job state                             │
+│                                                                      │
+│  Role 3. Job-level scheduling policy                  [Phase 2]      │
+│          - fairness over slowdown ratios                             │
+│          - reuses Role 1's Job + Registry, no new state              │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+The Halo job-level admission gate (Role 2) is **distinct from** SGLang's
+existing `admission_control/` module, which is a *per-request, predictive*
+gate (Mooncake-style TTFT/TBT SLO check). The two gates compose in series
+inside `scheduler._add_request_to_queue`:
+
+```
+client → tokenizer → scheduler._add_request_to_queue:
+                       ├── _abort_on_queued_limit          (capacity gate)
+                       ├── _abort_on_predicted_slo_violation
+                       │     ↳ admission_control: per-request predictive
+                       ├── _halo_register_or_abort
+                       │     ↳ Halo Role 2: job-level admission gate
+                       └── waiting_queue.append(req)
+```
+
+This file documents the Halo module that owns all three roles. Where roles
+overlap with existing SGLang subsystems (`admission_control/`,
+scheduling policy), the boundary is called out explicitly below.
 
 ## Why job-level?
 
-Existing `admission_control/` operates at request granularity (each request's
-predicted TTFT/TBT vs SLO). Halo operates at *job* granularity — a job is the
-client-supplied grouping of multiple requests that share an SLO target
-(e.g., a single agent loop, a LangGraph DAG, a multi-turn conversation).
+SGLang's existing `admission_control/` operates at request granularity (each
+request's predicted TTFT/TBT vs SLO). Halo operates at *job* granularity — a
+job is the client-supplied grouping of multiple requests that share an SLO
+target (e.g., a single agent loop, a LangGraph DAG, a multi-turn conversation).
 
 The SLO is defined as **end-to-end slowdown** of the job versus its solo-run
 baseline (e.g., SLO=5 means "the job's total wall time may be at most 5× what
@@ -45,15 +84,16 @@ managers/halo/
 
 ## Class summary
 
-| Class | Responsibility |
-|---|---|
-| `JobState` | Enum: `QUEUED / RUNNING / COMPLETE / REJECTED` (REJECTED reserved for Phase 2) |
-| `Job` | task_struct-like dataclass: id, slo, slowdown_max/mean, counters, rids set, history |
-| `JobRegistry` | `register/record_admission/record_completion/active_jobs/snapshot` |
-| `RequestExecutionInfo` | Plain dataclass the scheduler builds per active req before sweep |
-| `SlowdownTracker` | Pure compute. `compute_request_slowdown()` + `sweep()` |
-| `HaloConfig` | Snapshot of CLI flags / env-derived parameters |
-| `HaloController` | Glue. Owned by scheduler. `register_request / on_request_finished / tick / snapshot` |
+| Class | Responsibility | Role |
+|---|---|---|
+| `JobState` | Enum: `QUEUED / RUNNING / COMPLETE / REJECTED` | shared |
+| `Job` | task_struct-like dataclass: id, slo, slowdown_max/mean, counters, rids set, history, Option A pre-registration fields | Role 1 state |
+| `JobRegistry` | `register_program / admit_to_job / record_completion / active_jobs / gc_*` | Role 1 + Role 2 |
+| `JobAdmissionResult` | Return type of `admit_to_job` — Halo job-level admission decision (distinct from `admission_control.AdmissionDecision`) | Role 2 |
+| `RequestExecutionInfo` | Plain dataclass the scheduler builds per active req before sweep | Role 1 |
+| `SlowdownTracker` | Pure compute. `compute_request_slowdown()` + `sweep()` | Role 1 |
+| `HaloConfig` | Snapshot of CLI flags / env-derived parameters | shared |
+| `HaloController` | Glue. Owned by scheduler. `register_program / register_request / on_request_finished / tick / snapshot` | Roles 1 + 2 |
 
 ## Key invariants
 

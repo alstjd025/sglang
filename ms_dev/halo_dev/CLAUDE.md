@@ -819,3 +819,56 @@ Option A 작업 전체: 3 커밋, ~720 LoC (코드) + ~430 LoC (문서/테스트
 SLO conflict / 16KB cap / 단위 테스트 추가 코드.
 
 다음 (필요 시): Agent_applications 측 client wiring (Q15) → 통합 실험.
+
+## 16. Mental model 보정 — Halo 는 SGLang 안의 *서브시스템*
+
+§1, §11 에서 Phase 1 의 Halo 를 "관찰만 하는 레이어" 로 정의했었음. 하지만 사용자
+컨펌 + 실제 구현을 마치고 보니 **더 정확한 표현은**: Halo 는 SGLang 안에 도입된
+*서브시스템* 이고, 그 안에 **세 가지 새 책임**이 있음.
+
+| Role | Phase 1 상태 | Phase 2 예정 |
+|---|---|---|
+| **R1. Job-level slowdown tracking** | ✅ 활성 (SlowdownTracker.sweep) | 더 정교한 cost-model / per-stage tracking |
+| **R2. Job-level admission gate** | ✅ 활성 (strict validation: job_id 누락 / 미등록 → 400) | predictive lookahead — R1 의 job 상태를 읽어 admit/reject 결정 |
+| **R3. Job-level scheduling policy** | ❌ Phase 2 | fair-slowdown scheduling |
+
+### `admission_control/` 과의 책임 분리
+
+| | 동작 단위 | 결정 시점 | 결정 근거 |
+|---|---|---|---|
+| `managers/admission_control/` | per-request | request 도착 | 예측된 TTFT/TBT vs SLO (Mooncake §4.1) |
+| Halo R2 (이 모듈) | per-job | request 도착 (Phase 1) / + 주기 sweep (Phase 2) | job 의 누적 slowdown vs SLO 비율 |
+
+둘은 `scheduler._add_request_to_queue` 안에서 **직렬로** 작동:
+
+```
+_abort_on_queued_limit          # 용량 게이트
+  ↓
+_abort_on_predicted_slo_violation # admission_control: per-request 예측
+  ↓
+_halo_register_or_abort         # Halo R2: per-job 검증
+  ↓
+waiting_queue.append(req)
+```
+
+### Rename (2026-05-12)
+
+§7 직후 mental model 보정을 반영해 다음 rename 적용:
+
+- `JobRegistry.record_admission` → **`admit_to_job`** (이름 자체가 admission 결정임을 분명히 함)
+- `AdmissionResult` → **`JobAdmissionResult`** (admission_control 의 `AdmissionDecision` 과 구분)
+- `result.admit` → **`result.admitted`** (과거형 → "결정 났다" 가독성)
+
+CLAUDE.md (이 파일 + `managers/halo/CLAUDE.md`) 에 3-role 도식 + 경계 표를 명시.
+
+### 향후 (Phase 2) 자연스러운 통합
+
+Phase 2 에서 admission decision 알고리즘이 들어올 때:
+- Halo R2 의 `admit_to_job` 가 "registered/not-registered" 만 보던 단순한 게이트에서,
+  R1 의 job 상태 (`slowdown_max`, `slowdown_mean`, `total_calls_expected` 등) 를 읽어
+  *예측 기반* admission 도 함께 결정하도록 확장.
+- `admission_control/` 은 그대로 두되 (Mooncake 스타일 per-request 게이트), Halo R2 가
+  그 *위에 추가* 되는 형태로 작동.
+
+이 디자인이라면 Phase 2 에서 Halo 모듈 외부 코드 변경 거의 없음 (`scheduler.py` 의 hook
+한 줄, server_args 의 새 플래그 정도).

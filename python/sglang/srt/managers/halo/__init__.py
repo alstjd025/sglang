@@ -12,19 +12,19 @@ from sglang.srt.managers.halo.controller import (
     build_halo_controller_from_server_args,
 )
 from sglang.srt.managers.halo.job import Job, JobState
-from sglang.srt.managers.halo.job_registry import AdmissionResult, JobRegistry
+from sglang.srt.managers.halo.job_registry import JobAdmissionResult, JobRegistry
 from sglang.srt.managers.halo.slowdown_tracker import (
     RequestExecutionInfo,
     SlowdownTracker,
 )
 
 __all__ = [
-    "AdmissionResult",
     "HaloConfig",
     "HaloController",
     "HaloRegisterProgramResult",
     "HaloRejectError",
     "Job",
+    "JobAdmissionResult",
     "JobRegistry",
     "JobState",
     "REASON_DISABLED",

@@ -30,7 +30,7 @@ from sglang.srt.managers.admission_control.cost_model import (
 from sglang.srt.managers.halo.job import Job, JobState
 from sglang.srt.managers.halo.job_registry import (
     REASON_PROGRAM_NOT_REGISTERED,
-    AdmissionResult,
+    JobAdmissionResult,
     JobRegistry,
 )
 from sglang.srt.managers.halo.slowdown_tracker import (
@@ -197,10 +197,10 @@ class HaloController:
         if halo_job_id is None or halo_job_id == "":
             raise HaloRejectError(reason=REASON_NO_JOB_ID, rid=rid)
         slo = halo_slo if halo_slo is not None else self.config.default_slo
-        result: AdmissionResult = self.registry.record_admission(
+        result: JobAdmissionResult = self.registry.admit_to_job(
             halo_job_id, slo, rid
         )
-        if not result.admit:
+        if not result.admitted:
             # Q12 path: program was not pre-registered.
             raise HaloRejectError(
                 reason=result.reason or REASON_PROGRAM_NOT_REGISTERED,

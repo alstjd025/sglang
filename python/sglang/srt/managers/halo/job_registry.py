@@ -6,14 +6,21 @@ See managers/halo/CLAUDE.md.
 # HALO: Phase 1 job ownership table. The scheduler is the sole owner; methods
 # are not thread-safe by design (single-threaded scheduler loop).
 #
+# Note on terminology: this module performs *Halo's job-level admission
+# gate* — that is one of the three roles Halo plays inside SGLang (see
+# managers/halo/CLAUDE.md "Halo's three roles"). The per-request
+# *predictive* admission gate lives in managers/admission_control/ and
+# runs separately. The two gates compose in series in
+# scheduler._add_request_to_queue.
+#
 # Lifecycle:
 #   - register_program(...): Option A — pre-register a Job before any LLM
 #     request arrives. Carries chain length / DAG / expected token lens for
 #     Phase 2 admission lookahead. Returns (newly_registered, job).
-#   - record_admission(job_id, slo, rid): Option B transport — admit one
-#     request into the pre-registered job. Per Q12, jobs that were NOT
-#     pre-registered are rejected with `AdmissionResult(admit=False, ...)`
-#     so the scheduler can convert to HTTP 400.
+#   - admit_to_job(job_id, slo, rid): Option B transport — Halo's job-level
+#     admission decision: admit one request into the pre-registered job, or
+#     reject when no such job exists. Per Q12 the lazy-create branch is gone;
+#     callers convert `admitted=False` into HTTP 400.
 #   - record_completion(rid): finds job for rid, decrements counters, removes
 #     mapping.
 #   - active_jobs(): returns all non-COMPLETE jobs.
@@ -38,22 +45,26 @@ from sglang.srt.managers.halo.job import Job, JobState, _now_monotonic
 logger = logging.getLogger(__name__)
 
 
-# Reject reasons returned by `record_admission` to the scheduler.
+# Reject reasons returned by `admit_to_job` to the scheduler.
 # The scheduler converts these into HTTP status codes (see managers/halo/
 # CLAUDE.md §13 Q12).
 REASON_PROGRAM_NOT_REGISTERED = "HALO_PROGRAM_NOT_REGISTERED"
 
 
 @dataclass
-class AdmissionResult:
-    """Result of `JobRegistry.record_admission()`.
+class JobAdmissionResult:
+    """Result of `JobRegistry.admit_to_job()` — Halo's job-level admission gate.
 
-    `admit=True`  → job is the registered Job (counters bumped, rid mapped).
-    `admit=False` → reason is set to one of REASON_* constants; the scheduler
-                    converts this to an HTTP 4xx reject. `job` is None.
+    Distinct from `admission_control.AdmissionDecision` (per-request
+    predictive admission). See managers/halo/CLAUDE.md "Halo's three roles"
+    for how the two gates compose.
+
+    `admitted=True`  → job is the registered Job (counters bumped, rid mapped).
+    `admitted=False` → reason is set to one of REASON_* constants; the scheduler
+                       converts this to an HTTP 4xx reject. `job` is None.
     """
 
-    admit: bool
+    admitted: bool
     job: Optional[Job] = None
     reason: Optional[str] = None
 
@@ -106,15 +117,16 @@ class JobRegistry:
         return True, job
 
     # ------------------------------------------------------------------
-    # Option B — per-request admission
+    # Halo's job-level admission gate — Option B per-request transport
     # ------------------------------------------------------------------
 
-    def record_admission(self, job_id: str, slo: float, rid: str) -> AdmissionResult:
-        """Admit a request into a pre-registered job.
+    def admit_to_job(self, job_id: str, slo: float, rid: str) -> JobAdmissionResult:
+        """Halo's job-level admission decision. Admit a request into a
+        pre-registered job, or reject if no such job exists.
 
         Strict mode per Q12: jobs that were NOT pre-registered are rejected
         (the lazy-create branch from Phase-1-only Option B is gone). The
-        scheduler converts `admit=False` into HTTP 400.
+        scheduler converts `admitted=False` into HTTP 400.
 
         If a previous request for the same `rid` was already mapped (should
         only happen with malformed clients), we keep the original mapping
@@ -127,14 +139,16 @@ class JobRegistry:
                 "ignoring new claim job_id=%s",
                 rid, existing_for_rid, job_id,
             )
-            return AdmissionResult(admit=True, job=self._jobs[existing_for_rid])
+            return JobAdmissionResult(
+                admitted=True, job=self._jobs[existing_for_rid]
+            )
 
         job = self._jobs.get(job_id)
         if job is None:
             # Q12: no lazy-create. The client must call POST /halo/programs
             # first. Return a rejection; scheduler will respond HTTP 400.
-            return AdmissionResult(
-                admit=False, reason=REASON_PROGRAM_NOT_REGISTERED
+            return JobAdmissionResult(
+                admitted=False, reason=REASON_PROGRAM_NOT_REGISTERED
             )
 
         # SLO conflict policy (Q10): pre-registered SLO wins. The request's
@@ -152,7 +166,7 @@ class JobRegistry:
 
         self._rid_to_job[rid] = job_id
         job.on_request_admitted(rid)
-        return AdmissionResult(admit=True, job=job)
+        return JobAdmissionResult(admitted=True, job=job)
 
     def record_completion(self, rid: str) -> Optional[Job]:
         """Called from the scheduler's finish path. Returns the affected job."""
