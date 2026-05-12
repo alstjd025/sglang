@@ -36,19 +36,35 @@ tick → sweep should stay well under 1 ms).
 
 ### E2E smoke (live server)
 
-```bash
-# Terminal 1: start sglang with halo enabled
-source ms_dev/experiments/halo_observe_only.sh
-bash ms_dev/start_server_no_pd.sh
+**Recommended — orchestrated runner with live monitor panel:**
 
-# Terminal 2 (after readiness):
+```bash
+# Terminal 1
+source ms_dev/experiments/halo_observe_only.sh
+python3 ms_dev/expctl/run_experiment.py --mode single --metrics on
+
+# Terminal 2 (after "Server ready" appears in terminal 1)
 bash ms_dev/halo_dev/verify/e2e_smoke.sh
 ```
 
-Sends a `POST /halo/programs`, fires N `chat.completions` carrying
-`halo_job_id`/`halo_slo`, then queries `/server_info` and prints the
-`halo_state` block so you can eyeball `slowdown_max` / `slowdown_mean`
-and counters.
+While the smoke fires requests, the terminal 1 panel shows Halo state
+live: a `halo=ON ...` feature cell and two rows of runtime counters
+(`halo_active known registered admitted rejected` and
+`mean_smax mean_smean worst_smax slo_violations`).
+
+**Standalone (no monitor panel, plain server):**
+
+```bash
+source ms_dev/experiments/halo_observe_only.sh
+bash ms_dev/start_server_no_pd.sh
+# in another terminal:
+bash ms_dev/halo_dev/verify/e2e_smoke.sh
+```
+
+The smoke script itself sends a `POST /halo/programs`, fires N
+`chat.completions` carrying `halo_job_id`/`halo_slo`, then queries
+`/server_info` and prints the `halo_state` block so you can eyeball
+`slowdown_max` / `slowdown_mean` and counters.
 
 ## Acceptance hints
 

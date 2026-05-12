@@ -986,6 +986,25 @@ def render_status_single(
         server, "sglang:admission_decisions_total", "decision", "dryrun_would_reject"
     )
 
+    # HALO: live runtime state (gauges updated every sweep ≈100 ms,
+    # counters bumped on register/admit/reject events). All scoped to
+    # attn_tp_rank=0; series_sum returns the actual count.
+    server_halo_active = metric_value(server, "sglang:halo_active_jobs")
+    server_halo_total_known = metric_value(server, "sglang:halo_total_known_jobs")
+    server_halo_mean_smax = metric_value(server, "sglang:halo_mean_slowdown_max")
+    server_halo_mean_smean = metric_value(server, "sglang:halo_mean_slowdown_mean")
+    server_halo_max_smax = metric_value(server, "sglang:halo_max_slowdown_max")
+    server_halo_violations = metric_value(server, "sglang:halo_slo_violations_total")
+    server_halo_registered = metric_value(
+        server, "sglang:halo_programs_registered_total"
+    )
+    server_halo_admitted = metric_value(
+        server, "sglang:halo_requests_admitted_total"
+    )
+    server_halo_rejected = metric_value(
+        server, "sglang:halo_requests_rejected_total"
+    )
+
     lines = []
     lines.append(colorize("=" * 118, "muted", use_color))
     lines.append(
@@ -1121,6 +1140,82 @@ def render_status_single(
                     label_width=14,
                 )
             )
+
+    # HALO: live job-level state (only when --halo-enabled was on the
+    # launch command). Two rows so the panel stays scannable:
+    #   row 1 — fleet shape: active jobs, total known, lifetime registered/
+    #           admitted/rejected counters.
+    #   row 2 — fleet slowdown: mean(slowdown_max), mean(slowdown_mean),
+    #           worst single job's slowdown_max, lifetime SLO violations.
+    if feature_states.get("server_halo") is True:
+        active_int = (
+            int(server_halo_active) if server_halo_active is not None else None
+        )
+        total_known_int = (
+            int(server_halo_total_known) if server_halo_total_known is not None else None
+        )
+        reg_int = (
+            int(server_halo_registered) if server_halo_registered is not None else None
+        )
+        admitted_int = (
+            int(server_halo_admitted) if server_halo_admitted is not None else None
+        )
+        rejected_int = (
+            int(server_halo_rejected) if server_halo_rejected is not None else None
+        )
+        violations_int = (
+            int(server_halo_violations) if server_halo_violations is not None else None
+        )
+
+        def _fmt_x(v):
+            return "-" if v is None else f"{v:.2f}x"
+
+        lines.append(
+            "        "
+            + metric_row(
+                [
+                    ("halo_active", color_high_bad(
+                        active_int, fmt_int(active_int),
+                        warn=64, bad=256, enabled=use_color,
+                    )),
+                    ("known", fmt_int(total_known_int)),
+                    ("registered", fmt_int(reg_int)),
+                    ("admitted", fmt_int(admitted_int)),
+                    ("rejected", color_high_bad(
+                        rejected_int, fmt_int(rejected_int),
+                        warn=1, bad=100, enabled=use_color,
+                    )),
+                ],
+                label_width=11,
+            )
+        )
+        lines.append(
+            "        "
+            + metric_row(
+                [
+                    ("mean_smax", color_high_bad(
+                        server_halo_mean_smax,
+                        _fmt_x(server_halo_mean_smax),
+                        warn=2.0, bad=3.0, enabled=use_color,
+                    )),
+                    ("mean_smean", color_high_bad(
+                        server_halo_mean_smean,
+                        _fmt_x(server_halo_mean_smean),
+                        warn=2.0, bad=3.0, enabled=use_color,
+                    )),
+                    ("worst_smax", color_high_bad(
+                        server_halo_max_smax,
+                        _fmt_x(server_halo_max_smax),
+                        warn=3.0, bad=5.0, enabled=use_color,
+                    )),
+                    ("slo_violations", color_high_bad(
+                        violations_int, fmt_int(violations_int),
+                        warn=1, bad=50, enabled=use_color,
+                    )),
+                ],
+                label_width=15,
+            )
+        )
 
     lines.extend(gpu_lines)
     lines.append(system_summary)

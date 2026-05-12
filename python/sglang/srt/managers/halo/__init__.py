@@ -13,6 +13,7 @@ from sglang.srt.managers.halo.controller import (
 )
 from sglang.srt.managers.halo.job import Job, JobState
 from sglang.srt.managers.halo.job_registry import JobAdmissionResult, JobRegistry
+from sglang.srt.managers.halo.metrics import HaloMetrics
 from sglang.srt.managers.halo.slowdown_tracker import (
     RequestExecutionInfo,
     SlowdownTracker,
@@ -21,6 +22,7 @@ from sglang.srt.managers.halo.slowdown_tracker import (
 __all__ = [
     "HaloConfig",
     "HaloController",
+    "HaloMetrics",
     "HaloRegisterProgramResult",
     "HaloRejectError",
     "Job",

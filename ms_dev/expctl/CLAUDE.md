@@ -102,6 +102,43 @@ The 5 admission Prometheus metrics are already in the `sglang_exact` allowlist i
 `run_experiment.py`. They flow through the same scrape/persist/snapshot path —
 output ends up in `<session>/metrics/server_metrics.jsonl`.
 
+### Adding Halo metrics to the panel
+
+HALO Phase 1 follows the admission_control pattern exactly. The Prometheus
+metrics are emitted by `managers/halo/metrics.py::HaloMetrics`, registered
+on `attn_tp_rank=0` only (TP-dedup). The metrics list:
+
+```
+# counters
+sglang:halo_programs_registered_total
+sglang:halo_programs_rejected_total{reason}
+sglang:halo_requests_admitted_total
+sglang:halo_requests_rejected_total{reason}
+sglang:halo_slo_violations_total
+# gauges, refreshed every sweep (~100 ms)
+sglang:halo_active_jobs
+sglang:halo_total_known_jobs
+sglang:halo_mean_slowdown_max
+sglang:halo_mean_slowdown_mean
+sglang:halo_max_slowdown_max
+```
+
+All ten names live in the `sglang_exact` allowlist in
+`run_experiment.py`, so they auto-persist into
+`<session>/metrics/server_metrics.jsonl`.
+
+`monitoring_view.render_status_single` renders two rows when
+`feature_states["server_halo"] is True`:
+
+- Row 1 — fleet shape:
+  `halo_active | known | registered | admitted | rejected`
+- Row 2 — fleet slowdown:
+  `mean_smax | mean_smean | worst_smax | slo_violations`
+
+Both rows are gated on `feature_states["server_halo"]`, which
+`detect_runtime_feature_flags()` derives from the `--halo-enabled` flag
+on the launch command (process_logs/server.* head).
+
 ### Per-session admission decision log + run_meta
 
 `run_experiment.py` detects any `SGLANG_ADMISSION_*_SLO_*` env var at session

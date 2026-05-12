@@ -33,6 +33,7 @@ from sglang.srt.managers.halo.job_registry import (
     JobAdmissionResult,
     JobRegistry,
 )
+from sglang.srt.managers.halo.metrics import HaloMetrics
 from sglang.srt.managers.halo.slowdown_tracker import (
     RequestExecutionInfo,
     SlowdownTracker,
@@ -164,6 +165,14 @@ class HaloController:
             except OSError as e:
                 logger.warning("halo: job log disabled — %s", e)
 
+        # Prometheus metrics — installed by the scheduler after construction
+        # (init_halo). None when --enable-metrics is off OR rank > 0. All
+        # mutators on this controller null-check before touching it.
+        self.metrics: Optional[HaloMetrics] = None
+        # Total slo_violation_count seen at the last sweep — diff with the
+        # current sum gives the per-sweep delta the counter should bump by.
+        self._last_total_violations: int = 0
+
         self._last_tick_monotonic: float = 0.0
         self._tick_interval_s: float = max(config.tick_interval_ms, 0.0) / 1000.0
 
@@ -195,17 +204,21 @@ class HaloController:
         pre-registered slo wins anyway, see Q10).
         """
         if halo_job_id is None or halo_job_id == "":
+            if self.metrics is not None:
+                self.metrics.record_request_rejected(REASON_NO_JOB_ID)
             raise HaloRejectError(reason=REASON_NO_JOB_ID, rid=rid)
         slo = halo_slo if halo_slo is not None else self.config.default_slo
         result: JobAdmissionResult = self.registry.admit_to_job(
             halo_job_id, slo, rid
         )
         if not result.admitted:
+            reason = result.reason or REASON_PROGRAM_NOT_REGISTERED
             # Q12 path: program was not pre-registered.
-            raise HaloRejectError(
-                reason=result.reason or REASON_PROGRAM_NOT_REGISTERED,
-                rid=rid,
-            )
+            if self.metrics is not None:
+                self.metrics.record_request_rejected(reason)
+            raise HaloRejectError(reason=reason, rid=rid)
+        if self.metrics is not None:
+            self.metrics.record_request_admitted()
         return result.job
 
     def register_program(
@@ -229,6 +242,8 @@ class HaloController:
           reason=REASON_JOB_ID_ALREADY_REGISTERED; carries existing job dict.
         """
         if not self.config.enabled:
+            if self.metrics is not None:
+                self.metrics.record_program_rejected(REASON_DISABLED)
             return HaloRegisterProgramResult(
                 registered=False, job_id=job_id, reason=REASON_DISABLED
             )
@@ -243,6 +258,10 @@ class HaloController:
             dag=dag,
         )
         if not fresh:
+            if self.metrics is not None:
+                self.metrics.record_program_rejected(
+                    REASON_JOB_ID_ALREADY_REGISTERED
+                )
             return HaloRegisterProgramResult(
                 registered=False,
                 job_id=job_id,
@@ -258,6 +277,8 @@ class HaloController:
                     "job": job.to_dict(),
                 }
             )
+        if self.metrics is not None:
+            self.metrics.record_program_registered()
         logger.info(
             "halo: registered program job_id=%s slo=%.2f total_calls=%s",
             job_id, slo, total_calls,
@@ -308,6 +329,20 @@ class HaloController:
         self.registry.gc_completed(self.config.gc_retain_seconds)
         # Q13: drop pre-registered programs that never received a request.
         self.registry.gc_idle_programs(self.config.program_idle_timeout_seconds)
+
+        # Refresh Prometheus gauges from the post-GC active set. We diff the
+        # cumulative slo_violation_count across the registry to drive the
+        # counter increment so it never double-counts a sweep.
+        if self.metrics is not None:
+            actives = self.registry.active_jobs()
+            total_violations = sum(j.slo_violation_count for j in self.registry.all_jobs())
+            delta = max(0, total_violations - self._last_total_violations)
+            self._last_total_violations = total_violations
+            self.metrics.update_from_sweep(
+                active_jobs=actives,
+                total_known=len(self.registry.all_jobs()),
+                slo_violations_delta=delta,
+            )
 
     # ------------------------------------------------------------------
     # Observability

@@ -480,6 +480,18 @@ def main() -> int:
         "sglang:admission_predicted_tbt_ms",
         "sglang:admission_tbt_ewma_ms",
         "sglang:admission_queue_predicted_ms",
+        # HALO Phase 1 — job-level slowdown tracking.
+        # See managers/halo/CLAUDE.md.
+        "sglang:halo_programs_registered_total",
+        "sglang:halo_programs_rejected_total",
+        "sglang:halo_requests_admitted_total",
+        "sglang:halo_requests_rejected_total",
+        "sglang:halo_slo_violations_total",
+        "sglang:halo_active_jobs",
+        "sglang:halo_total_known_jobs",
+        "sglang:halo_mean_slowdown_max",
+        "sglang:halo_mean_slowdown_mean",
+        "sglang:halo_max_slowdown_max",
     ]
 
     if mode == "pd":

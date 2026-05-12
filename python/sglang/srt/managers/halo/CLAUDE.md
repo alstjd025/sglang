@@ -209,6 +209,32 @@ JSONL job log writes and any Prometheus counters initialized only when
 `getattr(self, "attn_tp_rank", 0) == 0`. Other ranks construct
 `HaloController` but with the log/metrics path nulled so they no-op.
 
+## Prometheus metrics
+
+`managers/halo/metrics.py::HaloMetrics`. Installed by `scheduler.init_halo`
+under the same TP-dedup + `--enable-metrics` gating as
+`admission_control/metrics.py` so a TP=N deployment doesn't multiply
+counters. All metrics live behind the `sglang:` prefix:
+
+```
+# counters
+sglang:halo_programs_registered_total
+sglang:halo_programs_rejected_total{reason}
+sglang:halo_requests_admitted_total
+sglang:halo_requests_rejected_total{reason}
+sglang:halo_slo_violations_total
+# gauges (refreshed every sweep, ~100 ms)
+sglang:halo_active_jobs
+sglang:halo_total_known_jobs
+sglang:halo_mean_slowdown_max
+sglang:halo_mean_slowdown_mean
+sglang:halo_max_slowdown_max
+```
+
+Consumed by `ms_dev/expctl/monitoring_view.py` to render two rows on the
+live status panel (`halo_active / known / registered / admitted /
+rejected` and `mean_smax / mean_smean / worst_smax / slo_violations`).
+
 ## /server_info snippet
 
 ```json

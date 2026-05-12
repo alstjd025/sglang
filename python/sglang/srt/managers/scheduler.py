@@ -95,6 +95,7 @@ from sglang.srt.managers.admission_control import (
 # See managers/halo/CLAUDE.md.
 from sglang.srt.managers.halo import (
     HaloController,
+    HaloMetrics,
     HaloRejectError,
     RequestExecutionInfo,
     build_halo_controller_from_server_args,
@@ -1274,6 +1275,19 @@ class Scheduler(
         # Wall-clock guard for the 100ms sweep tick (used by
         # scheduler_metrics_mixin to avoid sweeping every forward step).
         self._halo_last_tick_monotonic: float = 0.0
+
+        # Prometheus metrics — same gating as admission_control:
+        # only attn_tp_rank=0 registers them so a TP=N deployment doesn't
+        # double-count counters across ranks.
+        if (
+            self.halo_controller is not None
+            and self.server_args.enable_metrics
+            and getattr(self, "metrics_collector", None) is not None
+            and getattr(self, "attn_tp_rank", 0) == 0
+        ):
+            self.halo_controller.metrics = HaloMetrics(
+                labels=self.metrics_collector.labels
+            )
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
