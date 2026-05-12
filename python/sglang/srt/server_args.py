@@ -383,6 +383,9 @@ class ServerArgs:
     halo_job_log: Optional[str] = None
     halo_prefill_cost_model_path: Optional[str] = None
     halo_tbt_cost_model_path: Optional[str] = None
+    # Q13: pre-registered programs that never get an LLM request are dropped
+    # after this many seconds. Set to 0 to keep them indefinitely.
+    halo_program_idle_timeout_seconds: float = 300.0
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
@@ -4633,6 +4636,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.halo_tbt_cost_model_path,
             help="TBT cost model JSON for Halo slowdown computation. Same schema as admission_control.",
+        )
+        parser.add_argument(
+            "--halo-program-idle-timeout-seconds",
+            type=float,
+            default=ServerArgs.halo_program_idle_timeout_seconds,
+            help="HALO Option A: drop pre-registered programs that never receive an LLM request after this many seconds (default 300). Set to 0 to keep them indefinitely.",
         )
         parser.add_argument(
             "--max-total-tokens",

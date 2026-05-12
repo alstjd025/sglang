@@ -37,6 +37,9 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    # HALO: Project Halo Phase 1 Option A IO structs.
+    HaloRegisterProgramReqInput,
+    HaloRegisterProgramReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadsReqInput,
@@ -108,6 +111,8 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    # HALO: Option A — POST /halo/programs round-trips through this entry.
+    ("register_halo_program", HaloRegisterProgramReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -259,6 +264,22 @@ class TokenizerControlMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def register_halo_program(
+        self: TokenizerManager, obj: HaloRegisterProgramReqInput
+    ) -> HaloRegisterProgramReqOutput:
+        """HALO: Option A — pre-register a Halo job. See managers/halo/CLAUDE.md.
+
+        Routes the request to the scheduler over zmq via FanOutCommunicator
+        (single-instance NULL disagg in Phase 1 so dp_size=1 always; the
+        first result is the answer). The scheduler's handler is
+        Scheduler.register_halo_program(...).
+
+        Returns the scheduler's response unchanged. HTTP layer converts
+        `registered` and `reason` into the proper status code.
+        """
+        self.auto_create_handle_loop()
+        return (await self.register_halo_program_communicator(obj))[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

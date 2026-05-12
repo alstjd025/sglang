@@ -1259,6 +1259,29 @@ class FlushCacheReqOutput(BaseReq):
     message: str = ""
 
 
+# HALO: Project Halo Phase 1 Option A — pre-registration IO structs.
+# See managers/halo/CLAUDE.md §11 and ms_dev/halo_dev/CLAUDE.md §13.
+# Routed HTTP → tokenizer_manager → scheduler, mirroring flush_cache.
+@dataclass
+class HaloRegisterProgramReqInput(BaseReq):
+    job_id: str = ""
+    slo: float = 0.0
+    total_calls: Optional[int] = None
+    stage_sequence: Optional[List[str]] = None
+    expected_input_lens: Optional[List[int]] = None
+    expected_output_lens: Optional[List[int]] = None
+    dag: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class HaloRegisterProgramReqOutput(BaseReq):
+    registered: bool = False
+    job_id: str = ""
+    reason: Optional[str] = None         # set when registered=False
+    active_jobs: int = 0
+    existing: Optional[Dict[str, Any]] = None     # set on 409 conflict
+
+
 @dataclass
 class AddExternalCorpusReqInput(BaseReq):
     corpus_id: Optional[str] = None

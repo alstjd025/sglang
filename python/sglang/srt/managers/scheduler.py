@@ -126,6 +126,9 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    # HALO: Option A — POST /halo/programs IO structs.
+    HaloRegisterProgramReqInput,
+    HaloRegisterProgramReqOutput,
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -1503,6 +1506,9 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
+                # HALO: Option A — POST /halo/programs.
+                # See managers/halo/CLAUDE.md.
+                (HaloRegisterProgramReqInput, self.register_halo_program),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -2637,6 +2643,41 @@ class Scheduler(
                 _add(req, kv_len_now=kv_len, decoded_so_far=decoded)
 
         return infos
+
+    def register_halo_program(
+        self, recv_req: HaloRegisterProgramReqInput
+    ) -> HaloRegisterProgramReqOutput:
+        """HALO: Option A scheduler handler for `POST /halo/programs`.
+
+        Called via the request dispatcher (zmq from TokenizerManager).
+        Off path: when Halo is disabled, returns `registered=False` with
+        REASON_DISABLED so HTTP layer returns 400; we never start a Job.
+
+        See managers/halo/CLAUDE.md §11.7 and §13 Q9-Q14.
+        """
+        controller = getattr(self, "halo_controller", None)
+        if controller is None:
+            return HaloRegisterProgramReqOutput(
+                registered=False,
+                job_id=recv_req.job_id,
+                reason="HALO_DISABLED",
+            )
+        result = controller.register_program(
+            job_id=recv_req.job_id,
+            slo=recv_req.slo,
+            total_calls=recv_req.total_calls,
+            stage_sequence=recv_req.stage_sequence,
+            expected_input_lens=recv_req.expected_input_lens,
+            expected_output_lens=recv_req.expected_output_lens,
+            dag=recv_req.dag,
+        )
+        return HaloRegisterProgramReqOutput(
+            registered=result.registered,
+            job_id=result.job_id,
+            reason=result.reason,
+            active_jobs=result.active_jobs,
+            existing=result.existing,
+        )
 
     def _halo_maybe_tick(self) -> None:
         """Wall-clock-gated tick. Called once per scheduler-loop iteration.
