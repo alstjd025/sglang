@@ -419,15 +419,55 @@ class Job:
 16. ⏳ 짧은 통합 실험 1회 + 결과 캡처 (사용자 실행 필요 — `source ms_dev/experiments/halo_observe_only.sh && python3 ms_dev/expctl/run_experiment.py --mode single`)
 17. ⏳ Agent_applications 클라이언트 측에 `halo_job_id` / `halo_slo` 필드 추가 (Phase 1 strict mode → 빠지면 400)
 
-## 10. 커밋 히스토리 (project-halo-phase1)
+## 10. 커밋 히스토리 (전체, 시간 역순)
 
+### `sglang` repo · 브랜치 `project-halo-phase1` (분기: `28797d9e6` from `admission-control-mooncakelike`)
+
+**최신 (2026-05-13)**:
 ```
+2ac0fed5d add(halo): jsonl event=job_complete row on explicit signal + quiescent path
+e85c4fd61 docs(halo): §18 follow-up on TBT cost-model cliff
+3181ae6e9 docs(halo): halo_job_done + quiescent fallback + decision log
+03a334bc6 add(halo): split monitor labels — halo_rej_no_id / halo_rej_not_reg + halo_ prefix
+c03797057 add(halo): explicit halo_job_done body field + quiescent safety net  ← A 핵심
+f25fd41ea fix(halo): don't mark job COMPLETE mid-chain (rolled back later by c03797057)
+6d6074623 fix(halo): throttle JSONL job log to 10s
+cbf717a7d add(halo): GET /halo/status — lightweight server-config probe
+181cfb187 fix(halo): mark /health internal inference with halo_bypass=True
+443d1add4 fix(halo): forward halo_* fields from TokenizedGenerateReqInput into Req()
+b1afff118 docs(halo): split client-facing API surface into halo_api_reference.md
+d378cdde3 fix(halo): bypass admission gate for server-internal traffic (warmup)
+df60ccda2 docs(halo): correct verify guide
+67810b236 add(halo): Prometheus metrics + live runtime state in expctl panel
+834ea7356 add(halo): Phase 1 verification harness — microbench + e2e_smoke
+99cd25bd0 refactor(halo): clarify role boundaries — admit_to_job + JobAdmissionResult
+6c4720d73 docs(halo): Option A end-to-end progress + strict-mode guidance
+18bf66a8b add(halo): Option A IPC + HTTP — POST /halo/programs end-to-end
+802c5bf20 add(halo): Option A core — Job extension, register_program, strict-mode admission
+2c3ebee91 docs(halo): A+B 둘 다 구현 방향으로 명세 갱신
+```
+
+**초기 (2026-05-12)**:
+```
+f321ff493 docs(halo): Phase 1 progress + ms_dev/CLAUDE.md Halo section
 c72f90286 add(halo): Phase 1 ms_dev tooling — env vars, launcher, experiments, expctl panel
 37200978d test(halo): Phase 1 unit tests — Job, Registry, Tracker, Controller, factory
 3334bf55e add(halo): Phase 1 scheduler integration + request-metadata passthrough
 acdfc411f add(halo): Phase 1 module skeleton — Job, JobRegistry, SlowdownTracker, HaloController
 e496ea707 docs(halo): Phase 1 plan + decisions in ms_dev/halo_dev/CLAUDE.md
 ```
+
+총 **26 commits**. Push 는 사용자가 직접 (`git push -u origin project-halo-phase1`).
+
+### `Agent_applications` repo · 브랜치 `project-halo-phase1-client` (분기: `4d3cc51` from `main`)
+
+```
+0d596e8 add(halo-client): send halo_job_done=true on the chain's last call
+b5e5e5f fix(halo-client): record HALO_* rejections in metrics.csv
+d2058ef add(halo): Project Halo Phase 1 client wiring across all workloads
+```
+
+총 **3 commits**. Push 는 `bash safe_push.sh` 또는 `git push -u origin project-halo-phase1-client`.
 
 총 5개 커밋 (+ Halo 진행상황 doc 커밋 1개 = `f321ff493`). push 는 사용자가 직접
 (`git push -u origin project-halo-phase1`).
@@ -967,3 +1007,87 @@ Phase 1 의 *짧은* 대안. (γ) 가 무거우면 임시 (α) 또는 model-less
 - `python/sglang/srt/managers/halo/slowdown_tracker.py` 모듈 docstring
 - `ms_dev/runtime/cost_models/README.md` item 3
 - `ms_dev/halo_dev/CLAUDE.md` §2 Q2 (의사결정 노트) + 이 §18 (follow-up 정량 + 옵션)
+
+## 19. 현재 상태 (2026-05-13) — 한 페이지 요약
+
+> compaction 이후 새 context 에서 빠르게 catch-up 하기 위한 스냅샷.
+
+### Phase 1 deliverable 진행
+
+| | 의도된 동작 | 검증 상태 |
+|---|---|---|
+| **Job tracking** (R1) | 매 100ms sweep, per-job `slowdown_max/mean` 갱신 | ✅ 260513_1550 세션에서 mean 2.03x / worst 2.56x 관찰. 부하 반영 정상 |
+| **Job-level admission gate** (R2, strict mode) | `halo_job_id` + 사전등록 필수, 둘 다 안되면 400 | ✅ 검증됨 (reject 0건) |
+| **Job-level scheduling** (R3) | n/a — Phase 2 작업 | ⏳ |
+| **Option A: `POST /halo/programs`** | client 가 chain 시작 시 1회 등록. body 에 chain_length 등 | ✅ |
+| **Option B: request body fields** | `halo_job_id`, `halo_slo`, `halo_bypass`, `halo_job_done` | ✅ |
+| **Explicit termination** | client 가 마지막 call body 에 `halo_job_done=true` → server mark COMPLETE | ✅ 260513_1550 에서 1 job 정상 종료 확인 |
+| **Quiescent safety net** | 300s idle 후 자동 COMPLETE | ✅ 단위 테스트 통과, 정상 운용에선 미트립 |
+| **Monitor panel** | `halo_*` prefix + reject reason split | ✅ |
+| **Verify harness** | microbench + e2e_smoke + slowdown_vs_actual (Phase 2) | ✅ A/B 부분 |
+
+### 알려진 한계 (Phase 2 향)
+
+- **§18 cost-model cliff**: TBT 예측이 실측 대비 ~5x underestimate. slowdown ratio 가
+  부풀려져 보임 (실제 부하의 진짜 ratio 모름). Action items C1~C4 미결.
+- **Mass-job 분석 도구 없음**: 검증 1 (slowdown accuracy) 의 본 검증은 application
+  metrics.csv + halo_jobs.jsonl 조인 분석이 필요. 분석 스크립트 미작성.
+- **R3 (scheduling)** 미구현 — Phase 2 작업.
+- **Multi-instance (PD/DP)**: Halo 는 단일 scheduler 가정. PD 모드에선 controller
+  no-op + WARN. Phase 2 Conductor 단에 통합 필요.
+
+### Push 상태
+
+- sglang `project-halo-phase1`: 26 commits **(push 안 됨)**
+- Agent_applications `project-halo-phase1-client`: 3 commits **(push 안 됨)**
+
+push 정책상 사용자가 직접 푸시. 정상 실험 머신에서 fetch 하려면 push 필요.
+
+### 사용자 결정 미결 항목
+
+| ID | 내용 | 컨텍스트 |
+|---|---|---|
+| **C1~C4** | Cost model 보강 — 변수 선택 / 모델 형태 / 데이터 수집 방식 / 진행 시점 | §18 |
+| **본 실험 디자인** | 더 긴 실험 (`--duration-min 60+`) 으로 검증 1 (slowdown accuracy) 본격 수집할지 | — |
+| **검증 1 분석 스크립트** | `verify_slowdown_vs_actual.py` 같은 application_jobs.csv ↔ halo_jobs.jsonl 조인 분석 도구 작성 시점 | `verify/CLAUDE.md` |
+
+### 다음 가능한 action 후보 (대화 재개 시)
+
+1. **(가장 자연)** §18 의 C1~C4 결정 받고 cost-model 작업 시작
+2. **검증 1 분석 도구** 작성 (cost-model 안 건드리고도 가능)
+3. **본 실험** 1시간 돌려 진짜 slowdown 분포 확보
+4. **Phase 2 admission decision** 작업 시작 (lookahead 등) — R3 영역
+
+### 참고 — 변경된 파일 목록 (sglang)
+
+```
+python/sglang/srt/managers/halo/             ← 신규 패키지
+  ├── __init__.py
+  ├── CLAUDE.md
+  ├── job.py
+  ├── job_registry.py
+  ├── slowdown_tracker.py
+  ├── controller.py
+  └── metrics.py
+python/sglang/srt/managers/{io_struct, schedule_batch, scheduler, tokenizer_manager, tokenizer_control_mixin}.py
+python/sglang/srt/managers/scheduler_output_processor_mixin.py
+python/sglang/srt/entrypoints/{http_server, openai/{protocol, serving_chat, serving_completions}}.py
+python/sglang/srt/server_args.py
+test/registered/halo/{CLAUDE.md, test_halo_phase1.py}          ← 39 tests
+ms_dev/{env.common.sh, lib_server.sh, start_server_no_pd.sh, CLAUDE.md}
+ms_dev/experiments/{halo_observe_only.sh, halo_off.sh, README.md}
+ms_dev/expctl/{run_experiment.py, monitoring_view.py, CLAUDE.md}
+ms_dev/halo_dev/{CLAUDE.md, halo_api_reference.md, verify/{CLAUDE.md, microbench_overhead.py, e2e_smoke.sh}}
+```
+
+### 참고 — 변경된 파일 목록 (Agent_applications)
+
+```
+agent_motivation_experiment/run_experiment.py                  ← --halo-enabled / --halo-slo + readiness probe
+agent_motivation_experiment/workloads/{base, halo_helpers}.py
+agent_motivation_experiment/workloads/swe_bench_coding/{agent, workload}.py
+agent_motivation_experiment/workloads/swe_bench_coding_tool_delay/workload.py
+agent_motivation_experiment/workloads/swe_bench_coding_parallel_tool_delay/workload.py
+agent_motivation_experiment/{CLAUDE.md, workloads/{AGENTS, CLAUDE}.md}
+CLAUDE.md                                                       ← repo root
+```
