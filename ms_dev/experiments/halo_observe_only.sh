@@ -39,9 +39,16 @@ export SGLANG_HALO_ENABLED=1
 export SGLANG_HALO_DEFAULT_SLO="${SGLANG_HALO_DEFAULT_SLO:-5.0}"
 export SGLANG_HALO_TICK_INTERVAL_MS="${SGLANG_HALO_TICK_INTERVAL_MS:-100}"
 
-# Reuse admission_control cost models — same schema, same JSON files.
-# Halo's slowdown computation needs both; if either is missing, the sweep
-# still runs but contributes no math (job counters / state still work).
+# Default cost model: Halo Step Cost Model in SPLIT form. Validated as the
+# best-balanced model (closest tail/p90 to ground truth; cliff resolved) —
+# see ms_dev/halo_dev/prediction_model.md §17. When this var is set, the
+# server logs INFO and ignores SGLANG_HALO_PREFILL_COST_MODEL /
+# SGLANG_HALO_TBT_COST_MODEL. To opt back into the legacy two-model pair,
+# explicitly set SGLANG_HALO_STEP_COST_MODEL="" before sourcing.
+export SGLANG_HALO_STEP_COST_MODEL="${SGLANG_HALO_STEP_COST_MODEL-${SGLANG_REPO_ROOT}/ms_dev/runtime/cost_models/halo_step_split_llama3-70b_b200x4.json}"
+
+# Legacy fallback. Used only when SGLANG_HALO_STEP_COST_MODEL is empty;
+# otherwise ignored by the server.
 export SGLANG_HALO_PREFILL_COST_MODEL="${SGLANG_HALO_PREFILL_COST_MODEL:-${SGLANG_REPO_ROOT}/ms_dev/runtime/cost_models/prefill_llama3-70b_b200x4.json}"
 export SGLANG_HALO_TBT_COST_MODEL="${SGLANG_HALO_TBT_COST_MODEL:-${SGLANG_REPO_ROOT}/ms_dev/runtime/cost_models/tbt_llama3-70b_b200x4.json}"
 
@@ -49,4 +56,8 @@ export SGLANG_HALO_TBT_COST_MODEL="${SGLANG_HALO_TBT_COST_MODEL:-${SGLANG_REPO_R
 # ms_dev/expctl/run_experiment.py; leave unset here.
 unset SGLANG_HALO_JOB_LOG
 
-echo "[experiments/halo_observe_only] halo_enabled=${SGLANG_HALO_ENABLED} default_slo=${SGLANG_HALO_DEFAULT_SLO} tick_ms=${SGLANG_HALO_TICK_INTERVAL_MS} prefill_cost=${SGLANG_HALO_PREFILL_COST_MODEL##*/} tbt_cost=${SGLANG_HALO_TBT_COST_MODEL##*/}"
+if [[ -n "${SGLANG_HALO_STEP_COST_MODEL}" ]]; then
+  echo "[experiments/halo_observe_only] halo_enabled=${SGLANG_HALO_ENABLED} default_slo=${SGLANG_HALO_DEFAULT_SLO} tick_ms=${SGLANG_HALO_TICK_INTERVAL_MS} step_cost=${SGLANG_HALO_STEP_COST_MODEL##*/}"
+else
+  echo "[experiments/halo_observe_only] halo_enabled=${SGLANG_HALO_ENABLED} default_slo=${SGLANG_HALO_DEFAULT_SLO} tick_ms=${SGLANG_HALO_TICK_INTERVAL_MS} prefill_cost=${SGLANG_HALO_PREFILL_COST_MODEL##*/} tbt_cost=${SGLANG_HALO_TBT_COST_MODEL##*/} (legacy fallback)"
+fi
