@@ -423,7 +423,14 @@ class Job:
 
 ### `sglang` repo · 브랜치 `project-halo-phase1` (분기: `28797d9e6` from `admission-control-mooncakelike`)
 
-**최신 (2026-05-13)**:
+**최신 (2026-05-14) — Step Cost Model round**:
+```
+672280e4b feat(halo): adopt split form as default — observe_only wrapper wires it up
+dc39b5b3e add(halo): Step Cost Model — unified + split forms, sampler, fit tool  ← §15/§17
+a83b1bade docs(halo): refresh §10 commit history (5→26) + new §19 status snapshot
+```
+
+**2026-05-13 (compaction 직전까지)**:
 ```
 2ac0fed5d add(halo): jsonl event=job_complete row on explicit signal + quiescent path
 e85c4fd61 docs(halo): §18 follow-up on TBT cost-model cliff
@@ -457,7 +464,7 @@ acdfc411f add(halo): Phase 1 module skeleton — Job, JobRegistry, SlowdownTrack
 e496ea707 docs(halo): Phase 1 plan + decisions in ms_dev/halo_dev/CLAUDE.md
 ```
 
-총 **26 commits**. Push 는 사용자가 직접 (`git push -u origin project-halo-phase1`).
+총 **29 commits** (26 + Step Cost Model 라운드 3). Push 는 사용자가 직접 (`git push origin project-halo-phase1`).
 
 ### `Agent_applications` repo · 브랜치 `project-halo-phase1-client` (분기: `4d3cc51` from `main`)
 
