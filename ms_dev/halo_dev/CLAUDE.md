@@ -844,3 +844,61 @@ Phase 2 에서 admission decision 알고리즘이 들어올 때:
 
 이 디자인이라면 Phase 2 에서 Halo 모듈 외부 코드 변경 거의 없음 (`scheduler.py` 의 hook
 한 줄, server_args 의 새 플래그 정도).
+
+## 17. Job 종료 시그널 — explicit `halo_job_done` (2026-05-12 결정)
+
+### 배경: chain 중간 조기 COMPLETE 버그
+
+Slowdown 실험 (`260512_2128_slowdown_test_lambda_0p3`) 에서 *parallel_tool_delay* 워크로드의 44 reject (`HALO_PROGRAM_NOT_REGISTERED`). 원인:
+- `Job.on_request_completed` 가 `remaining_request_number==0` 시 즉시 COMPLETE
+- parallel_tool_delay 의 *tool_delay 3-10s* 가 5s retain 윈도우 초과 → `gc_completed` GC
+- 다음 round 의 call 도착 → registry 에서 미등록 → 400
+
+### 1차 fix 의 한계 — total_calls_expected 의존
+
+f25fd41ea 에서 `total_calls_expected` 만큼 admit 됐을 때만 COMPLETE 로 가드. 그러나:
+- 동적 DAG (conditional branch, runtime-결정 chain) 에서 정확한 count 미리 모름
+- 과소 추정: 9번째 call → reject (버그 재발)
+- 과대 추정: 영영 COMPLETE 안 됨 → idle GC (300s) 까지 점유
+
+### 최종 결정 (c03797057): explicit signal
+
+| | 동작 |
+|---|---|
+| **client 책임** | chain 의 마지막 LLM call 의 body 에 `halo_job_done: true` 동봉 |
+| **server 동작** | `_halo_on_request_finished` 가 그 flag 받으면 `mark_job_done(rid)` → state=COMPLETE → 다음 sweep 의 `gc_completed` 가 retain_seconds 후 GC |
+| **`on_request_completed`** | 자동 COMPLETE 로직 *완전 제거*. 단순히 counter 갱신만 |
+| **안전망** | `gc_quiescent_jobs(quiescent_seconds=300)` — `--halo-quiescent-timeout-seconds` 로 조정 가능. 클라이언트 crash / signal 누락 case 처리 |
+
+### Implementation
+
+| 영역 | 변경 |
+|---|---|
+| `io_struct.GenerateReqInput` + `Tokenized*` + `protocol.ChatCompletion*` | `halo_job_done: bool = False` |
+| `serving_chat`/`serving_completions`/`tokenizer_manager` | passthrough |
+| `schedule_batch.Req` | `halo_job_done` 필드 |
+| `scheduler.handle_generate_request` | Req 생성 시 전달 |
+| `scheduler._halo_on_request_finished` | flag forward |
+| `HaloController.on_request_finished(rid, halo_job_done=False)` | flag True 시 `mark_job_done` 먼저, `record_completion` 나중 |
+| `Job.on_request_completed` | state 전환 로직 *제거* |
+| `Job.mark_done()` | state=COMPLETE 강제 |
+| `JobRegistry.mark_job_done(rid)` | rid → job 룩업 후 mark_done |
+| `JobRegistry.gc_quiescent_jobs(N)` | running/queued 상태인 idle job 자동 COMPLETE (WARN 로그) |
+| `HaloController.tick()` | gc_quiescent_jobs → gc_completed → gc_idle_programs 순 |
+| `server_args.halo_quiescent_timeout_seconds` (default 300) | + CLI flag + env var passthrough |
+
+### Client wiring (Agent_applications)
+
+| | wiring |
+|---|---|
+| `make_llm(...)` | `halo_job_done: bool = False` keyword arg → `extra_body["halo_job_done"]` |
+| `ChainState` + `create_chain_state` | `halo_done_llm: Optional[Any]` |
+| `invoke_with_tracking` | `call_index == state["chain_length"]` 시 `state["halo_done_llm"]` 으로 swap |
+| 3 워크로드 `run_job` | `llm` + `halo_done_llm` 두 인스턴스 같이 생성 |
+
+### 명시 종료 시그널의 효과
+
+- chain 길이 정확히 몰라도 OK (사용자 의도)
+- gap (tool_delay) 길이 무관 — quiescent 까지는 안전
+- dynamic DAG 도 wiring 가능 (마지막 call 시점에 client 가 결정)
+- 안전망: quiescent timeout 으로 client crash 케이스 대비

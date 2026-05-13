@@ -36,6 +36,7 @@ python3 ms_dev/expctl/run_experiment.py --mode single
 | `--halo-tbt-cost-model-path` | unset | Same for TBT |
 | `--halo-program-idle-timeout-seconds` | `300` | Pre-registered programs that never receive a request get GC'd after this many seconds. `0` disables idle GC |
 | `--halo-job-log-interval-seconds` | `10` | How often (seconds) `halo_jobs.jsonl` gets a full active-jobs snapshot. Slowdown sweep + Prometheus gauges still tick at `--halo-tick-interval-ms`; only the verbose JSONL log is throttled. `0` reverts to per-sweep logging |
+| `--halo-quiescent-timeout-seconds` | `300` | Safety net for jobs the client never closes with `halo_job_done=true`. A job with zero in-flight requests and no admit/finish activity for this many seconds is force-flipped to COMPLETE (then GC'd after retain_seconds). Tune up for workloads with legitimately long mid-chain waits (human-in-the-loop, external API). `0` disables |
 
 ### Env-var equivalents (translated to flags by `lib_server.sh::append_halo_args`)
 
@@ -126,6 +127,7 @@ These existing endpoints gain three optional fields:
 | `halo_job_id` | `str` | unset | Required when Halo is on. Identifies the job this call belongs to. Must match a previously registered program (per Q12 — no lazy create) |
 | `halo_slo` | `float` | unset → server default | Per-job slowdown SLO. If the program was pre-registered (Q10), this is **ignored** and the pre-registered SLO is used (server logs WARN on mismatch) |
 | `halo_bypass` | `bool` | `false` | Skip Halo entirely for this request. Reserved for server-internal traffic (warmup, self-loopback). Real clients should never set this |
+| `halo_job_done` | `bool` | `false` | "This is the last LLM call of the job." On this request's finish, the server flips the owning Job's state to COMPLETE → `gc_completed` drops it after retain_seconds. Required for clean termination — without it the job stays RUNNING until the quiescent safety net trips (default 5 min). |
 
 ### Strict-mode reject paths (when `--halo-enabled` is on)
 
@@ -180,14 +182,21 @@ yet-GC'd ones.
 
 ### Plain curl (one job, N sequential calls)
 
+The last call carries `halo_job_done: true` so the server closes the
+job cleanly. Without it the job sits RUNNING until the quiescent
+safety net trips.
+
 ```bash
 BASE=http://127.0.0.1:31000
 curl -X POST $BASE/halo/programs -H 'Content-Type: application/json' \
     -d '{"job_id":"demo-1","slo":5.0,"total_calls":3}'
 for i in 1 2 3; do
+  DONE=false
+  [ "$i" -eq 3 ] && DONE=true
   curl -X POST $BASE/v1/chat/completions -H 'Content-Type: application/json' \
       -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"call $i\"}],
-           \"max_tokens\":32,\"halo_job_id\":\"demo-1\",\"halo_slo\":5.0}"
+           \"max_tokens\":32,\"halo_job_id\":\"demo-1\",\"halo_slo\":5.0,
+           \"halo_job_done\":$DONE}"
 done
 ```
 

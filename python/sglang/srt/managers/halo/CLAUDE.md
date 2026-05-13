@@ -165,6 +165,11 @@ Internal-only knobs worth remembering here:
   `POST /halo/programs` before the first LLM call.
 - Request has `halo_job_id` + program pre-registered but no `halo_slo` ⇒
   pre-registered SLO is used (anyway wins per Q10).
+- Request with `halo_job_done: true` on its finish ⇒ owning job is
+  marked COMPLETE; `gc_completed` drops it after retain_seconds.
+- Job with no admit/finish activity for `--halo-quiescent-timeout-seconds`
+  (default 300) and zero in-flight requests ⇒ safety-net force-completed
+  (WARN logged). Catches clients that crashed or forgot the signal.
 
 ## External touchpoints (one-line `# HALO:` comments at each site)
 
