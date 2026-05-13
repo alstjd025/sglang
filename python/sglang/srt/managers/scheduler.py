@@ -2139,6 +2139,7 @@ class Scheduler(
                 halo_job_id=recv_req.halo_job_id,
                 halo_slo=recv_req.halo_slo,
                 halo_bypass=recv_req.halo_bypass,
+                halo_job_done=recv_req.halo_job_done,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -2621,11 +2622,19 @@ class Scheduler(
         return False
 
     def _halo_on_request_finished(self, req: Req) -> None:
-        """Called from the scheduler's per-request finish path. No-op if Halo off."""
+        """Called from the scheduler's per-request finish path. No-op if Halo off.
+
+        Forwards the client's `halo_job_done` flag so the controller can
+        explicitly transition the owning job to COMPLETE when this is the
+        last call in the chain. See halo_api_reference.md.
+        """
         controller = getattr(self, "halo_controller", None)
         if controller is None:
             return
-        controller.on_request_finished(req.rid)
+        controller.on_request_finished(
+            req.rid,
+            halo_job_done=getattr(req, "halo_job_done", False),
+        )
 
     def _halo_build_request_execution_infos(self) -> List[RequestExecutionInfo]:
         """Snapshot the in-flight Halo-tracked requests for the periodic sweep.

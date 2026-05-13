@@ -612,6 +612,7 @@ class Req(ReqDllmMixin):
         halo_job_id: Optional[str] = None,
         halo_slo: Optional[float] = None,
         halo_bypass: bool = False,
+        halo_job_done: bool = False,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -696,6 +697,7 @@ class Req(ReqDllmMixin):
         self.halo_job_id = halo_job_id
         self.halo_slo = halo_slo
         self.halo_bypass = halo_bypass
+        self.halo_job_done = halo_job_done
         self.halo_first_admitted_ts: Optional[float] = None
         # Prefix-cache match length captured at admission time (used by Halo
         # to compute solo-run baseline; matches admission_control's snapshot

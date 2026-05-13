@@ -391,6 +391,12 @@ class ServerArgs:
     # per-sweep snapshot — writing every sweep blows up jsonl size on
     # long runs. 0 → write every sweep.
     halo_job_log_interval_seconds: float = 10.0
+    # Safety-net timeout: when a job has had no admit/finish activity for
+    # this many seconds, force COMPLETE so gc_completed can drop it.
+    # Catches clients that crashed or forgot to send halo_job_done. Set
+    # to 0 to disable. Tune up for workloads with legitimately long
+    # mid-chain waits (human-in-the-loop, external API, etc.).
+    halo_quiescent_timeout_seconds: float = 300.0
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
@@ -4653,6 +4659,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.halo_job_log_interval_seconds,
             help="HALO: how often (seconds) to append a full active-jobs snapshot to halo_jobs.jsonl. Default 10. Slowdown sweep + Prometheus gauges still update every tick_interval_ms; only the verbose JSONL log is throttled. Set to 0 to write every sweep (legacy).",
+        )
+        parser.add_argument(
+            "--halo-quiescent-timeout-seconds",
+            type=float,
+            default=ServerArgs.halo_quiescent_timeout_seconds,
+            help="HALO: safety net. A job that hasn't seen any admit/finish for this many seconds is force-completed (then GC'd after retain_seconds). Catches clients that crashed or forgot to send halo_job_done. Default 300. Set to 0 to disable.",
         )
         parser.add_argument(
             "--max-total-tokens",

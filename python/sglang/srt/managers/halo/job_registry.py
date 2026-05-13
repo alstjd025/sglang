@@ -179,6 +179,23 @@ class JobRegistry:
         job.on_request_completed(rid)
         return job
 
+    def mark_job_done(self, rid: str) -> Optional[Job]:
+        """Client-side explicit termination — see halo_job_done body field.
+
+        Looks up the job that owns `rid` and marks it COMPLETE regardless
+        of remaining_request_number. The matching `record_completion` for
+        the same rid still runs (it's still a finish event), so counters
+        are kept consistent.
+        """
+        job_id = self._rid_to_job.get(rid)
+        if job_id is None:
+            return None
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        job.mark_done()
+        return job
+
     # ------------------------------------------------------------------
     # GC
     # ------------------------------------------------------------------
@@ -200,6 +217,44 @@ class JobRegistry:
         for jid in to_drop:
             self._jobs.pop(jid, None)
         return len(to_drop)
+
+    def gc_quiescent_jobs(self, quiescent_seconds: float) -> int:
+        """Safety net for jobs whose client never sent `halo_job_done`.
+
+        Marks any QUEUED/RUNNING job as COMPLETE when its last_update_ts
+        is older than `quiescent_seconds` AND it has zero in-flight
+        requests. The next `gc_completed` sweep will then drop it after
+        retain_seconds.
+
+        Catches the failure modes the explicit signal can't:
+          - client crashed mid-chain
+          - dynamic-DAG client legitimately decided no more calls but
+            forgot to signal
+          - misconfigured workload
+
+        `quiescent_seconds <= 0` disables this fallback. Returns the
+        count of jobs flipped to COMPLETE.
+        """
+        if quiescent_seconds <= 0:
+            return 0
+        now = _now_monotonic()
+        flipped = 0
+        for job in self._jobs.values():
+            if (
+                job.state in (JobState.QUEUED, JobState.RUNNING)
+                and not job.request_ids
+                and now - job.last_update_ts > quiescent_seconds
+            ):
+                logger.warning(
+                    "halo: job_id=%s flipped to COMPLETE by quiescent "
+                    "fallback (no activity for %.1fs, halo_job_done never "
+                    "received). Tune --halo-quiescent-timeout-seconds to "
+                    "adjust the threshold.",
+                    job.job_id, quiescent_seconds,
+                )
+                job.mark_done()
+                flipped += 1
+        return flipped
 
     def gc_idle_programs(self, idle_seconds: float) -> int:
         """Drop pre-registered jobs that never received a single LLM request.

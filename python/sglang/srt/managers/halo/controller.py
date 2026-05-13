@@ -115,6 +115,12 @@ class HaloConfig:
     # file. Default to one log line every 10s; metrics gauges still
     # update every sweep. 0 → write every sweep (legacy behavior).
     job_log_interval_seconds: float = 10.0
+    # Safety-net timeout: when a job is QUEUED/RUNNING but has had no
+    # admit/finish activity for this many seconds, force COMPLETE so
+    # gc_completed can drop it. Catches clients that crashed or forgot
+    # to send halo_job_done. 0 disables. Tune up for workloads with
+    # legitimately long mid-chain waits (e.g., human-in-the-loop).
+    quiescent_timeout_seconds: float = 300.0
 
 
 class _JobLogger:
@@ -298,8 +304,16 @@ class HaloController:
             active_jobs=len(self.registry.active_jobs()),
         )
 
-    def on_request_finished(self, rid: str) -> None:
-        """Called from the scheduler's finish path."""
+    def on_request_finished(self, rid: str, halo_job_done: bool = False) -> None:
+        """Called from the scheduler's finish path.
+
+        If the client set `halo_job_done=true` on this request, mark the
+        owning job COMPLETE *before* record_completion pops the rid→job
+        mapping (otherwise mark_job_done can't look up the job). Then
+        decrement counters as normal.
+        """
+        if halo_job_done:
+            self.registry.mark_job_done(rid)
         self.registry.record_completion(rid)
 
     # ------------------------------------------------------------------
@@ -344,6 +358,10 @@ class HaloController:
             )
             self._last_log_monotonic = now
 
+        # Safety net BEFORE gc_completed: any job that's been quiescent
+        # (no in-flight + no recent update) gets flipped to COMPLETE.
+        # Then gc_completed picks them up after retain_seconds.
+        self.registry.gc_quiescent_jobs(self.config.quiescent_timeout_seconds)
         # GC completed jobs older than retain window — bounded memory.
         self.registry.gc_completed(self.config.gc_retain_seconds)
         # Q13: drop pre-registered programs that never received a request.
@@ -418,6 +436,9 @@ def build_halo_controller_from_server_args(
         ),
         job_log_interval_seconds=float(
             getattr(server_args, "halo_job_log_interval_seconds", 10.0)
+        ),
+        quiescent_timeout_seconds=float(
+            getattr(server_args, "halo_quiescent_timeout_seconds", 300.0)
         ),
     )
     return HaloController(config=config, is_rank0=is_rank0)

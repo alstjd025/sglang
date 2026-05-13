@@ -210,6 +210,9 @@ append_halo_args() {
   if [[ -n "${SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS:-}" ]]; then
     _halo_out+=(--halo-job-log-interval-seconds "${SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS}")
   fi
+  if [[ -n "${SGLANG_HALO_QUIESCENT_TIMEOUT_SECONDS:-}" ]]; then
+    _halo_out+=(--halo-quiescent-timeout-seconds "${SGLANG_HALO_QUIESCENT_TIMEOUT_SECONDS}")
+  fi
 }
 
 # launch_server <cmd...>

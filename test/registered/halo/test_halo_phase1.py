@@ -53,6 +53,10 @@ class TestJob(unittest.TestCase):
         self.assertFalse(job.from_program)
 
     def test_admission_completion_lifecycle(self):
+        """Counters track per-call admit/finish. State does NOT auto-flip
+        to COMPLETE — the client must send halo_job_done (or the
+        quiescent safety net trips). See halo_api_reference.md.
+        """
         job = Job(job_id="agent-1", slo=3.0)
         job.on_request_admitted("rid-a")
         self.assertEqual(job.total_request_number, 1)
@@ -65,6 +69,12 @@ class TestJob(unittest.TestCase):
         self.assertNotEqual(job.state, JobState.COMPLETE)
 
         job.on_request_completed("rid-b")
+        # All in-flight done but state still NOT COMPLETE — explicit
+        # halo_job_done required. (Old auto-COMPLETE on remaining==0 was
+        # too eager and broke mid-chain pauses; see commit f25fd41ea
+        # and follow-up rollback.)
+        self.assertNotEqual(job.state, JobState.COMPLETE)
+        job.mark_done()
         self.assertEqual(job.state, JobState.COMPLETE)
 
     def test_record_sweep_promotes_to_running_and_counts_violations(self):
@@ -81,23 +91,30 @@ class TestJob(unittest.TestCase):
     def test_completion_does_not_mark_complete_mid_chain(self):
         """Multi-round chains (e.g. parallel_tool_delay) finish each round
         then sleep before the next. `remaining=0` between rounds must NOT
-        flip the job to COMPLETE — otherwise gc_completed would drop it
-        and the next round would hit HALO_PROGRAM_NOT_REGISTERED.
+        flip the job to COMPLETE. Even after every expected call has
+        finished, the state stays RUNNING/QUEUED until the client
+        explicitly signals via `halo_job_done`. The total_calls_expected
+        count is advisory only (Phase 1 — workloads with dynamic DAGs
+        won't know it up front).
         """
         job = Job(job_id="agent-1", slo=5.0, total_calls_expected=4)
-        # Round 1: 2 calls admit → both finish → remaining briefly 0.
+        # Round 1 — both calls finish, remaining briefly 0.
         job.on_request_admitted("r1")
         job.on_request_admitted("r2")
         job.on_request_completed("r1")
         job.on_request_completed("r2")
         self.assertEqual(job.remaining_request_number, 0)
-        self.assertNotEqual(job.state, JobState.COMPLETE)  # ← key check
-        # Round 2: 2 more calls.
+        self.assertNotEqual(job.state, JobState.COMPLETE)
+        # Round 2.
         job.on_request_admitted("r3")
         job.on_request_admitted("r4")
         job.on_request_completed("r3")
         job.on_request_completed("r4")
-        self.assertEqual(job.state, JobState.COMPLETE)  # now all 4 expected
+        # Even though total_request_number now == total_calls_expected,
+        # state stays not-COMPLETE — explicit signal required.
+        self.assertNotEqual(job.state, JobState.COMPLETE)
+        job.mark_done()
+        self.assertEqual(job.state, JobState.COMPLETE)
 
     def test_is_idle(self):
         """A pre-registered job with zero requests is idle."""
@@ -183,11 +200,20 @@ class TestJobRegistry(unittest.TestCase):
         self.assertIsNone(reg.record_completion("nope"))
 
     def test_gc_completed_after_retain_window(self):
+        """gc_completed only fires on jobs in COMPLETE state. The
+        explicit signal pattern is: client sends halo_job_done=true on
+        the last call → controller.on_request_finished marks job COMPLETE
+        *before* dropping the rid mapping → gc_completed picks it up
+        after retain_seconds.
+        """
         reg = JobRegistry()
         reg.register_program("agent-1", 5.0)
         reg.admit_to_job("agent-1", 5.0, "rid-a")
-        reg.record_completion("rid-a")
+        # Client signals "this is the last call" on its finish.
+        reg.mark_job_done("rid-a")        # ← order matters: mark first
+        reg.record_completion("rid-a")    # ← then drop the rid mapping
         job = reg.job_for_id("agent-1")
+        self.assertEqual(job.state, JobState.COMPLETE)
         job.last_update_ts = time.monotonic() - 100.0
         dropped = reg.gc_completed(retain_seconds=1.0)
         self.assertEqual(dropped, 1)
@@ -206,6 +232,53 @@ class TestJobRegistry(unittest.TestCase):
         self.assertEqual(dropped, 1)
         self.assertIsNone(reg.job_for_id("agent-1"))
         self.assertIsNotNone(reg.job_for_id("agent-2"))  # has active request
+
+    def test_mark_job_done_via_registry(self):
+        reg = JobRegistry()
+        reg.register_program("agent-1", 5.0)
+        reg.admit_to_job("agent-1", 5.0, "rid-a")
+        affected = reg.mark_job_done("rid-a")
+        self.assertIsNotNone(affected)
+        self.assertEqual(affected.state, JobState.COMPLETE)
+        # mark_job_done is decoupled from record_completion; both can
+        # run in either order without inconsistency.
+        reg.record_completion("rid-a")
+        self.assertEqual(reg.job_for_id("agent-1").remaining_request_number, 0)
+
+    def test_gc_quiescent_jobs_flips_long_idle(self):
+        reg = JobRegistry()
+        reg.register_program("agent-1", 5.0)
+        reg.admit_to_job("agent-1", 5.0, "rid-a")
+        reg.record_completion("rid-a")
+        job = reg.job_for_id("agent-1")
+        self.assertNotEqual(job.state, JobState.COMPLETE)
+        # Force last_update_ts to be old.
+        job.last_update_ts = time.monotonic() - 100.0
+        flipped = reg.gc_quiescent_jobs(quiescent_seconds=1.0)
+        self.assertEqual(flipped, 1)
+        self.assertEqual(job.state, JobState.COMPLETE)
+
+    def test_gc_quiescent_jobs_skips_in_flight(self):
+        """A job with active in-flight requests must not be force-completed
+        even if last_update_ts is old (e.g. a long slow generation)."""
+        reg = JobRegistry()
+        reg.register_program("agent-1", 5.0)
+        reg.admit_to_job("agent-1", 5.0, "rid-a")
+        job = reg.job_for_id("agent-1")
+        job.last_update_ts = time.monotonic() - 1000.0  # very stale
+        flipped = reg.gc_quiescent_jobs(quiescent_seconds=1.0)
+        self.assertEqual(flipped, 0)
+        self.assertNotEqual(job.state, JobState.COMPLETE)
+
+    def test_gc_quiescent_disabled_when_zero(self):
+        reg = JobRegistry()
+        reg.register_program("agent-1", 5.0)
+        reg.admit_to_job("agent-1", 5.0, "rid-a")
+        reg.record_completion("rid-a")
+        job = reg.job_for_id("agent-1")
+        job.last_update_ts = time.monotonic() - 1000.0
+        self.assertEqual(reg.gc_quiescent_jobs(quiescent_seconds=0.0), 0)
+        self.assertNotEqual(job.state, JobState.COMPLETE)
 
     def test_gc_idle_programs_disabled_when_zero(self):
         reg = JobRegistry()
@@ -370,6 +443,21 @@ class TestHaloController(unittest.TestCase):
         time.sleep(0.005)
         c.tick(build_infos=lambda: [])
         self.assertIsNone(c.registry.job_for_id("agent-1"))
+
+    def test_on_request_finished_with_halo_job_done_signal(self):
+        """Client sends halo_job_done=True on the last call → controller
+        flips the job to COMPLETE on its finish hook."""
+        c = HaloController(self._config(), is_rank0=True)
+        c.register_program("agent-1", slo=2.0, total_calls=3)
+        c.register_request(rid="rid-a", halo_job_id="agent-1", halo_slo=2.0)
+        # Plain finish — state stays RUNNING/QUEUED.
+        c.on_request_finished("rid-a", halo_job_done=False)
+        job = c.registry.job_for_id("agent-1")
+        self.assertNotEqual(job.state, JobState.COMPLETE)
+        # Now the last call comes with halo_job_done=True.
+        c.register_request(rid="rid-b", halo_job_id="agent-1", halo_slo=2.0)
+        c.on_request_finished("rid-b", halo_job_done=True)
+        self.assertEqual(job.state, JobState.COMPLETE)
 
     def test_halo_bypass_field_does_not_affect_controller(self):
         """halo_bypass is a scheduler-level concern (skip the gate). The

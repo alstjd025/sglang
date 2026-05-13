@@ -1023,6 +1023,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 halo_job_id=obj.halo_job_id,
                 halo_slo=obj.halo_slo,
                 halo_bypass=obj.halo_bypass,
+                halo_job_done=obj.halo_job_done,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,

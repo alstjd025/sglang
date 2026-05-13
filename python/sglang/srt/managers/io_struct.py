@@ -239,6 +239,12 @@ class GenerateReqInput(BaseReq):
     # leave this False — it's not a security boundary, just a way to mark
     # server-emitted requests as "not real user traffic".
     halo_bypass: bool = False
+    # HALO: explicit "this is the last LLM call of the job" signal. When
+    # true, the server marks the owning job COMPLETE on this request's
+    # finish so it can be GC'd. Decouples job termination from "remaining
+    # call count == 0", which is fragile when DAGs are dynamic (tool
+    # delays, conditional branches, parallel rounds). See halo_api_reference.md.
+    halo_job_done: bool = False
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -702,6 +708,7 @@ class GenerateReqInput(BaseReq):
             halo_job_id=self.halo_job_id,
             halo_slo=self.halo_slo,
             halo_bypass=self.halo_bypass,
+            halo_job_done=self.halo_job_done,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -793,6 +800,7 @@ class TokenizedGenerateReqInput(BaseReq):
     halo_job_id: Optional[str] = None
     halo_slo: Optional[float] = None
     halo_bypass: bool = False
+    halo_job_done: bool = False
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False

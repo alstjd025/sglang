@@ -115,23 +115,32 @@ class Job:
     def on_request_completed(self, rid: str) -> None:
         """Called when a request finishes (success or abort).
 
-        Only mark the job COMPLETE when every expected call has actually
-        been admitted (or, for jobs registered without total_calls_expected,
-        when no in-flight request remains and there's no expected count to
-        wait for). Otherwise a chain with gaps between calls — e.g.
-        parallel_tool_delay's round → tool_delay → next round — would
-        flip to COMPLETE during the delay, get GC'd by gc_completed after
-        retain_seconds, and reject the next round's calls with
-        HALO_PROGRAM_NOT_REGISTERED. See ms_dev/halo_dev/CLAUDE.md.
+        Decouples *call finish* from *job finish*. A chain with gaps
+        between calls (tool delays, conditional branches, parallel
+        rounds…) may have `remaining_request_number == 0` repeatedly
+        during its lifetime without the job itself being done — so we
+        do NOT auto-flip to COMPLETE here. The job's state moves to
+        COMPLETE only when one of:
+          - the client sends `halo_job_done=true` on a chat.completions
+            request → `mark_done()` is called from the finish hook
+          - the quiescent safety net (`gc_quiescent_jobs`) trips
+        See ms_dev/halo_dev/halo_api_reference.md.
         """
         self.request_ids.discard(rid)
         if self.remaining_request_number > 0:
             self.remaining_request_number -= 1
         self.last_update_ts = _now_monotonic()
-        if self.remaining_request_number == 0 and not self.request_ids:
-            expected = self.total_calls_expected
-            if expected is None or self.total_request_number >= expected:
-                self.state = JobState.COMPLETE
+        # NOTE: deliberately NOT transitioning to COMPLETE here.
+
+    def mark_done(self) -> None:
+        """Explicit client-side termination signal — see
+        halo_api_reference.md (`halo_job_done` body field).
+
+        Sets state to COMPLETE regardless of in-flight count. The next
+        `gc_completed` sweep will GC the job after retain_seconds.
+        """
+        self.last_update_ts = _now_monotonic()
+        self.state = JobState.COMPLETE
 
     def record_sweep(self, max_ratio: float, mean_ratio: float) -> None:
         """Called from SlowdownTracker after each periodic sweep."""
