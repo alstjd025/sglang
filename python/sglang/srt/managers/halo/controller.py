@@ -311,9 +311,23 @@ class HaloController:
         owning job COMPLETE *before* record_completion pops the rid→job
         mapping (otherwise mark_job_done can't look up the job). Then
         decrement counters as normal.
+
+        Emits a `job_complete` row to the JSONL job log so the
+        termination is observable even when the COMPLETE state doesn't
+        survive long enough to be captured by the periodic sweep
+        snapshot (retain_seconds < job_log_interval_seconds).
         """
         if halo_job_done:
-            self.registry.mark_job_done(rid)
+            job = self.registry.mark_job_done(rid)
+            if job is not None and self._log is not None:
+                self._log.write(
+                    {
+                        "ts": time.monotonic(),
+                        "event": "job_complete",
+                        "reason": "halo_job_done",
+                        "job": job.to_dict(),
+                    }
+                )
         self.registry.record_completion(rid)
 
     # ------------------------------------------------------------------
@@ -361,7 +375,20 @@ class HaloController:
         # Safety net BEFORE gc_completed: any job that's been quiescent
         # (no in-flight + no recent update) gets flipped to COMPLETE.
         # Then gc_completed picks them up after retain_seconds.
-        self.registry.gc_quiescent_jobs(self.config.quiescent_timeout_seconds)
+        flipped = self.registry.gc_quiescent_jobs(
+            self.config.quiescent_timeout_seconds
+        )
+        if self._log is not None and flipped:
+            ts = time.monotonic()
+            for job in flipped:
+                self._log.write(
+                    {
+                        "ts": ts,
+                        "event": "job_complete",
+                        "reason": "quiescent_timeout",
+                        "job": job.to_dict(),
+                    }
+                )
         # GC completed jobs older than retain window — bounded memory.
         self.registry.gc_completed(self.config.gc_retain_seconds)
         # Q13: drop pre-registered programs that never received a request.

@@ -35,7 +35,7 @@ python3 ms_dev/expctl/run_experiment.py --mode single
 | `--halo-prefill-cost-model-path` | unset | Same JSON schema as admission_control's prefill cost model |
 | `--halo-tbt-cost-model-path` | unset | Same for TBT |
 | `--halo-program-idle-timeout-seconds` | `300` | Pre-registered programs that never receive a request get GC'd after this many seconds. `0` disables idle GC |
-| `--halo-job-log-interval-seconds` | `10` | How often (seconds) `halo_jobs.jsonl` gets a full active-jobs snapshot. Slowdown sweep + Prometheus gauges still tick at `--halo-tick-interval-ms`; only the verbose JSONL log is throttled. `0` reverts to per-sweep logging |
+| `--halo-job-log-interval-seconds` | `10` | How often (seconds) `halo_jobs.jsonl` gets a full active-jobs snapshot. Slowdown sweep + Prometheus gauges still tick at `--halo-tick-interval-ms`; only the verbose JSONL log is throttled. `0` reverts to per-sweep logging. Note: `event=register_program` and `event=job_complete` rows are emitted immediately regardless of this interval |
 | `--halo-quiescent-timeout-seconds` | `300` | Safety net for jobs the client never closes with `halo_job_done=true`. A job with zero in-flight requests and no admit/finish activity for this many seconds is force-flipped to COMPLETE (then GC'd after retain_seconds). Tune up for workloads with legitimately long mid-chain waits (human-in-the-loop, external API). `0` disables |
 
 ### Env-var equivalents (translated to flags by `lib_server.sh::append_halo_args`)

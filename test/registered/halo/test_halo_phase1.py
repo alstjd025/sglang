@@ -255,7 +255,8 @@ class TestJobRegistry(unittest.TestCase):
         # Force last_update_ts to be old.
         job.last_update_ts = time.monotonic() - 100.0
         flipped = reg.gc_quiescent_jobs(quiescent_seconds=1.0)
-        self.assertEqual(flipped, 1)
+        self.assertEqual(len(flipped), 1)
+        self.assertIs(flipped[0], job)
         self.assertEqual(job.state, JobState.COMPLETE)
 
     def test_gc_quiescent_jobs_skips_in_flight(self):
@@ -267,7 +268,7 @@ class TestJobRegistry(unittest.TestCase):
         job = reg.job_for_id("agent-1")
         job.last_update_ts = time.monotonic() - 1000.0  # very stale
         flipped = reg.gc_quiescent_jobs(quiescent_seconds=1.0)
-        self.assertEqual(flipped, 0)
+        self.assertEqual(flipped, [])
         self.assertNotEqual(job.state, JobState.COMPLETE)
 
     def test_gc_quiescent_disabled_when_zero(self):
@@ -277,7 +278,7 @@ class TestJobRegistry(unittest.TestCase):
         reg.record_completion("rid-a")
         job = reg.job_for_id("agent-1")
         job.last_update_ts = time.monotonic() - 1000.0
-        self.assertEqual(reg.gc_quiescent_jobs(quiescent_seconds=0.0), 0)
+        self.assertEqual(reg.gc_quiescent_jobs(quiescent_seconds=0.0), [])
         self.assertNotEqual(job.state, JobState.COMPLETE)
 
     def test_gc_idle_programs_disabled_when_zero(self):
@@ -458,6 +459,35 @@ class TestHaloController(unittest.TestCase):
         c.register_request(rid="rid-b", halo_job_id="agent-1", halo_slo=2.0)
         c.on_request_finished("rid-b", halo_job_done=True)
         self.assertEqual(job.state, JobState.COMPLETE)
+
+    def test_jsonl_emits_job_complete_event_on_done_signal(self):
+        """The job_complete row in halo_jobs.jsonl with reason=halo_job_done
+        is what makes job termination visible to post-hoc analysis even
+        when the COMPLETE state doesn't survive the next sweep snapshot."""
+        import os
+        import tempfile
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "halo_jobs.jsonl")
+            c = HaloController(
+                self._config(job_log_path=path), is_rank0=True
+            )
+            c.register_program("agent-1", slo=2.0, total_calls=2)
+            c.register_request(rid="rid-a", halo_job_id="agent-1", halo_slo=2.0)
+            c.on_request_finished("rid-a", halo_job_done=True)
+            c.close()  # flush
+            with open(path) as f:
+                events = [_json.loads(l) for l in f]
+        kinds = [e.get("event") for e in events]
+        self.assertIn("register_program", kinds)
+        self.assertIn("job_complete", kinds)
+        # The complete event carries reason and a job dict.
+        completes = [e for e in events if e.get("event") == "job_complete"]
+        self.assertEqual(len(completes), 1)
+        self.assertEqual(completes[0]["reason"], "halo_job_done")
+        self.assertEqual(completes[0]["job"]["job_id"], "agent-1")
+        self.assertEqual(completes[0]["job"]["state"], "complete")
 
     def test_halo_bypass_field_does_not_affect_controller(self):
         """halo_bypass is a scheduler-level concern (skip the gate). The

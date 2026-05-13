@@ -218,7 +218,7 @@ class JobRegistry:
             self._jobs.pop(jid, None)
         return len(to_drop)
 
-    def gc_quiescent_jobs(self, quiescent_seconds: float) -> int:
+    def gc_quiescent_jobs(self, quiescent_seconds: float) -> List[Job]:
         """Safety net for jobs whose client never sent `halo_job_done`.
 
         Marks any QUEUED/RUNNING job as COMPLETE when its last_update_ts
@@ -233,12 +233,13 @@ class JobRegistry:
           - misconfigured workload
 
         `quiescent_seconds <= 0` disables this fallback. Returns the
-        count of jobs flipped to COMPLETE.
+        list of jobs that were just flipped so the caller (controller)
+        can emit a `job_complete` log row for each.
         """
         if quiescent_seconds <= 0:
-            return 0
+            return []
         now = _now_monotonic()
-        flipped = 0
+        flipped: List[Job] = []
         for job in self._jobs.values():
             if (
                 job.state in (JobState.QUEUED, JobState.RUNNING)
@@ -253,7 +254,7 @@ class JobRegistry:
                     job.job_id, quiescent_seconds,
                 )
                 job.mark_done()
-                flipped += 1
+                flipped.append(job)
         return flipped
 
     def gc_idle_programs(self, idle_seconds: float) -> int:

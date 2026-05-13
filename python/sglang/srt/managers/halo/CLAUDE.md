@@ -196,6 +196,22 @@ JSONL job log writes and any Prometheus counters initialized only when
 `getattr(self, "attn_tp_rank", 0) == 0`. Other ranks construct
 `HaloController` but with the log/metrics path nulled so they no-op.
 
+## JSONL job log (`halo_jobs.jsonl`)
+
+Per-sweep snapshot is throttled to `--halo-job-log-interval-seconds` (default
+10s) to keep the file small. Three event kinds:
+
+| Event | When emitted | Throttled by interval? |
+|---|---|---|
+| `register_program` | client successful `POST /halo/programs` | no — emitted immediately |
+| (sweep) `{"ts", "active_jobs": [...]}` | every tick after interval window | yes — every 10s |
+| `job_complete` (reason=`halo_job_done`) | client sends `halo_job_done=true` on the last call's body | no — emitted from finish hook |
+| `job_complete` (reason=`quiescent_timeout`) | safety-net fallback: a job had no admit/finish for `--halo-quiescent-timeout-seconds` | no — emitted from tick after registry GC |
+
+The `job_complete` row carries the Job.to_dict() at termination time, so
+post-hoc analysis sees the final state even when the COMPLETE→GC pair
+happens between two sweep snapshots.
+
 ## Prometheus metrics
 
 `managers/halo/metrics.py::HaloMetrics`. Installed by `scheduler.init_halo`
