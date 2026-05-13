@@ -902,3 +902,68 @@ f25fd41ea 에서 `total_calls_expected` 만큼 admit 됐을 때만 COMPLETE 로 
 - gap (tool_delay) 길이 무관 — quiescent 까지는 안전
 - dynamic DAG 도 wiring 가능 (마지막 call 시점에 client 가 결정)
 - 안전망: quiescent timeout 으로 client crash 케이스 대비
+
+## 18. Open issue — TBT cost-model cliff (follow-up to §2 Q2)
+
+§2 Q2 의 짧은 메모와 `runtime/cost_models/README.md` item 3, `managers/halo/CLAUDE.md`
+"Cost model brittleness inherited" 의 통합 follow-up. **A, B 검증이 끝난 뒤 별도
+트랙으로 진행**.
+
+### 증상 정량 (260512_2159 세션 측정)
+
+| 항목 | 값 |
+|---|---|
+| 실측 TBT mean (λ=0.3 부하, parallel_tool_delay) | **50.8 ms** |
+| TBT cost-model 예측 @ batch=1, kv=2000 | **11.4 ms** |
+| 예측/실측 비율 | **~22 %** — model이 ~5x underestimate |
+
+현재 식 `tbt_ms ≈ a + b·batch_size + c·per_req_kv`, fit 결과
+`a=9.25, b=0.066, c=0.00105`. per_req_kv 가 0~5000 사이면 출력이 9~14ms 좁은
+구간에 평탄 — **부하 변화에 거의 무반응 (cliff)**. 결과적으로 Halo slowdown
+ratio = actual / predicted 가 인플레이션.
+
+### 모델이 못 잡는 변수 (검토 후보, 영향 큰 순)
+
+| 변수 | 왜 영향 큰가 | 가용성 |
+|---|---|---|
+| **total_batch_kv** (running batch 모든 req KV 합) | Attention 은 batch 전체 KV 메모리에서 동시에 읽음 — 메모리 BW 가 *합* 에 종속 | scheduler 에서 직접 가능 (already aggregated in `_halo_build_request_execution_infos`) |
+| **num_running_reqs** | TBT compute = kernel launch + sched + attn 병렬도 — *batch size 의 초선형* | `running_batch.reqs` |
+| **max_seqlen** | 일부 attention kernel 은 max KV 에 padding/chunking → max 에 종속 | running batch max |
+| **num_prefill_in_progress** (chunked-prefill 토큰) | prefill 이 같은 GPU 의 decode time 을 훔침 — 무시 못 함 | scheduler chunked-prefill state |
+| **GPU mem saturation (token_usage_pct)** | 일정 임계 넘으면 swap/evict → 갑작스런 TBT cliff (진짜 cliff) | mem pool |
+| **spec-decoding accept rate** | spec 켰을 때 평균 TBT 가 accept rate 에 강하게 종속 | spec stats |
+
+### 데이터 수집 옵션 (3 가지)
+
+| 방식 | 설명 | 장 | 단 |
+|---|---|---|---|
+| **(α) workload-driven calibration** | baseline + load run 의 실측 TBT 와 scheduler batch composition 시계열을 같이 기록 → offline regression | 본 workload 에 fit. 빠른 적용 | 일반화 약함 |
+| **(β) grid 확장 + 다변수** | `tools/admission_control/fit_cost_model.py` 의 controlled grid 에 multi-req 시나리오 추가 | 일반화 좋음 | 학습 시간 길음 (몇 시간) + grid 설계 부담 |
+| **(γ) per-step instrumentation** | scheduler 가 step 마다 `(num_running, total_kv, max_kv, prefill_tokens, measured_tbt)` 5-tuple 기록 (rank-0) → run 후 fit_cost_model.py 가 regression | 자동. 운용 부담 적음. 실험 부하 시점 분포에 정확 fit | 새 instrumentation 필요 (40 LoC) |
+
+추천: **(γ)** — 새 instrumentation 인 만큼 phase 2 cost-model refit 의 기반이 되고
+admission_control 의 TBT EWMA tracker 와도 자연 통합 가능.
+
+### 현실적 대안 — model-less baseline TBT
+
+baseline run (concurrency=1) 의 측정 TBT 통계를 직접 사용:
+```
+solo_tbt_ms = baseline_run.tbt_mean_ms_for_this_workload
+```
+- 장: 즉시 정확 (실측 자체). cliff 없음. ~10 LoC.
+- 단: workload-specific. 새 workload 면 새 baseline 필요. 일반 모델 학습 회피.
+
+Phase 1 의 *짧은* 대안. (γ) 가 무거우면 임시 (α) 또는 model-less 로 가도 됨.
+
+### Action items (사용자 컨펌 후)
+
+- [ ] C1: 변수 후보 중 어디까지 추가? (추천: total_batch_kv, num_running_reqs, max_seqlen, prefill_tokens 4개)
+- [ ] C2: 모델 형태 — 다중선형만 / 분할선형 / lookup? (추천: 다중선형 먼저 → 잔차 보고)
+- [ ] C3: 데이터 수집 — α / β / γ / model-less? (추천: γ)
+- [ ] C4: 진행 시점 — Halo A·B 검증 후 (현재 결정: A·B 먼저)
+
+이 자료는 Halo Phase 1 의 *알려진 한계* 로 표시되어 있음:
+- `python/sglang/srt/managers/halo/CLAUDE.md` "Cost model brittleness inherited"
+- `python/sglang/srt/managers/halo/slowdown_tracker.py` 모듈 docstring
+- `ms_dev/runtime/cost_models/README.md` item 3
+- `ms_dev/halo_dev/CLAUDE.md` §2 Q2 (의사결정 노트) + 이 §18 (follow-up 정량 + 옵션)
