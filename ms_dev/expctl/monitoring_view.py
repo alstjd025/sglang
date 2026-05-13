@@ -1004,6 +1004,16 @@ def render_status_single(
     server_halo_rejected = metric_value(
         server, "sglang:halo_requests_rejected_total"
     )
+    # Split by reason so the panel distinguishes "no job_id field" from
+    # "job_id present but program not pre-registered" (very different
+    # client-side bugs).
+    server_halo_rejected_no_id = series_sum(
+        server, "sglang:halo_requests_rejected_total", "reason", "HALO_NO_JOB_ID"
+    )
+    server_halo_rejected_not_reg = series_sum(
+        server, "sglang:halo_requests_rejected_total", "reason",
+        "HALO_PROGRAM_NOT_REGISTERED",
+    )
 
     lines = []
     lines.append(colorize("=" * 118, "muted", use_color))
@@ -1163,6 +1173,14 @@ def render_status_single(
         rejected_int = (
             int(server_halo_rejected) if server_halo_rejected is not None else None
         )
+        rej_no_id_int = (
+            int(server_halo_rejected_no_id)
+            if server_halo_rejected_no_id is not None else None
+        )
+        rej_not_reg_int = (
+            int(server_halo_rejected_not_reg)
+            if server_halo_rejected_not_reg is not None else None
+        )
         violations_int = (
             int(server_halo_violations) if server_halo_violations is not None else None
         )
@@ -1170,6 +1188,9 @@ def render_status_single(
         def _fmt_x(v):
             return "-" if v is None else f"{v:.2f}x"
 
+        # Row 1 — Halo fleet shape. Prefix every label with "halo_" so the
+        # panel reader can't confuse them with the admission_control row
+        # right above (which has its own "admit"/"reject" counters).
         lines.append(
             "        "
             + metric_row(
@@ -1178,42 +1199,60 @@ def render_status_single(
                         active_int, fmt_int(active_int),
                         warn=64, bad=256, enabled=use_color,
                     )),
-                    ("known", fmt_int(total_known_int)),
-                    ("registered", fmt_int(reg_int)),
-                    ("admitted", fmt_int(admitted_int)),
-                    ("rejected", color_high_bad(
+                    ("halo_known", fmt_int(total_known_int)),
+                    ("halo_registered", fmt_int(reg_int)),
+                    ("halo_admitted", fmt_int(admitted_int)),
+                    ("halo_rejected", color_high_bad(
                         rejected_int, fmt_int(rejected_int),
                         warn=1, bad=100, enabled=use_color,
                     )),
                 ],
-                label_width=11,
+                label_width=15,
+            )
+        )
+        # Row 1b — Halo reject by reason (only meaningful when total > 0;
+        # otherwise show zeros so the panel stays stable).
+        lines.append(
+            "        "
+            + metric_row(
+                [
+                    ("halo_rej_no_id", color_high_bad(
+                        rej_no_id_int, fmt_int(rej_no_id_int),
+                        warn=1, bad=100, enabled=use_color,
+                    )),
+                    ("halo_rej_not_reg", color_high_bad(
+                        rej_not_reg_int, fmt_int(rej_not_reg_int),
+                        warn=1, bad=100, enabled=use_color,
+                    )),
+                ],
+                label_width=17,
             )
         )
         lines.append(
             "        "
             + metric_row(
                 [
-                    ("mean_smax", color_high_bad(
+                    ("halo_mean_smax", color_high_bad(
                         server_halo_mean_smax,
                         _fmt_x(server_halo_mean_smax),
                         warn=2.0, bad=3.0, enabled=use_color,
                     )),
-                    ("mean_smean", color_high_bad(
+                    ("halo_mean_smean", color_high_bad(
                         server_halo_mean_smean,
                         _fmt_x(server_halo_mean_smean),
                         warn=2.0, bad=3.0, enabled=use_color,
                     )),
-                    ("worst_smax", color_high_bad(
+                    ("halo_worst_smax", color_high_bad(
                         server_halo_max_smax,
                         _fmt_x(server_halo_max_smax),
                         warn=3.0, bad=5.0, enabled=use_color,
                     )),
-                    ("slo_violations", color_high_bad(
+                    ("halo_slo_violations", color_high_bad(
                         violations_int, fmt_int(violations_int),
                         warn=1, bad=50, enabled=use_color,
                     )),
                 ],
-                label_width=15,
+                label_width=19,
             )
         )
 
