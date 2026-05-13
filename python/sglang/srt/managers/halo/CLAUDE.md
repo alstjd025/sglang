@@ -85,7 +85,10 @@ managers/halo/
 ├── job.py                  # Job dataclass + JobState enum
 ├── job_registry.py         # JobRegistry: rid↔job, lifecycle
 ├── slowdown_tracker.py     # sweep() — compute per-request ratios, aggregate to job
-└── controller.py           # HaloController: on/off, hook into scheduler
+├── controller.py           # HaloController: on/off, hook into scheduler
+└── cost_model_sampler.py   # per-step JSONL sampler for fitting the Halo Step Cost Model
+                            # (rank-0, background flusher thread, no-op when path unset).
+                            # See ms_dev/halo_dev/prediction_model.md.
 ```
 
 ## Class summary
@@ -132,6 +135,17 @@ prediction range (~55 ms regardless of batch composition — see
 `ms_dev/runtime/cost_models/README.md` item 3). That means `solo_tbt_ms`
 under-discriminates context, which propagates to slowdown estimates. Phase 1 ships
 this as a known limitation; Phase 2 work should refine the cost model first.
+
+**Halo Step Cost Model (post-Phase-1 follow-up, in progress)**: a 6-coefficient
+per-step regression that replaces the `per_req_kv` reparam (root cause of the
+cliff) with a batch-summed `Σrⱼ` plus prefill cross-term `Σ(nᵢ·rᵢ)`. It loads
+from `--halo-step-cost-model-path` and, when present, the tracker swaps to it
+automatically; otherwise the legacy two-model path is used. Full design (each
+term's physical meaning, JSON schema, instrumentation, fit procedure, file
+changes, and PR-sized rollout order) is in
+[`ms_dev/halo_dev/prediction_model.md`](../../../../../ms_dev/halo_dev/prediction_model.md)
+with a one-page summary at
+[`ms_dev/halo_dev/CLAUDE.md`](../../../../../ms_dev/halo_dev/CLAUDE.md) §20.
 
 ## CLI flags + endpoint surface
 

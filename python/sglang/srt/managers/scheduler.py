@@ -99,6 +99,7 @@ from sglang.srt.managers.halo import (
     HaloRejectError,
     RequestExecutionInfo,
     build_halo_controller_from_server_args,
+    build_halo_cost_sampler_from_server_args,
 )
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -1289,6 +1290,14 @@ class Scheduler(
                 labels=self.metrics_collector.labels
             )
 
+        # Halo Step Cost Model sampler — independent of the controller. When
+        # --halo-cost-model-sample-log is unset, the factory returns None and
+        # the event-loop hook short-circuits on `is None`. Rank-0 only.
+        # See ms_dev/halo_dev/prediction_model.md.
+        self.halo_cost_sampler = build_halo_cost_sampler_from_server_args(
+            sa, getattr(self, "attn_tp_rank", 0)
+        )
+
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
@@ -1643,8 +1652,20 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                # Halo cost-model sampler: measure wall-clock step time when
+                # enabled. `is None` short-circuit when sampler is off.
+                # See managers/halo/cost_model_sampler.py.
+                step_t0 = (
+                    time.perf_counter()
+                    if self.halo_cost_sampler is not None
+                    else None
+                )
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                if self.halo_cost_sampler is not None:
+                    self.halo_cost_sampler.observe_step(
+                        batch, (time.perf_counter() - step_t0) * 1000.0
+                    )
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
@@ -1661,6 +1682,21 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        # Halo cost-model sampler: overlap mode makes per-iteration wall-clock
+        # an inaccurate proxy for forward step latency (CPU is pipelined with
+        # GPU). Disable the sampler here and tell the operator to re-run with
+        # --disable-overlap-schedule if they want fit data. See
+        # managers/halo/cost_model_sampler.py.
+        if self.halo_cost_sampler is not None:
+            logger.warning(
+                "halo cost-model sampler: disabled because the scheduler is "
+                "running in overlap mode (per-iteration timing is not a valid "
+                "step-latency measurement). Re-run with "
+                "--disable-overlap-schedule to collect fit data."
+            )
+            self.halo_cost_sampler.close()
+            self.halo_cost_sampler = None
+
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()

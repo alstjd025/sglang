@@ -1,13 +1,24 @@
 """SlowdownTracker — periodic per-request slowdown sweep + per-job aggregation.
 
-See managers/halo/CLAUDE.md.
+See managers/halo/CLAUDE.md and ms_dev/halo_dev/prediction_model.md.
 """
 
 # HALO: Phase 1 slowdown derivation.
 #
-# Per-request slowdown = actual_elapsed_ms / solo_run_elapsed_ms, where
-#   solo_prefill_ms = prefill_cost.estimate_ms(prompt_len, prefix_len_at_admission)
-#   solo_tbt_ms     = tbt_cost.estimate_ms(batch_size=1, per_req_kv=current_kv_len)
+# Per-request slowdown = actual_elapsed_ms / solo_run_elapsed_ms.
+#
+# Two paths for the solo estimate, chosen by which cost model is loaded:
+#
+#   (A) Halo Step Cost Model (new — see prediction_model.md). When present, it
+#       supersedes the legacy two-model path.
+#         solo_prefill_ms = step_cost.estimate_solo_prefill_total_ms(n, r)
+#         solo_tbt_ms     = step_cost.estimate_solo_tbt_ms(r_now)
+#
+#   (B) Legacy Mooncake-like pair. When step_cost is None and at least one of
+#       the legacy models is loaded:
+#         solo_prefill_ms = prefill_cost.estimate_ms(prompt_len, prefix_len)
+#         solo_tbt_ms     = tbt_cost.estimate_ms(batch_size=1, per_req_kv=r_now)
+#
 #   solo_elapsed_ms = solo_prefill_ms + solo_tbt_ms * decoded_tokens_so_far
 #
 # Per-job aggregation: max + mean over its active requests (both kept on Job).
@@ -19,9 +30,9 @@ See managers/halo/CLAUDE.md.
 #   - When decoded_tokens_so_far == 0 (still in prefill), solo_elapsed_ms is just
 #     solo_prefill_ms; if actual_elapsed is also small the ratio is noisy. We
 #     guard with MIN_SOLO_MS and MIN_DECODED_BEFORE_TRUST.
-#   - The TBT cost model's narrow prediction range (~55ms regardless of batch
-#     composition) means solo_tbt_ms under-discriminates — slowdown estimates
-#     inherit this brittleness. Documented in cost_models/README.md.
+#   - The legacy TBT model has a narrow prediction range (~55ms regardless of
+#     batch composition) — see cost_models/README.md §3. That's the original
+#     motivation for path (A); see ms_dev/halo_dev/prediction_model.md §1.
 
 from __future__ import annotations
 
@@ -31,6 +42,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from sglang.srt.managers.admission_control.cost_model import (
+    HaloStepCostModel,
     PrefillCostModel,
     TBTCostModel,
 )
@@ -59,9 +71,13 @@ class SlowdownTracker:
     """Pure compute. Given execution infos and the job registry, updates each
     affected Job's slowdown_max / slowdown_mean.
 
-    A `None` cost model means the corresponding term is treated as zero —
-    if both are None, the tracker is a no-op (the controller logs WARN once
-    at startup so this isn't silent in production).
+    Cost-model selection (mutually exclusive at construction time):
+      - `step_cost` not None         → Halo Step Cost Model path (new).
+      - `step_cost` None, legacy set → legacy two-model path (Phase 1).
+      - All three None               → no-op tracker.
+
+    The controller is responsible for not passing both. If a caller does pass
+    all three, `step_cost` wins and the legacy pair is ignored.
     """
 
     def __init__(
@@ -69,29 +85,46 @@ class SlowdownTracker:
         prefill_cost: Optional[PrefillCostModel],
         tbt_cost: Optional[TBTCostModel],
         registry: JobRegistry,
+        step_cost: Optional[HaloStepCostModel] = None,
     ) -> None:
         self.prefill_cost = prefill_cost
         self.tbt_cost = tbt_cost
+        self.step_cost = step_cost
         self.registry = registry
+
+    @property
+    def has_cost_model(self) -> bool:
+        """True when any cost model is loaded — used by introspection and tests."""
+        return (
+            self.step_cost is not None
+            or self.prefill_cost is not None
+            or self.tbt_cost is not None
+        )
 
     # ---- per-request ----
 
     def compute_request_slowdown(self, info: RequestExecutionInfo) -> Optional[float]:
-        """Returns the slowdown ratio or None if both cost models are unavailable."""
-        if self.prefill_cost is None and self.tbt_cost is None:
-            return None
-
-        solo_prefill_ms = 0.0
-        if self.prefill_cost is not None:
-            solo_prefill_ms = self.prefill_cost.estimate_ms(
+        """Returns the slowdown ratio or None if no cost model is loaded."""
+        if self.step_cost is not None:
+            solo_prefill_ms = self.step_cost.estimate_solo_prefill_total_ms(
                 info.prompt_len, info.prefix_len_at_admission
             )
-
-        solo_tbt_ms = 0.0
-        if self.tbt_cost is not None:
-            solo_tbt_ms = self.tbt_cost.estimate_ms(
-                batch_size=1, per_req_kv=max(info.kv_len_now, 0)
+            solo_tbt_ms = self.step_cost.estimate_solo_tbt_ms(
+                max(info.kv_len_now, 0)
             )
+        elif self.prefill_cost is not None or self.tbt_cost is not None:
+            solo_prefill_ms = 0.0
+            if self.prefill_cost is not None:
+                solo_prefill_ms = self.prefill_cost.estimate_ms(
+                    info.prompt_len, info.prefix_len_at_admission
+                )
+            solo_tbt_ms = 0.0
+            if self.tbt_cost is not None:
+                solo_tbt_ms = self.tbt_cost.estimate_ms(
+                    batch_size=1, per_req_kv=max(info.kv_len_now, 0)
+                )
+        else:
+            return None
 
         solo_total_ms = solo_prefill_ms + solo_tbt_ms * max(
             info.decoded_tokens_so_far, 0

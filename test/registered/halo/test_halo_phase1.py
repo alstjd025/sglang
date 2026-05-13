@@ -356,6 +356,68 @@ class TestSlowdownTracker(unittest.TestCase):
         tracker.sweep([info])  # no exception
         self.assertEqual(len(reg.all_jobs()), 0)
 
+    def test_step_cost_supersedes_legacy_when_both_provided(self):
+        """When step_cost is given, the legacy pair is ignored.
+
+        We make the legacy pair return a wildly different value from the step
+        model and verify the step model wins.
+        """
+        from sglang.srt.managers.admission_control.cost_model import (
+            HaloStepCostModel,
+        )
+        # Step model: solo_prefill = θ_c only, solo_tbt = θ_d2 + θ_c.
+        step = HaloStepCostModel(
+            theta_p1=0.0, theta_p2=0.0, theta_p3=0.0,
+            theta_d1=0.0, theta_d2=1.0, theta_c=99.0,
+        )
+        legacy_prefill, legacy_tbt = _make_cost_models()  # wildly different
+        reg = JobRegistry()
+        tracker = SlowdownTracker(
+            prefill_cost=legacy_prefill, tbt_cost=legacy_tbt,
+            registry=reg, step_cost=step,
+        )
+        info = RequestExecutionInfo(
+            rid="rid-a", job_id="agent-1", prompt_len=100,
+            prefix_len_at_admission=0, decoded_tokens_so_far=10,
+            kv_len_now=200, elapsed_ms=200.0,
+        )
+        # solo_prefill = 99 (θ_c). solo_tbt = 1 + 99 = 100.
+        # solo_total = 99 + 100*10 = 1099. ratio = 200/1099.
+        ratio = tracker.compute_request_slowdown(info)
+        self.assertAlmostEqual(ratio, 200.0 / 1099.0, places=6)
+
+    def test_step_cost_only_path_produces_finite_ratio(self):
+        """With only the step model loaded (no legacy), tracker still works."""
+        from sglang.srt.managers.admission_control.cost_model import (
+            HaloStepCostModel,
+        )
+        step = HaloStepCostModel(
+            theta_p1=1e-7, theta_p2=4e-7, theta_p3=0.08,
+            theta_d1=5e-5, theta_d2=0.3, theta_c=10.0,
+        )
+        reg = JobRegistry()
+        tracker = SlowdownTracker(
+            prefill_cost=None, tbt_cost=None,
+            registry=reg, step_cost=step,
+        )
+        info = RequestExecutionInfo(
+            rid="rid-a", job_id="agent-1", prompt_len=1000,
+            prefix_len_at_admission=500, decoded_tokens_so_far=20,
+            kv_len_now=1200, elapsed_ms=500.0,
+        )
+        # solo_prefill = 1e-7·1e6 + 4e-7·500000 + 0.08·1000 + 10
+        #             = 0.1 + 0.2 + 80 + 10 = 90.3
+        # solo_tbt    = 5e-5·1200 + 0.3 + 10 = 0.06 + 10.3 = 10.36
+        # solo_total  = 90.3 + 10.36·20 = 90.3 + 207.2 = 297.5
+        ratio = tracker.compute_request_slowdown(info)
+        self.assertAlmostEqual(ratio, 500.0 / 297.5, places=4)
+        self.assertTrue(tracker.has_cost_model)
+
+    def test_no_cost_models_has_cost_model_false(self):
+        reg = JobRegistry()
+        tracker = SlowdownTracker(None, None, reg)
+        self.assertFalse(tracker.has_cost_model)
+
 
 class TestHaloController(unittest.TestCase):
     def _config(self, **overrides) -> HaloConfig:
@@ -535,6 +597,47 @@ class TestFactory(unittest.TestCase):
         self.assertIsNotNone(c)
         self.assertEqual(c.config.default_slo, 4.0)
         self.assertEqual(c.config.program_idle_timeout_seconds, 200.0)
+
+    def test_step_cost_model_path_propagates_through_factory(self):
+        """End-to-end: server_args.halo_step_cost_model_path → HaloConfig →
+        loader → SlowdownTracker.step_cost."""
+        import os
+        import tempfile
+        from sglang.srt.managers.admission_control.cost_model import (
+            HaloStepCostModel,
+        )
+
+        # Write a valid step-cost JSON to disk.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "step.json")
+            HaloStepCostModel(
+                theta_p1=1e-7, theta_p2=4e-7, theta_p3=0.08,
+                theta_d1=5e-5, theta_d2=0.3, theta_c=10.0,
+            ).to_json(p)
+
+            class Args:
+                halo_enabled = True
+                halo_default_slo = 5.0
+                halo_tick_interval_ms = 100.0
+                halo_aggregator = "max+mean"
+                halo_job_log = None
+                # Legacy paths intentionally set to verify they get ignored.
+                halo_prefill_cost_model_path = "/does/not/exist/prefill.json"
+                halo_tbt_cost_model_path = "/does/not/exist/tbt.json"
+                halo_step_cost_model_path = p
+                halo_program_idle_timeout_seconds = 300.0
+
+            c = build_halo_controller_from_server_args(Args(), True)
+        self.assertIsNotNone(c)
+        # Step model loaded, legacy pair left None (their paths were ignored).
+        self.assertIsNotNone(c.tracker.step_cost)
+        self.assertIsNone(c.tracker.prefill_cost)
+        self.assertIsNone(c.tracker.tbt_cost)
+        # snapshot exposes the new flag.
+        snap = c.snapshot()
+        self.assertTrue(snap["cost_models_loaded"]["step"])
+        self.assertFalse(snap["cost_models_loaded"]["prefill"])
+        self.assertFalse(snap["cost_models_loaded"]["tbt"])
 
 
 if __name__ == "__main__":

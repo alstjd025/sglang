@@ -1008,7 +1008,7 @@ Phase 1 의 *짧은* 대안. (γ) 가 무거우면 임시 (α) 또는 model-less
 - `ms_dev/runtime/cost_models/README.md` item 3
 - `ms_dev/halo_dev/CLAUDE.md` §2 Q2 (의사결정 노트) + 이 §18 (follow-up 정량 + 옵션)
 
-## 19. 현재 상태 (2026-05-13) — 한 페이지 요약
+## 19. 현재 상태 (2026-05-14) — 한 페이지 요약
 
 > compaction 이후 새 context 에서 빠르게 catch-up 하기 위한 스냅샷.
 
@@ -1028,35 +1028,103 @@ Phase 1 의 *짧은* 대안. (γ) 가 무거우면 임시 (α) 또는 model-less
 
 ### 알려진 한계 (Phase 2 향)
 
-- **§18 cost-model cliff**: TBT 예측이 실측 대비 ~5x underestimate. slowdown ratio 가
-  부풀려져 보임 (실제 부하의 진짜 ratio 모름). Action items C1~C4 미결.
-- **Mass-job 분석 도구 없음**: 검증 1 (slowdown accuracy) 의 본 검증은 application
-  metrics.csv + halo_jobs.jsonl 조인 분석이 필요. 분석 스크립트 미작성.
+- **§18 cost-model cliff**: ✅ Halo Step Cost Model (split form, §17) 으로 **해소**.
+  옛 식 worst-case +89 % 인플레이션 → split 검증 (260513_2342 세션) 에서 -35 %
+  deflation 으로 균형. p90 은 +4 % 로 거의 정확. 분포 모양이 ground-truth 와
+  닮아짐. mean/p50 은 약간 보수적 (+17 % / +34 %) — Halo SLO 결정에는 안전한
+  방향 (false-negative 적음).
+  Validation 정량 + open question: [`prediction_model.md`](prediction_model.md) §17.
+- **Prefill 식 정확도는 sample 부족**: EXTEND step 645개로 fit 됨. V1 refit
+  (λ spectrum 확장 + 긴 sweep) 시 함께 개선될 가능성. 본 라운드에선 미진행.
+- **Mass-job 분석 도구 없음**: per-request ground-truth 비교를 일회용 inline
+  python 으로 수행 (§15·§17 표). 재사용 가능한 스크립트로는 미작성.
 - **R3 (scheduling)** 미구현 — Phase 2 작업.
 - **Multi-instance (PD/DP)**: Halo 는 단일 scheduler 가정. PD 모드에선 controller
   no-op + WARN. Phase 2 Conductor 단에 통합 필요.
 
-### Push 상태
+### Push 상태 (2026-05-14)
 
-- sglang `project-halo-phase1`: 26 commits **(push 안 됨)**
-- Agent_applications `project-halo-phase1-client`: 3 commits **(push 안 됨)**
+- sglang `project-halo-phase1`: 26 commits **이미 push 됨** + 본 라운드의 step-cost-model 작업
+  분량 누적 (commit 대기 중)
+- Agent_applications `project-halo-phase1-client`: 변경 없음 (client 측은 본 작업
+  영향 0 — server-side cost-model 만 바뀜)
 
-push 정책상 사용자가 직접 푸시. 정상 실험 머신에서 fetch 하려면 push 필요.
+push 정책상 사용자가 직접 푸시.
 
-### 사용자 결정 미결 항목
+### 사용자 결정 미결 항목 (2026-05-14 시점)
 
 | ID | 내용 | 컨텍스트 |
 |---|---|---|
-| **C1~C4** | Cost model 보강 — 변수 선택 / 모델 형태 / 데이터 수집 방식 / 진행 시점 | §18 |
-| **본 실험 디자인** | 더 긴 실험 (`--duration-min 60+`) 으로 검증 1 (slowdown accuracy) 본격 수집할지 | — |
-| **검증 1 분석 스크립트** | `verify_slowdown_vs_actual.py` 같은 application_jobs.csv ↔ halo_jobs.jsonl 조인 분석 도구 작성 시점 | `verify/CLAUDE.md` |
+| **V1 refit** | λ=[0.1, 0.3, 0.5, 0.7] × 30~60 min 데이터로 step model 재학습할지. Phase 2 R3 lookahead 가기 전 권장. | [`prediction_model.md`](prediction_model.md) §15 V1 |
+| **검증 1 분석 스크립트** | 재사용 가능한 `verify_slowdown_vs_actual.py` 작성 시점. 현재는 inline. | `verify/CLAUDE.md` |
+| **Phase 2 R3 진입 시점** | 현 split model 그대로 갈지 V1 refit 후 갈지 | §17 끝 |
 
 ### 다음 가능한 action 후보 (대화 재개 시)
 
-1. **(가장 자연)** §18 의 C1~C4 결정 받고 cost-model 작업 시작
-2. **검증 1 분석 도구** 작성 (cost-model 안 건드리고도 가능)
-3. **본 실험** 1시간 돌려 진짜 slowdown 분포 확보
-4. **Phase 2 admission decision** 작업 시작 (lookahead 등) — R3 영역
+1. **(끝남)** §20 / §17 — split form 채택, default 로 설정. 1차 라운드 완료.
+2. **V1 refit (선택, 권장)** — λ spectrum × 긴 sweep 으로 split model refit.
+   prefill 정확도 + tail 정확도 모두 추가 개선 여지. §15 V1.
+3. **Phase 2 R3 lookahead** — admission decision 작업 진입. V1 refit 안 거치고
+   가도 일단 split model 이 ground-truth 와 균형 잡힌 분포라 진행 가능.
+4. **commit + push** (사용자 직접) — 본 라운드의 모든 작업.
+
+---
+
+## 20. Halo Step Cost Model (§18 cliff 해결안)
+
+§18 cliff 를 해결하기 위한 새 cost-model 도입. **결정된 설계·식·변수 의미·
+fit 절차·변경 파일·단계별 실행 순서의 상세는 [`prediction_model.md`](prediction_model.md)** 에 정리. 본 절은 한눈에 보는 요약만.
+
+### 식 (한 step 회귀 대상, 6 계수)
+```
+T_step ≈ θ_p1·Σnᵢ² + θ_p2·Σ(nᵢ·rᵢ) + θ_p3·Σnᵢ
+       + θ_d1·Σrⱼ + θ_d2·bs_d + θ_c
+```
+- prefill 항: 새 토큰 self-attention(`Σnᵢ²`) + 새 토큰 × cached prefix cross-attention(`Σ(nᵢ·rᵢ)`) + FFN(`Σnᵢ`)
+- decode 항: 배치 KV 합산(`Σrⱼ`) + per-request 오버헤드(`bs_d`)
+- 옛 식과의 핵심 차이: decode 항이 `per_req_kv` (나눔) 대신 `Σrⱼ` (합산) — cliff 의 직접 원인 제거
+
+### 핵심 결정사항 (사용자 컨펌, 2026-05-13 → 14)
+
+| ID | 결정 |
+|---|---|
+| 모델 형태 | `HaloStepCostModel` — 두 form 지원: **unified (`halo_step_v1`, 6 계수)** + **split (`halo_step_split_v1`, 7 계수, MuxWise 원본 형태)** |
+| Form 선택 기준 | MIXED step 발생 시 unified, 없으면 split. 본 호스트 (mixed_chunk off) 에선 **split default 채택** (2026-05-14, ground-truth 검증 후 — [`prediction_model.md`](prediction_model.md) §17). `fit_halo_cost_model.py --form` default=`split`. `halo_observe_only.sh` 가 split JSON 을 default export. |
+| Solo vs batched | 같은 모델·계수, caller 가 입력 모드 선택. Halo R1 분모는 solo (1 요청 가정) |
+| `Σ(nᵢ·rᵢ)` cross-term | 포함 (cache hit ≥ 90% 워크로드라 비중 큼) |
+| Contention guard | 없음 (drift 보이면 추후 EWMA 보정 추가) |
+| 모듈 분리 | 안 함 — `admission_control/cost_model.py` 안에 `HaloStepCostModel` 추가 (옛 클래스 공존) |
+| Naming | "Halo Step Cost Model" (외부 시스템 이름 사용 안 함) |
+| admission_control 변경 | **이번 작업 범위 아님** — 옛 식 (Mooncake-like) 그대로 살아 있음. 미래 Phase 2 작업 |
+| Legacy 공존 | 새 path 있으면 new, 없으면 legacy 자동 fallback. 양 모드 다 유지 |
+
+### 단계별 실행 순서 (각 단계가 PR 한 개 단위)
+
+1. ✅ `HaloStepCostModel` 클래스 + loader + 단위 테스트
+2. ✅ per-step instrumentation (`--halo-cost-model-sample-log`) + 단위 테스트
+3. ✅ `tools/halo/fit_halo_cost_model.py` + JSONL fixture 단위 테스트
+4. ✅ Halo controller·tracker 로드/호출 분기 + 단위 테스트
+5. ✅ 데이터 수집 1차 (260513_2014 세션, λ=0.3, 10 min, 6,982 step)
+6. ✅ Fit → `halo_step_llama3-70b_b200x4.json` (R²=0.96, RMSE=23 ms) → 검증 실험 (260513_2147 세션) → ground truth vs 옛/새 식 비교 완료. [`prediction_model.md`](prediction_model.md) §15 에 결과 + 한계 + 개선 경로 기록.
+7. ✅ `runtime/cost_models/README.md`, `tools/halo/README.md` (워크플로·명령어), `tools/halo/CLAUDE.md` (짧은 pointer) 등 문서 갱신 (monitor panel 은 minor 로 보류)
+
+**진행 상황**: 단계 1–7 모두 완료. 코드/문서/검증 1차 라운드 종료.
+**결과 요약**: §18 cliff 의 *인플레이션 방향* 오차는 해소, *deflation 방향* 의 새 오차가 tail 에 생김. 평균 정확도 ~2x 향상. R3 lookahead 에서 쓰기 전엔 V1 refit (다양한 λ + 긴 sweep) 권장.
+
+### 신규 CLI 플래그
+
+| 플래그 | env var | 효과 |
+|---|---|---|
+| `--halo-step-cost-model-path` | `SGLANG_HALO_STEP_COST_MODEL` | Halo 가 새 모델 사용. set 시 legacy halo 두 path 무시 |
+| `--halo-cost-model-sample-log` | `SGLANG_HALO_COST_MODEL_SAMPLE_LOG` | per-step JSONL 출력 (rank-0 only, 데이터 수집용) |
+
+legacy `--halo-prefill-cost-model-path`, `--halo-tbt-cost-model-path` 는 그대로 살아 있음.
+
+### 참고
+- 상세: [`prediction_model.md`](prediction_model.md)
+- §18 (cliff 정량·진단)
+- `python/sglang/srt/managers/halo/CLAUDE.md` "Cost model brittleness inherited"
+- 식 출처(영감): MuxWise (ASPLOS '26 arXiv 2504.14489). DistServe (OSDI '24) 의 simulator 는 disaggregated 가정이라 직접 이식 안 함.
 
 ### 참고 — 변경된 파일 목록 (sglang)
 

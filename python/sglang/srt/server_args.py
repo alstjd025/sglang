@@ -383,6 +383,17 @@ class ServerArgs:
     halo_job_log: Optional[str] = None
     halo_prefill_cost_model_path: Optional[str] = None
     halo_tbt_cost_model_path: Optional[str] = None
+    # Halo Step Cost Model (post-Phase-1 follow-up — see
+    # ms_dev/halo_dev/prediction_model.md). When set, the SlowdownTracker
+    # ignores the legacy two-path pair above and uses this 6-coefficient
+    # unified step model. When None, legacy behavior is preserved.
+    halo_step_cost_model_path: Optional[str] = None
+    # Per-step JSONL sampler for fitting the Halo Step Cost Model. When unset,
+    # the sampler is not instantiated and the hot-path hook short-circuits on
+    # `is None` — zero impact on production. Only rank attn_tp_rank==0 records.
+    halo_cost_model_sample_log: Optional[str] = None
+    # Subsample rate: write every Nth step. Default 1 (every step).
+    halo_cost_model_sample_every: int = 1
     # Q13: pre-registered programs that never get an LLM request are dropped
     # after this many seconds. Set to 0 to keep them indefinitely.
     halo_program_idle_timeout_seconds: float = 300.0
@@ -4647,6 +4658,24 @@ class ServerArgs:
             type=str,
             default=ServerArgs.halo_tbt_cost_model_path,
             help="TBT cost model JSON for Halo slowdown computation. Same schema as admission_control.",
+        )
+        parser.add_argument(
+            "--halo-step-cost-model-path",
+            type=str,
+            default=ServerArgs.halo_step_cost_model_path,
+            help="Halo Step Cost Model JSON (form='halo_step_v1'). When set, supersedes --halo-prefill-cost-model-path and --halo-tbt-cost-model-path for Halo slowdown computation. See ms_dev/halo_dev/prediction_model.md.",
+        )
+        parser.add_argument(
+            "--halo-cost-model-sample-log",
+            type=str,
+            default=ServerArgs.halo_cost_model_sample_log,
+            help="Per-forward-step JSONL output for fitting the Halo Step Cost Model. Only rank attn_tp_rank==0 writes. When unset, the sampler is disabled (zero hot-path overhead).",
+        )
+        parser.add_argument(
+            "--halo-cost-model-sample-every",
+            type=int,
+            default=ServerArgs.halo_cost_model_sample_every,
+            help="Subsample rate for --halo-cost-model-sample-log: write every Nth step. Default 1 (every step). Increase to reduce JSONL size or hot-path queue pressure during long runs.",
         )
         parser.add_argument(
             "--halo-program-idle-timeout-seconds",

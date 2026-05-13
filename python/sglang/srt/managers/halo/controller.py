@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.managers.admission_control.cost_model import (
+    try_load_halo_step_cost_model,
     try_load_prefill_cost_model,
     try_load_tbt_cost_model,
 )
@@ -105,6 +106,10 @@ class HaloConfig:
     job_log_path: Optional[str] = None
     prefill_cost_model_path: Optional[str] = None
     tbt_cost_model_path: Optional[str] = None
+    # Halo Step Cost Model (post-Phase-1 follow-up; see
+    # ms_dev/halo_dev/prediction_model.md). When set, supersedes
+    # prefill_cost_model_path / tbt_cost_model_path.
+    step_cost_model_path: Optional[str] = None
     gc_retain_seconds: float = 5.0
     # Q13: pre-registered programs that never receive an LLM request get
     # dropped after this many seconds. 0 disables idle GC.
@@ -161,14 +166,34 @@ class HaloController:
         self.is_rank0 = is_rank0
         self.registry = JobRegistry()
 
-        prefill_cost = try_load_prefill_cost_model(config.prefill_cost_model_path)
-        tbt_cost = try_load_tbt_cost_model(config.tbt_cost_model_path)
-        if prefill_cost is None and tbt_cost is None:
+        # Cost-model selection. Step model (new) wins over the legacy pair
+        # when both are configured. See ms_dev/halo_dev/prediction_model.md.
+        step_cost = try_load_halo_step_cost_model(config.step_cost_model_path)
+        prefill_cost = None
+        tbt_cost = None
+        if step_cost is not None:
+            if config.prefill_cost_model_path or config.tbt_cost_model_path:
+                logger.info(
+                    "halo: --halo-step-cost-model-path set; ignoring "
+                    "--halo-prefill-cost-model-path / --halo-tbt-cost-model-path"
+                )
+        else:
+            prefill_cost = try_load_prefill_cost_model(
+                config.prefill_cost_model_path
+            )
+            tbt_cost = try_load_tbt_cost_model(config.tbt_cost_model_path)
+
+        if step_cost is None and prefill_cost is None and tbt_cost is None:
             logger.warning(
-                "halo: both cost models missing — slowdown sweep will be a no-op; "
+                "halo: no cost model loaded — slowdown sweep will be a no-op; "
                 "job counters / state still tracked"
             )
-        self.tracker = SlowdownTracker(prefill_cost, tbt_cost, self.registry)
+        self.tracker = SlowdownTracker(
+            prefill_cost=prefill_cost,
+            tbt_cost=tbt_cost,
+            registry=self.registry,
+            step_cost=step_cost,
+        )
 
         self._log: Optional[_JobLogger] = None
         if is_rank0 and config.job_log_path:
@@ -423,6 +448,7 @@ class HaloController:
             "cost_models_loaded": {
                 "prefill": self.tracker.prefill_cost is not None,
                 "tbt": self.tracker.tbt_cost is not None,
+                "step": self.tracker.step_cost is not None,
             },
         }
         s.update(self.registry.snapshot_dict(limit=limit))
@@ -457,6 +483,9 @@ def build_halo_controller_from_server_args(
         ),
         tbt_cost_model_path=getattr(
             server_args, "halo_tbt_cost_model_path", None
+        ),
+        step_cost_model_path=getattr(
+            server_args, "halo_step_cost_model_path", None
         ),
         program_idle_timeout_seconds=float(
             getattr(server_args, "halo_program_idle_timeout_seconds", 300.0)

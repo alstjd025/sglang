@@ -15,9 +15,14 @@ from sglang.srt.managers.admission_control.controller import (
     SchedulerSnapshot,
 )
 from sglang.srt.managers.admission_control.cost_model import (
+    HALO_STEP_FORM_SPLIT_V1,
+    HALO_STEP_FORM_V1,
+    HALO_STEP_FORMS,
     CostModelLoadError,
+    HaloStepCostModel,
     PrefillCostModel,
     TBTCostModel,
+    try_load_halo_step_cost_model,
     try_load_prefill_cost_model,
     try_load_tbt_cost_model,
 )
@@ -32,6 +37,10 @@ __all__ = [
     "AdmissionMetrics",
     "CostModelLoadError",
     "DecisionLogger",
+    "HALO_STEP_FORM_SPLIT_V1",
+    "HALO_STEP_FORM_V1",
+    "HALO_STEP_FORMS",
+    "HaloStepCostModel",
     "PrefillCostModel",
     "REASON_ADMIT",
     "REASON_DISABLED",
@@ -44,6 +53,7 @@ __all__ = [
     "SchedulerSnapshot",
     "TBTCostModel",
     "TBTEwmaTracker",
+    "try_load_halo_step_cost_model",
     "try_load_prefill_cost_model",
     "try_load_tbt_cost_model",
 ]

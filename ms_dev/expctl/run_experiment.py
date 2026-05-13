@@ -425,6 +425,9 @@ def main() -> int:
         "SGLANG_HALO_JOB_LOG",
         "SGLANG_HALO_PREFILL_COST_MODEL",
         "SGLANG_HALO_TBT_COST_MODEL",
+        "SGLANG_HALO_STEP_COST_MODEL",
+        "SGLANG_HALO_COST_MODEL_SAMPLE_LOG",
+        "SGLANG_HALO_COST_MODEL_SAMPLE_EVERY",
     )
     halo_config_snapshot = {
         k: os.environ[k] for k in halo_env_keys if os.environ.get(k)
@@ -440,6 +443,31 @@ def main() -> int:
         else:
             halo_job_log_path = session_dir / "halo_jobs.jsonl"
             halo_config_snapshot["SGLANG_HALO_JOB_LOG"] = str(halo_job_log_path)
+
+    # Halo Step Cost Model sampler: independent of --halo-enabled. The user
+    # sets SGLANG_HALO_COST_MODEL_SAMPLE_LOG to any value to turn collection
+    # on; an absolute path is pinned, anything else (e.g. "auto", "1") is
+    # auto-routed into the session dir. The sampler is only valid in
+    # normal-mode scheduling, so we also append --disable-overlap-schedule
+    # to SGLANG_SERVE_EXTRA_ARGS when collection is on.
+    halo_cost_sample_log_path: Optional[Path] = None
+    sample_log_raw = halo_config_snapshot.get("SGLANG_HALO_COST_MODEL_SAMPLE_LOG")
+    if sample_log_raw:
+        if os.path.isabs(sample_log_raw):
+            halo_cost_sample_log_path = Path(sample_log_raw)
+        else:
+            halo_cost_sample_log_path = session_dir / "halo_cost_samples.jsonl"
+            halo_config_snapshot["SGLANG_HALO_COST_MODEL_SAMPLE_LOG"] = str(
+                halo_cost_sample_log_path
+            )
+        # Ensure overlap is off — the sampler self-disables under overlap
+        # mode otherwise. We append to SGLANG_SERVE_EXTRA_ARGS so the user
+        # still sees the flag in the launch command.
+        existing_extra = os.environ.get("SGLANG_SERVE_EXTRA_ARGS", "") or ""
+        if "--disable-overlap-schedule" not in existing_extra:
+            os.environ["SGLANG_SERVE_EXTRA_ARGS"] = (
+                f"{existing_extra} --disable-overlap-schedule".strip()
+            )
 
     sglang_exact = [
         "sglang:gen_throughput",
@@ -620,6 +648,17 @@ def main() -> int:
             launch_env_overrides["server"]["SGLANG_HALO_JOB_LOG"] = str(
                 halo_job_log_path
             )
+        # HALO Step Cost Model sampler: forward whichever env vars the
+        # user has set. The auto-routed path was already written back into
+        # halo_config_snapshot above.
+        for k in (
+            "SGLANG_HALO_STEP_COST_MODEL",
+            "SGLANG_HALO_COST_MODEL_SAMPLE_LOG",
+            "SGLANG_HALO_COST_MODEL_SAMPLE_EVERY",
+        ):
+            v = halo_config_snapshot.get(k)
+            if v:
+                launch_env_overrides["server"][k] = v
 
     if args.cleanup_extra_ports.strip():
         for item in args.cleanup_extra_ports.split(","):
@@ -724,6 +763,11 @@ def main() -> int:
             "job_log_path": (
                 str(halo_job_log_path)
                 if halo_job_log_path is not None
+                else None
+            ),
+            "cost_sample_log_path": (
+                str(halo_cost_sample_log_path)
+                if halo_cost_sample_log_path is not None
                 else None
             ),
         },

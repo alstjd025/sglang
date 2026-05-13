@@ -180,6 +180,17 @@ append_halo_args() {
   local -n _halo_out="$1"
   local mode="${2:-single}"
 
+  # The cost-model sampler is INDEPENDENT of --halo-enabled — fit-data
+  # collection works with Halo off. Forward those two flags even when the
+  # Halo controller is disabled. expctl/run_experiment.py already routes
+  # the sample-log path into the session dir.
+  if [[ -n "${SGLANG_HALO_COST_MODEL_SAMPLE_LOG:-}" ]]; then
+    _halo_out+=(--halo-cost-model-sample-log "${SGLANG_HALO_COST_MODEL_SAMPLE_LOG}")
+  fi
+  if [[ -n "${SGLANG_HALO_COST_MODEL_SAMPLE_EVERY:-}" ]]; then
+    _halo_out+=(--halo-cost-model-sample-every "${SGLANG_HALO_COST_MODEL_SAMPLE_EVERY}")
+  fi
+
   if [[ "${SGLANG_HALO_ENABLED:-0}" != "1" ]]; then
     return 0
   fi
@@ -206,6 +217,10 @@ append_halo_args() {
   fi
   if [[ -n "${SGLANG_HALO_TBT_COST_MODEL:-}" ]]; then
     _halo_out+=(--halo-tbt-cost-model-path "${SGLANG_HALO_TBT_COST_MODEL}")
+  fi
+  # Step cost model — supersedes the legacy two-model pair when set.
+  if [[ -n "${SGLANG_HALO_STEP_COST_MODEL:-}" ]]; then
+    _halo_out+=(--halo-step-cost-model-path "${SGLANG_HALO_STEP_COST_MODEL}")
   fi
   if [[ -n "${SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS:-}" ]]; then
     _halo_out+=(--halo-job-log-interval-seconds "${SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS}")

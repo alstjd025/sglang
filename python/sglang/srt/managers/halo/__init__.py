@@ -11,6 +11,10 @@ from sglang.srt.managers.halo.controller import (
     HaloRejectError,
     build_halo_controller_from_server_args,
 )
+from sglang.srt.managers.halo.cost_model_sampler import (
+    HaloCostModelSampler,
+    build_halo_cost_sampler_from_server_args,
+)
 from sglang.srt.managers.halo.job import Job, JobState
 from sglang.srt.managers.halo.job_registry import JobAdmissionResult, JobRegistry
 from sglang.srt.managers.halo.metrics import HaloMetrics
@@ -22,6 +26,7 @@ from sglang.srt.managers.halo.slowdown_tracker import (
 __all__ = [
     "HaloConfig",
     "HaloController",
+    "HaloCostModelSampler",
     "HaloMetrics",
     "HaloRegisterProgramResult",
     "HaloRejectError",
@@ -36,4 +41,5 @@ __all__ = [
     "RequestExecutionInfo",
     "SlowdownTracker",
     "build_halo_controller_from_server_args",
+    "build_halo_cost_sampler_from_server_args",
 ]

@@ -84,6 +84,17 @@ export SGLANG_HALO_PREFILL_COST_MODEL="${SGLANG_HALO_PREFILL_COST_MODEL:-}"
 export SGLANG_HALO_TBT_COST_MODEL="${SGLANG_HALO_TBT_COST_MODEL:-}"
 export SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS="${SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS:-}"
 export SGLANG_HALO_QUIESCENT_TIMEOUT_SECONDS="${SGLANG_HALO_QUIESCENT_TIMEOUT_SECONDS:-}"
+# Halo Step Cost Model (post-Phase-1 follow-up) — see
+# ms_dev/halo_dev/prediction_model.md and tools/halo/README.md.
+# When SGLANG_HALO_STEP_COST_MODEL is set, it supersedes the legacy
+# prefill/tbt path pair. When SGLANG_HALO_COST_MODEL_SAMPLE_LOG is set
+# (to "auto", "1", or an explicit path), expctl/run_experiment.py
+# auto-routes to <session>/halo_cost_samples.jsonl (unless an absolute
+# path is given) AND auto-adds --disable-overlap-schedule because the
+# sampler is only valid in normal-mode scheduling.
+export SGLANG_HALO_STEP_COST_MODEL="${SGLANG_HALO_STEP_COST_MODEL:-}"
+export SGLANG_HALO_COST_MODEL_SAMPLE_LOG="${SGLANG_HALO_COST_MODEL_SAMPLE_LOG:-}"
+export SGLANG_HALO_COST_MODEL_SAMPLE_EVERY="${SGLANG_HALO_COST_MODEL_SAMPLE_EVERY:-}"
 
 # Some environments mount /tmp with noexec, which breaks Triton /
 # torchinductor when they try to mmap compiled .so files. Redirect their
