@@ -86,9 +86,12 @@ managers/halo/
 ├── job_registry.py         # JobRegistry: rid↔job, lifecycle
 ├── slowdown_tracker.py     # sweep() — compute per-request ratios, aggregate to job
 ├── controller.py           # HaloController: on/off, hook into scheduler
-└── cost_model_sampler.py   # per-step JSONL sampler for fitting the Halo Step Cost Model
-                            # (rank-0, background flusher thread, no-op when path unset).
-                            # See ms_dev/halo_dev/prediction_model.md.
+├── cost_model_sampler.py   # per-step JSONL sampler for fitting the Halo Step Cost Model
+│                           # (rank-0, background flusher thread, no-op when path unset).
+│                           # See ms_dev/halo_dev/prediction_model.md.
+└── admission_decision.py   # ★ Phase 2: AdmissionPredictor ABC + Snapshot (Level 0) +
+                            # Lookahead (Level 2) + decide_admission. Job-level
+                            # predictive admission gate. See ms_dev/halo_dev/admission_design.md.
 ```
 
 ## Class summary

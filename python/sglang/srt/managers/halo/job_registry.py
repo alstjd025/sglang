@@ -88,6 +88,7 @@ class JobRegistry:
         expected_input_lens: Optional[List[int]] = None,
         expected_output_lens: Optional[List[int]] = None,
         dag: Optional[Dict[str, Any]] = None,
+        declared_max_concurrency: Optional[int] = None,
     ) -> Tuple[bool, Job]:
         """Pre-register a job before any LLM request arrives (Option A).
 
@@ -95,6 +96,9 @@ class JobRegistry:
         - newly_registered=True  → fresh registration (HTTP 200)
         - newly_registered=False → job_id already exists; caller returns
                                    HTTP 409 (per Q11).
+
+        Phase 2 — Stage B: `declared_max_concurrency` (D4) is the application-
+        promised maximum in-flight LLM calls for this job. None means no cap.
         """
         if not math.isfinite(slo) or slo <= 0.0:
             # Defensive: the HTTP layer should have validated already, but
@@ -112,6 +116,7 @@ class JobRegistry:
             expected_output_lens=expected_output_lens,
             dag=dag,
             from_program=True,
+            declared_max_concurrency=declared_max_concurrency,
         )
         self._jobs[job_id] = job
         return True, job

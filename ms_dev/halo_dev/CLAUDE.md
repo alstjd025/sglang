@@ -1155,6 +1155,72 @@ ms_dev/expctl/{run_experiment.py, monitoring_view.py, CLAUDE.md}
 ms_dev/halo_dev/{CLAUDE.md, halo_api_reference.md, verify/{CLAUDE.md, microbench_overhead.py, e2e_smoke.sh}}
 ```
 
+---
+
+## 21. Halo Phase 2 — Admission Control
+
+§3 의 Role 2 (job-level admission gate) 의 *predictive* + *enforcement* 단계.
+Phase 1 은 strict-mode 만 (halo_job_id + pre-registered 둘 다 있어야 통과).
+Phase 2 는 그 위에 **새 job 받기 결정** 을 *기존 job 들의 예측 slowdown* 으로
+판정.
+
+**상세 설계·식·코드 구조·PR 순서**: [`admission_design.md`](admission_design.md).
+
+### 목적 한 줄
+
+> 새 job 을 admit 했을 때 *기존 active job 들의* 예측 slowdown 중 xx% 이상이
+> SLO 를 넘을 것 같으면 reject. 새 job 의 SLA 가 아니라 *기존 작업 보호* 가
+> 목적.
+
+### 두 Stage
+
+| Stage | 목적 | 입력 | 출력 |
+|---|---|---|---|
+| **A — Predictive (Level 0 / Level 2)** | 새 job 받으면 *기존 job 들의 predicted final slowdown_max 분포* | active jobs + new job + cost model | admit / reject + per-job 예측치 |
+| **B — Concurrency hard cap** | application 이 declare 한 *동시 in-flight* 약속을 enforce | declared_max_concurrency + current in_flight_count | admit / reject |
+
+### Level 0 / Level 2
+
+- **Level 0** (snapshot scaling): 지금 부하가 *그대로 유지된다* 가정. 한 step time 의 *비율* 로 남은 시간 stretch. 가장 단순, 매우 빠름.
+- **Level 2** (SLO-driven lookahead): 1초 slice 로 미래 batch composition 시뮬. *다른 job 종료* 와 *새 job 후속 calls* 효과 반영. 정확하지만 declared 정보 필요.
+
+### 새 components (계획)
+
+```
+managers/halo/admission_decision.py   ← 신규
+  AdmissionPredictor / SnapshotAdmissionPredictor / LookaheadAdmissionPredictor
+  decide_admission(...)
+managers/halo/job.py                  declared_max_concurrency, in_flight_count
+managers/halo/controller.py            register_request 안 Stage A → Stage B
+server_args.py                         5 새 CLI 플래그 (--halo-admission-*)
+ms_dev/env.common.sh + lib_server.sh   5 새 env vars (SGLANG_HALO_ADMISSION_*)
+test/registered/halo/test_halo_admission_predictors.py  ← 신규
+```
+
+### 단계별 PR 순서
+
+| # | 내용 | 영향 |
+|---|---|---|
+| PR1 | AdmissionPredictor ABC + Level 0 + 단위 테스트 | 라이브러리만 |
+| PR2 | Controller 통합 + dry-run + CLI + env vars + decision log | 통합 |
+| PR3 | Level 2 lookahead + 단위 테스트 | 라이브러리 |
+| PR4 | Stage B (Concurrency cap) | Job/Registry + register_program |
+| PR5 | 검증 실험 + 문서 갱신 | 문서 |
+
+### 진행 상태 (2026-05-14)
+
+| PR | 상태 | 산출물 |
+|---|---|---|
+| PR1 | ✅ | `managers/halo/admission_decision.py` (Snapshot + ABC) + 14 unit tests |
+| PR2 | ✅ | `HaloController.register_request` 가 Stage A 호출 + dry-run + decision log + 5 CLI 플래그 + 5 env vars + expctl auto-route + 6 controller tests |
+| PR3 | ✅ | `LookaheadAdmissionPredictor` (1초 slice 시뮬) + 7 lookahead tests |
+| PR4 | ✅ | `Job.declared_max_concurrency` + `in_flight_count` + `register_program` body field + Stage B reject path + 4 cap tests |
+| PR5 | ⏳ | 사용자 환경 검증 실험 (mode=off / level0 / level2 비교) — 코드 ready |
+
+본 라운드 통합 test 수: **201 (43+33+13+9+72 + 4 신규 Phase 2 sets)**.
+
+---
+
 ### 참고 — 변경된 파일 목록 (Agent_applications)
 
 ```

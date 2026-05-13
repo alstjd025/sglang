@@ -228,6 +228,22 @@ append_halo_args() {
   if [[ -n "${SGLANG_HALO_QUIESCENT_TIMEOUT_SECONDS:-}" ]]; then
     _halo_out+=(--halo-quiescent-timeout-seconds "${SGLANG_HALO_QUIESCENT_TIMEOUT_SECONDS}")
   fi
+  # Phase 2 admission control.
+  if [[ -n "${SGLANG_HALO_ADMISSION_MODE:-}" && "${SGLANG_HALO_ADMISSION_MODE}" != "off" ]]; then
+    _halo_out+=(--halo-admission-mode "${SGLANG_HALO_ADMISSION_MODE}")
+  fi
+  if [[ -n "${SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD:-}" ]]; then
+    _halo_out+=(--halo-admission-violation-threshold "${SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD}")
+  fi
+  if [[ -n "${SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC:-}" ]]; then
+    _halo_out+=(--halo-admission-lookahead-horizon-sec "${SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC}")
+  fi
+  if [[ "${SGLANG_HALO_ADMISSION_DRY_RUN:-0}" == "1" ]]; then
+    _halo_out+=(--halo-admission-dry-run)
+  fi
+  if [[ -n "${SGLANG_HALO_ADMISSION_DECISION_LOG:-}" ]]; then
+    _halo_out+=(--halo-admission-decision-log "${SGLANG_HALO_ADMISSION_DECISION_LOG}")
+  fi
 }
 
 # launch_server <cmd...>

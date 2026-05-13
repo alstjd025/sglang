@@ -1,0 +1,694 @@
+"""Job-level admission decision for Halo Phase 2.
+
+Design + rationale: ms_dev/halo_dev/admission_design.md.
+
+Core idea (different from request-level admission_control):
+    Reject a new job if admitting it would push too many *currently active
+    jobs* over their SLO. Decision uses the Halo Step Cost Model (the same
+    cost model that powers R1 slowdown tracking) to predict each active
+    job's final slowdown after the new arrival.
+
+Three pluggable predictor variants share one interface:
+    - SnapshotAdmissionPredictor  (Level 0): time-invariant snapshot scaling.
+    - LookaheadAdmissionPredictor (Level 2): 1-second slice forward simulation.
+    - (future) Level 1 fixed-horizon, EWMA-corrected, etc.
+
+decide_admission(...) glues a predictor's output to the violation-ratio
+threshold (D3 = 0.2) and returns AdmissionDecisionResult — the controller
+logs that and either passes through or raises HaloRejectError.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from sglang.srt.managers.admission_control.cost_model import HaloStepCostModel
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reject reason — kept in this module so the predictor + controller share it
+# without importing from controller (avoids a circular import).
+# ─────────────────────────────────────────────────────────────────────────────
+REASON_OK = "OK"
+REASON_HALO_ADMISSION_PREDICTED = "HALO_ADMISSION_PREDICTED"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inputs
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class ActiveCallInfo:
+    """A single in-flight LLM call inside an active job."""
+
+    rid: str
+    is_prefill: bool          # True while still doing prefill (uncached new tokens)
+    prompt_len: int           # total prompt tokens (n + r)
+    prefix_len: int           # cached prefix at admit time (r)
+    decoded_tokens: int       # tokens already produced
+    kv_len_now: int           # current KV span (= prompt_len + decoded_tokens)
+    elapsed_actual_ms: float  # wall-clock since this call started
+
+
+@dataclass(frozen=True)
+class JobLookaheadInput:
+    """Per-active-job snapshot consumed by AdmissionPredictor.
+
+    All fields after ``current_solo_elapsed_ms`` are *declared* and may be
+    None if the job's register_program payload omitted them — predictors
+    must handle that gracefully (e.g. fall back to "no remaining estimate").
+    """
+
+    job_id: str
+    slo: float
+    # Current observed state (from Halo R1 / Job + RequestExecutionInfo)
+    active_calls: Tuple[ActiveCallInfo, ...]
+    current_actual_elapsed_ms: float
+    current_solo_elapsed_ms: float  # cost_model.solo accumulated so far
+    # Declared structure (opt-in — None if not registered)
+    remaining_calls: Optional[int] = None
+    remaining_stage_sequence: Optional[Tuple[str, ...]] = None
+    expected_input_lens: Optional[Tuple[int, ...]] = None
+    expected_output_lens: Optional[Tuple[int, ...]] = None
+    expected_cached_prefix_lens: Optional[Tuple[int, ...]] = None
+
+
+@dataclass(frozen=True)
+class NewJobInput:
+    """New job arrival — what the predictor needs to score admission.
+
+    The first call's input_len / prefix_len is always known at admit time
+    (it's exactly what triggered the admission decision). Everything else
+    is declared via register_program and is Optional.
+    """
+
+    job_id: str
+    slo: float
+    # First call (always known — this is what's being admitted)
+    first_call_input_len: int
+    first_call_prefix_len: int = 0
+    first_call_expected_output_len: int = 0
+    # Declared structure (opt-in)
+    total_calls: Optional[int] = None
+    stage_sequence: Optional[Tuple[str, ...]] = None
+    expected_input_lens: Optional[Tuple[int, ...]] = None
+    expected_output_lens: Optional[Tuple[int, ...]] = None
+    expected_cached_prefix_lens: Optional[Tuple[int, ...]] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Decision result
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class AdmissionDecisionResult:
+    """Output of decide_admission(...). Carries enough info for the JSONL
+    decision log + the operator's intuition."""
+
+    admit: bool
+    reason: str                            # REASON_OK or REASON_HALO_ADMISSION_PREDICTED
+    violation_ratio: float                 # violations / active_jobs_total
+    violation_count: int
+    active_jobs_total: int
+    threshold: float
+    predicted_slowdowns: Dict[str, float]  # job_id → predicted final slowdown_max
+    # Optional / mode-specific diagnostic fields:
+    horizon_sec: Optional[float] = None    # Level 2 only
+    mode: str = ""                          # "level0" | "level2"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Predictor base
+# ─────────────────────────────────────────────────────────────────────────────
+class AdmissionPredictor(ABC):
+    """Predicts each active job's final slowdown_max *if* the new job is
+    admitted. Concrete subclasses differ in how they extrapolate the future:
+
+    - Level 0 (SnapshotAdmissionPredictor): treat the current load as
+      time-invariant and stretch each job's declared remaining-solo time by
+      a single factor (augmented_step_ms / current_step_ms).
+    - Level 2 (LookaheadAdmissionPredictor): 1-second slice forward
+      simulation, letting the batch composition evolve as calls finish and
+      new calls of the same job become active.
+    """
+
+    mode_name: str = "abstract"
+
+    def __init__(self, cost_model: HaloStepCostModel) -> None:
+        self.cost_model = cost_model
+
+    @abstractmethod
+    def predict(
+        self,
+        active_jobs: Sequence[JobLookaheadInput],
+        new_job: NewJobInput,
+    ) -> Dict[str, float]:
+        """Returns {job_id: predicted_final_slowdown_max} for every active job.
+
+        New job not included — only existing active jobs are scored (its
+        SLO is the caller's responsibility, not admission control's).
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers shared by predictors
+# ─────────────────────────────────────────────────────────────────────────────
+def _build_current_batch_features(
+    active_jobs: Sequence[JobLookaheadInput],
+) -> Tuple[List[Tuple[int, int]], List[int]]:
+    """Returns (prefill_infos, decode_kvs) describing the current batch
+    composition as the cost model's estimate_step_ms expects."""
+    prefill_infos: List[Tuple[int, int]] = []
+    decode_kvs: List[int] = []
+    for job in active_jobs:
+        for call in job.active_calls:
+            if call.is_prefill:
+                n = max(0, call.prompt_len - call.prefix_len)
+                prefill_infos.append((n, call.prefix_len))
+            else:
+                decode_kvs.append(call.kv_len_now)
+    return prefill_infos, decode_kvs
+
+
+def _solo_call_ms(cost_model: HaloStepCostModel, n: int, r: int, out_len: int) -> float:
+    """Total solo wall-clock for one call: prefill + (output_len × per-step TBT
+    at average context). The split-form cost model is linear in r, so the
+    average KV (= input + output/2) is an exact integral substitute."""
+    n_new = max(0, n - r)
+    prefill_ms = cost_model.estimate_solo_prefill_total_ms(n_new, r)
+    avg_kv = n + max(0, out_len // 2)
+    decode_step_ms = cost_model.estimate_solo_tbt_ms(avg_kv)
+    return prefill_ms + decode_step_ms * max(0, out_len)
+
+
+def _estimate_remaining_solo_ms(
+    cost_model: HaloStepCostModel,
+    job: JobLookaheadInput,
+) -> Optional[float]:
+    """Sum of per-call solo time across the job's declared *remaining* calls.
+
+    Returns None when declared lengths are insufficient — predictors should
+    treat that as "no proactive prediction" (typically: keep the job's
+    current observed ratio as the prediction).
+    """
+    seq = job.remaining_stage_sequence
+    if not seq:
+        return None
+    if not (job.expected_input_lens and job.expected_output_lens):
+        return None
+    n_remaining = len(seq)
+    if len(job.expected_input_lens) < n_remaining:
+        return None
+    if len(job.expected_output_lens) < n_remaining:
+        return None
+    prefix_lens = job.expected_cached_prefix_lens or (0,) * n_remaining
+
+    total = 0.0
+    for i in range(n_remaining):
+        total += _solo_call_ms(
+            cost_model,
+            int(job.expected_input_lens[i]),
+            int(prefix_lens[i]) if i < len(prefix_lens) else 0,
+            int(job.expected_output_lens[i]),
+        )
+    return total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Level 0 — Snapshot scaling
+# ─────────────────────────────────────────────────────────────────────────────
+class SnapshotAdmissionPredictor(AdmissionPredictor):
+    """Time-invariant snapshot model.
+
+    Algorithm:
+        current_step_ms   = cost_model.estimate_step_ms(current_batch)
+        augmented_step_ms = cost_model.estimate_step_ms(current_batch + new_first_call)
+        stretch_factor    = augmented_step_ms / current_step_ms
+
+    For each active job j with declared remaining-solo R_solo_j:
+        remaining_actual_j  = R_solo_j * stretch_factor
+        final_actual_j      = current_actual_elapsed_j + remaining_actual_j
+        final_solo_j        = current_solo_elapsed_j   + R_solo_j
+        predicted_j         = final_actual_j / final_solo_j
+
+    If R_solo_j is unavailable (declared insufficient), fall back to the
+    job's *current observed* slowdown — the predictor refuses to extrapolate
+    without the structural information.
+    """
+
+    mode_name = "level0"
+
+    def predict(
+        self,
+        active_jobs: Sequence[JobLookaheadInput],
+        new_job: NewJobInput,
+    ) -> Dict[str, float]:
+        current_prefill, current_decode = _build_current_batch_features(active_jobs)
+        current_step_ms = self.cost_model.estimate_step_ms(
+            current_prefill, current_decode
+        )
+        # New job's first call: prefill on (n, r).
+        n_new = max(
+            0,
+            new_job.first_call_input_len - new_job.first_call_prefix_len,
+        )
+        augmented_prefill = current_prefill + [(n_new, new_job.first_call_prefix_len)]
+        augmented_step_ms = self.cost_model.estimate_step_ms(
+            augmented_prefill, current_decode
+        )
+        # Guard against degenerate current state (empty batch).
+        if current_step_ms <= 0:
+            current_step_ms = max(augmented_step_ms, 1.0)
+        stretch = augmented_step_ms / current_step_ms
+
+        predictions: Dict[str, float] = {}
+        for job in active_jobs:
+            remaining_solo = _estimate_remaining_solo_ms(self.cost_model, job)
+            if remaining_solo is None:
+                # No declared info — use current observed slowdown.
+                if job.current_solo_elapsed_ms > 0:
+                    predictions[job.job_id] = (
+                        job.current_actual_elapsed_ms / job.current_solo_elapsed_ms
+                    )
+                else:
+                    predictions[job.job_id] = job.slo
+                continue
+            remaining_actual = remaining_solo * stretch
+            final_actual = job.current_actual_elapsed_ms + remaining_actual
+            final_solo = job.current_solo_elapsed_ms + remaining_solo
+            if final_solo > 0:
+                predictions[job.job_id] = final_actual / final_solo
+            else:
+                predictions[job.job_id] = float("inf")
+        return predictions
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Decision wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+def decide_admission(
+    predictions: Dict[str, float],
+    slos: Dict[str, float],
+    threshold: float,
+    mode: str = "",
+    horizon_sec: Optional[float] = None,
+) -> AdmissionDecisionResult:
+    """Apply the violation-ratio threshold to a predictor's output.
+
+    Args:
+        predictions: {job_id: predicted_final_slowdown_max}
+        slos:        {job_id: SLO}. Falls back to the prediction's value if
+                     missing (treats missing SLO as "always satisfied").
+        threshold:   D3 — fraction (0..1). If violation_ratio > threshold,
+                     decision is REJECT.
+        mode:        for diagnostic.
+        horizon_sec: Level 2 only — for diagnostic.
+
+    Returns:
+        AdmissionDecisionResult with all fields populated.
+    """
+    total = len(predictions)
+    if total == 0:
+        return AdmissionDecisionResult(
+            admit=True,
+            reason=REASON_OK,
+            violation_ratio=0.0,
+            violation_count=0,
+            active_jobs_total=0,
+            threshold=threshold,
+            predicted_slowdowns={},
+            horizon_sec=horizon_sec,
+            mode=mode,
+        )
+    violations = 0
+    for jid, pred in predictions.items():
+        slo = slos.get(jid, pred)
+        if pred > slo:
+            violations += 1
+    violation_ratio = violations / total
+    if violation_ratio > threshold:
+        return AdmissionDecisionResult(
+            admit=False,
+            reason=REASON_HALO_ADMISSION_PREDICTED,
+            violation_ratio=violation_ratio,
+            violation_count=violations,
+            active_jobs_total=total,
+            threshold=threshold,
+            predicted_slowdowns=dict(predictions),
+            horizon_sec=horizon_sec,
+            mode=mode,
+        )
+    return AdmissionDecisionResult(
+        admit=True,
+        reason=REASON_OK,
+        violation_ratio=violation_ratio,
+        violation_count=violations,
+        active_jobs_total=total,
+        threshold=threshold,
+        predicted_slowdowns=dict(predictions),
+        horizon_sec=horizon_sec,
+        mode=mode,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Level 2 — SLO-driven lookahead
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class _SimCall:
+    """Mutable simulation state for one in-flight call."""
+
+    rid: str
+    is_prefill: bool
+    prompt_len: int            # n + r (unchanged through decode)
+    prefix_len: int            # r at start of call (unchanged)
+    decoded_tokens: float      # fractional during the simulation
+    expected_output_len: int   # 0 means unknown — call never auto-terminates
+    elapsed_actual_ms: float   # wall-clock since this call started in sim
+
+
+@dataclass
+class _SimJob:
+    """Mutable simulation state for one job (current + future calls)."""
+
+    job_id: str
+    slo: float
+    elapsed_actual_ms: float     # cumulative across calls (sim + observed)
+    solo_ms: float               # cumulative solo across calls (sim + observed)
+    active_calls: List[_SimCall]
+    pending_calls: List[_SimCall]
+
+
+class LookaheadAdmissionPredictor(AdmissionPredictor):
+    """1-second slice forward simulation.
+
+    For each slice:
+      1. Compute step_ms from cost_model.estimate_step_ms over the current
+         simulated batch composition.
+      2. Advance each active call by `slice_ms / step_ms` steps. Prefill
+         calls finish their prefill in their first slice (the prefill cost
+         is folded into that slice's step_ms via the cost-model's prefill
+         terms) and flip to the decode phase afterwards.
+      3. When a call's decoded ≥ expected_output_len, retire it and pull
+         the job's next declared call (if any) into the active set.
+      4. All jobs accumulate elapsed_actual = elapsed_actual + slice_ms.
+
+    Termination:
+      * t ≥ horizon_sec, OR
+      * no job has any active or pending call.
+
+    Horizon selection (config_horizon_sec arg):
+      * > 0 → use it directly
+      * == 0 → SLO-driven: max over active jobs of
+                ((current_solo_elapsed + remaining_solo) × SLO / 1000),
+                capped at MAX_HORIZON_SEC.
+
+    Fallback: when a job has no declared expected_output_lens for its
+    *currently active* calls, the call has no terminating condition. We
+    treat it as "decode forever" within the horizon — accurate enough as
+    long as the horizon itself is bounded.
+    """
+
+    mode_name = "level2"
+    SLICE_SEC: float = 1.0
+    MAX_HORIZON_SEC: float = 600.0  # safety cap (10 minutes)
+    SLICE_STEP_MS_FLOOR: float = 1.0  # protect against degenerate empty batch
+
+    def __init__(
+        self,
+        cost_model: HaloStepCostModel,
+        horizon_sec: float = 0.0,
+    ) -> None:
+        super().__init__(cost_model)
+        self.horizon_sec = horizon_sec
+
+    def predict(
+        self,
+        active_jobs: Sequence[JobLookaheadInput],
+        new_job: NewJobInput,
+    ) -> Dict[str, float]:
+        # Build mutable simulation state from the immutable inputs.
+        sim_jobs = self._build_sim_jobs(active_jobs)
+        new_sim = self._build_new_sim_job(new_job)
+        all_sim = sim_jobs + ([new_sim] if new_sim else [])
+        if not all_sim:
+            return {}
+
+        horizon = self._resolve_horizon(active_jobs)
+        slice_ms = self.SLICE_SEC * 1000.0
+        t = 0.0
+        # Step the simulation in 1-second increments.
+        while t < horizon and self._any_work_remaining(all_sim):
+            prefill_infos, decode_infos = self._collect_batch_features(all_sim)
+            step_ms = self.cost_model.estimate_step_ms(
+                prefill_infos, decode_infos
+            )
+            step_ms = max(step_ms, self.SLICE_STEP_MS_FLOOR)
+            steps_in_slice = slice_ms / step_ms
+
+            for job in all_sim:
+                if not job.active_calls and not job.pending_calls:
+                    continue
+                job.elapsed_actual_ms += slice_ms
+                self._advance_calls(job, steps_in_slice, slice_ms)
+            t += self.SLICE_SEC
+
+        # Compute predicted final slowdown_max per active job. New job is
+        # excluded — admission protects existing jobs only.
+        predictions: Dict[str, float] = {}
+        for sim in sim_jobs:
+            if sim.solo_ms > 0:
+                predictions[sim.job_id] = sim.elapsed_actual_ms / sim.solo_ms
+            else:
+                predictions[sim.job_id] = sim.slo
+        return predictions
+
+    # ── horizon + state construction ──────────────────────────────────────
+    def _resolve_horizon(
+        self, active_jobs: Sequence[JobLookaheadInput]
+    ) -> float:
+        if self.horizon_sec > 0:
+            return min(self.horizon_sec, self.MAX_HORIZON_SEC)
+        # SLO-driven: when would this job hit slowdown == SLO?
+        best = 0.0
+        for job in active_jobs:
+            remaining_solo = _estimate_remaining_solo_ms(
+                self.cost_model, job
+            )
+            if remaining_solo is None:
+                # Insufficient declared info — use the current observed
+                # elapsed (degenerate but not zero).
+                expected_total_solo = max(
+                    job.current_solo_elapsed_ms, 1.0
+                )
+            else:
+                expected_total_solo = job.current_solo_elapsed_ms + remaining_solo
+            target_ms = expected_total_solo * job.slo
+            best = max(best, target_ms / 1000.0)
+        return min(max(best, self.SLICE_SEC), self.MAX_HORIZON_SEC)
+
+    def _build_sim_jobs(
+        self, active_jobs: Sequence[JobLookaheadInput]
+    ) -> List[_SimJob]:
+        out: List[_SimJob] = []
+        for j in active_jobs:
+            active_calls = [
+                _SimCall(
+                    rid=c.rid,
+                    is_prefill=c.is_prefill,
+                    prompt_len=c.prompt_len,
+                    prefix_len=c.prefix_len,
+                    decoded_tokens=float(c.decoded_tokens),
+                    expected_output_len=self._lookup_expected_output_for_call(
+                        j, c
+                    ),
+                    elapsed_actual_ms=c.elapsed_actual_ms,
+                )
+                for c in j.active_calls
+            ]
+            pending = self._build_pending_calls(j)
+            out.append(
+                _SimJob(
+                    job_id=j.job_id,
+                    slo=j.slo,
+                    elapsed_actual_ms=j.current_actual_elapsed_ms,
+                    solo_ms=j.current_solo_elapsed_ms,
+                    active_calls=active_calls,
+                    pending_calls=pending,
+                )
+            )
+        return out
+
+    def _build_new_sim_job(self, new_job: NewJobInput) -> Optional[_SimJob]:
+        # First-call info is required; without it the new job adds no load
+        # to the simulation.
+        if new_job.first_call_input_len <= 0:
+            return None
+        first_call = _SimCall(
+            rid=f"new::{new_job.job_id}",
+            is_prefill=True,
+            prompt_len=new_job.first_call_input_len,
+            prefix_len=new_job.first_call_prefix_len,
+            decoded_tokens=0.0,
+            expected_output_len=new_job.first_call_expected_output_len
+            or self._derive_expected_output_for_new_first(new_job),
+            elapsed_actual_ms=0.0,
+        )
+        pending = self._build_pending_calls_from_new(new_job)
+        return _SimJob(
+            job_id=new_job.job_id,
+            slo=new_job.slo,
+            elapsed_actual_ms=0.0,
+            solo_ms=0.0,
+            active_calls=[first_call],
+            pending_calls=pending,
+        )
+
+    @staticmethod
+    def _lookup_expected_output_for_call(
+        job: JobLookaheadInput, call: ActiveCallInfo
+    ) -> int:
+        """Best-effort: use the FIRST expected output length when declared.
+        Active calls don't carry their stage index, so this is the most
+        defensible default."""
+        if job.expected_output_lens:
+            return int(job.expected_output_lens[0])
+        return 0  # 0 ⇒ never auto-terminates within the horizon
+
+    @staticmethod
+    def _build_pending_calls(job: JobLookaheadInput) -> List[_SimCall]:
+        if not job.remaining_stage_sequence:
+            return []
+        if not (job.expected_input_lens and job.expected_output_lens):
+            return []
+        n_remaining = len(job.remaining_stage_sequence)
+        if len(job.expected_input_lens) < n_remaining:
+            return []
+        if len(job.expected_output_lens) < n_remaining:
+            return []
+        prefix_lens = (
+            job.expected_cached_prefix_lens or tuple(0 for _ in range(n_remaining))
+        )
+        return [
+            _SimCall(
+                rid=f"sim::{job.job_id}::{i}",
+                is_prefill=True,
+                prompt_len=int(job.expected_input_lens[i]),
+                prefix_len=int(prefix_lens[i]) if i < len(prefix_lens) else 0,
+                decoded_tokens=0.0,
+                expected_output_len=int(job.expected_output_lens[i]),
+                elapsed_actual_ms=0.0,
+            )
+            for i in range(n_remaining)
+        ]
+
+    @staticmethod
+    def _build_pending_calls_from_new(new_job: NewJobInput) -> List[_SimCall]:
+        if not (new_job.expected_input_lens and new_job.expected_output_lens):
+            return []
+        # Skip index 0 because it's the just-arrived (active) first call.
+        n = len(new_job.expected_input_lens)
+        if n <= 1:
+            return []
+        if len(new_job.expected_output_lens) < n:
+            return []
+        prefix_lens = (
+            new_job.expected_cached_prefix_lens or tuple(0 for _ in range(n))
+        )
+        return [
+            _SimCall(
+                rid=f"new::{new_job.job_id}::{i}",
+                is_prefill=True,
+                prompt_len=int(new_job.expected_input_lens[i]),
+                prefix_len=int(prefix_lens[i]) if i < len(prefix_lens) else 0,
+                decoded_tokens=0.0,
+                expected_output_len=int(new_job.expected_output_lens[i]),
+                elapsed_actual_ms=0.0,
+            )
+            for i in range(1, n)
+        ]
+
+    @staticmethod
+    def _derive_expected_output_for_new_first(new_job: NewJobInput) -> int:
+        if new_job.expected_output_lens:
+            return int(new_job.expected_output_lens[0])
+        return 0
+
+    # ── per-slice mechanics ───────────────────────────────────────────────
+    def _collect_batch_features(
+        self, sim_jobs: Sequence[_SimJob]
+    ) -> Tuple[List[Tuple[int, int]], List[int]]:
+        prefill_infos: List[Tuple[int, int]] = []
+        decode_kvs: List[int] = []
+        for job in sim_jobs:
+            for call in job.active_calls:
+                if call.is_prefill:
+                    n_new = max(0, call.prompt_len - call.prefix_len)
+                    prefill_infos.append((n_new, call.prefix_len))
+                else:
+                    decode_kvs.append(
+                        call.prompt_len + int(call.decoded_tokens)
+                    )
+        return prefill_infos, decode_kvs
+
+    def _advance_calls(
+        self,
+        sim_job: _SimJob,
+        steps_in_slice: float,
+        slice_ms: float,
+    ) -> None:
+        finished: List[_SimCall] = []
+        for call in sim_job.active_calls:
+            call.elapsed_actual_ms += slice_ms
+            if call.is_prefill:
+                # Folding model: prefill resolves within the slice that
+                # contained it. Charge the solo prefill cost to the job
+                # and flip to decode.
+                n_new = max(0, call.prompt_len - call.prefix_len)
+                sim_job.solo_ms += self.cost_model.estimate_solo_prefill_total_ms(
+                    n_new, call.prefix_len
+                )
+                call.is_prefill = False
+                # Continue decoding within the same slice if budget remains.
+                # Approximate: keep the slice's remaining step budget for
+                # decode tokens, weighted by the fact that prefill already
+                # ate some of it. We simply do not subtract here — the
+                # decoded count for this slice will rest on the next loop.
+                continue
+            # Decode phase.
+            call.decoded_tokens += steps_in_slice
+            # Charge per-step solo cost (linear in current KV).
+            current_kv = call.prompt_len + int(call.decoded_tokens)
+            sim_job.solo_ms += (
+                self.cost_model.estimate_solo_tbt_ms(current_kv)
+                * steps_in_slice
+            )
+            if (
+                call.expected_output_len > 0
+                and call.decoded_tokens >= call.expected_output_len
+            ):
+                finished.append(call)
+        for call in finished:
+            sim_job.active_calls.remove(call)
+            if sim_job.pending_calls:
+                sim_job.active_calls.append(sim_job.pending_calls.pop(0))
+
+    @staticmethod
+    def _any_work_remaining(sim_jobs: Sequence[_SimJob]) -> bool:
+        return any(
+            (job.active_calls or job.pending_calls) for job in sim_jobs
+        )
+
+
+__all__ = [
+    "REASON_OK",
+    "REASON_HALO_ADMISSION_PREDICTED",
+    "ActiveCallInfo",
+    "AdmissionDecisionResult",
+    "AdmissionPredictor",
+    "JobLookaheadInput",
+    "LookaheadAdmissionPredictor",
+    "NewJobInput",
+    "SnapshotAdmissionPredictor",
+    "decide_admission",
+]

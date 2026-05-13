@@ -1287,6 +1287,9 @@ class HaloRegisterProgramReqInput(BaseReq):
     expected_input_lens: Optional[List[int]] = None
     expected_output_lens: Optional[List[int]] = None
     dag: Optional[Dict[str, Any]] = None
+    # Phase 2 — Stage B: application's promise for the maximum in-flight
+    # LLM calls this job will hold open. None means no cap (per D4).
+    declared_max_concurrency: Optional[int] = None
 
 
 @dataclass

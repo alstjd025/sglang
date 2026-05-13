@@ -428,6 +428,11 @@ def main() -> int:
         "SGLANG_HALO_STEP_COST_MODEL",
         "SGLANG_HALO_COST_MODEL_SAMPLE_LOG",
         "SGLANG_HALO_COST_MODEL_SAMPLE_EVERY",
+        "SGLANG_HALO_ADMISSION_MODE",
+        "SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD",
+        "SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC",
+        "SGLANG_HALO_ADMISSION_DRY_RUN",
+        "SGLANG_HALO_ADMISSION_DECISION_LOG",
     )
     halo_config_snapshot = {
         k: os.environ[k] for k in halo_env_keys if os.environ.get(k)
@@ -467,6 +472,23 @@ def main() -> int:
         if "--disable-overlap-schedule" not in existing_extra:
             os.environ["SGLANG_SERVE_EXTRA_ARGS"] = (
                 f"{existing_extra} --disable-overlap-schedule".strip()
+            )
+
+    # Phase 2 admission decision log auto-route. When admission mode is on
+    # (anything other than "off") and the operator didn't pin a path, route
+    # it into the session folder. See ms_dev/halo_dev/admission_design.md.
+    halo_admission_mode = (
+        halo_config_snapshot.get("SGLANG_HALO_ADMISSION_MODE") or "off"
+    ).lower()
+    halo_admission_decision_log_path: Optional[Path] = None
+    if halo_enabled and halo_admission_mode != "off":
+        pinned = halo_config_snapshot.get("SGLANG_HALO_ADMISSION_DECISION_LOG")
+        if pinned:
+            halo_admission_decision_log_path = Path(pinned)
+        else:
+            halo_admission_decision_log_path = session_dir / "admission_decisions.jsonl"
+            halo_config_snapshot["SGLANG_HALO_ADMISSION_DECISION_LOG"] = str(
+                halo_admission_decision_log_path
             )
 
     sglang_exact = [
@@ -648,13 +670,18 @@ def main() -> int:
             launch_env_overrides["server"]["SGLANG_HALO_JOB_LOG"] = str(
                 halo_job_log_path
             )
-        # HALO Step Cost Model sampler: forward whichever env vars the
-        # user has set. The auto-routed path was already written back into
-        # halo_config_snapshot above.
+        # HALO Step Cost Model sampler + Phase 2 admission: forward whichever
+        # env vars the user has set. Auto-routed paths (sample log, admission
+        # decision log) were already written back into halo_config_snapshot.
         for k in (
             "SGLANG_HALO_STEP_COST_MODEL",
             "SGLANG_HALO_COST_MODEL_SAMPLE_LOG",
             "SGLANG_HALO_COST_MODEL_SAMPLE_EVERY",
+            "SGLANG_HALO_ADMISSION_MODE",
+            "SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD",
+            "SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC",
+            "SGLANG_HALO_ADMISSION_DRY_RUN",
+            "SGLANG_HALO_ADMISSION_DECISION_LOG",
         ):
             v = halo_config_snapshot.get(k)
             if v:
@@ -768,6 +795,12 @@ def main() -> int:
             "cost_sample_log_path": (
                 str(halo_cost_sample_log_path)
                 if halo_cost_sample_log_path is not None
+                else None
+            ),
+            "admission_mode": halo_admission_mode,
+            "admission_decision_log_path": (
+                str(halo_admission_decision_log_path)
+                if halo_admission_decision_log_path is not None
                 else None
             ),
         },

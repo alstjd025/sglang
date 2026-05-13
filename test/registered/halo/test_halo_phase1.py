@@ -11,6 +11,7 @@ Coverage:
 """
 
 import logging
+import os
 import time
 import unittest
 from unittest.mock import MagicMock
@@ -575,6 +576,208 @@ class TestHaloController(unittest.TestCase):
         self.assertEqual(snap["jobs"][0]["job_id"], "agent-1")
         self.assertEqual(snap["jobs"][0]["total_calls_expected"], 5)
         self.assertEqual(snap["program_idle_timeout_seconds"], 300.0)
+
+
+class TestPhase2AdmissionIntegration(unittest.TestCase):
+    """Phase 2: register_request runs Stage A (predictive admission) when
+    admission_mode != off and active_request_infos is supplied.
+
+    See ms_dev/halo_dev/admission_design.md §9 (workflow)."""
+
+    def _step_cost(self):
+        from sglang.srt.managers.admission_control.cost_model import (
+            HaloStepCostModel,
+        )
+        # Same fixture as the cost-model unit tests.
+        return HaloStepCostModel(
+            theta_p1=1e-7, theta_p2=4e-7, theta_p3=0.013,
+            theta_d1=1.5e-5, theta_d2=0.18, theta_c=22.0,
+            theta_c_p=70.0, theta_c_d=22.0,
+            form="halo_step_split_v1",
+        )
+
+    def _config(self, **overrides) -> HaloConfig:
+        kwargs = dict(
+            enabled=True, default_slo=5.0, tick_interval_ms=100.0,
+        )
+        kwargs.update(overrides)
+        return HaloConfig(**kwargs)
+
+    def _make_controller(self, *, step_path=None, **cfg_overrides) -> HaloController:
+        """Build a controller wired with the test step-cost-model.
+
+        If step_path is None, write the fixture to a temp file. Caller can
+        supply step_path to share a single JSON across operations (e.g. to
+        let the controller's normal __init__ path build the admission log).
+        """
+        if step_path is None:
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False
+            )
+            tmp.close()
+            self._step_cost().to_json(tmp.name)
+            step_path = tmp.name
+            self.addCleanup(lambda p=tmp.name: os.unlink(p))
+        cfg = self._config(step_cost_model_path=step_path, **cfg_overrides)
+        return HaloController(cfg, is_rank0=True)
+
+    def test_admission_off_skips_stage_a(self):
+        c = self._make_controller(admission_mode="off")
+        c.register_program("agent-1", slo=5.0, total_calls=2)
+        # No active_request_infos passed — strict-mode-only path.
+        job = c.register_request(
+            rid="rid-a", halo_job_id="agent-1", halo_slo=5.0,
+        )
+        self.assertEqual(job.job_id, "agent-1")
+
+    def test_admission_level0_admits_when_below_threshold(self):
+        """No active jobs → violation_ratio = 0 → admit."""
+        c = self._make_controller(admission_mode="level0",
+                                  admission_violation_threshold=0.2)
+        c.register_program("agent-1", slo=5.0, total_calls=2)
+        job = c.register_request(
+            rid="rid-a", halo_job_id="agent-1", halo_slo=5.0,
+            prompt_len=1000, prefix_len=500,
+            active_request_infos=[],   # empty → ADMIT
+        )
+        self.assertEqual(job.job_id, "agent-1")
+
+    def test_admission_level0_rejects_when_predictions_violate(self):
+        """One active job whose predicted slowdown will exceed its SLO ⇒
+        violation_ratio = 1.0 > 0.2 ⇒ reject."""
+        c = self._make_controller(
+            admission_mode="level0",
+            admission_violation_threshold=0.2,
+        )
+        # Pre-register both jobs.
+        c.register_program("active-1", slo=2.0, total_calls=2)
+        c.register_program("new-1", slo=5.0, total_calls=2)
+        # Pretend active-1 is already mid-execution, far behind solo.
+        c.registry.admit_to_job("active-1", 2.0, "rid-x")
+        active_info = RequestExecutionInfo(
+            rid="rid-x", job_id="active-1",
+            prompt_len=2000, prefix_len_at_admission=1800,
+            decoded_tokens_so_far=200, kv_len_now=2200,
+            elapsed_ms=200_000.0,   # 200s elapsed against a small solo budget
+        )
+        with self.assertRaises(HaloRejectError) as cm:
+            c.register_request(
+                rid="rid-b", halo_job_id="new-1", halo_slo=5.0,
+                prompt_len=4000, prefix_len=0,
+                active_request_infos=[active_info],
+            )
+        self.assertEqual(cm.exception.reason, "HALO_ADMISSION_PREDICTED")
+
+    def test_admission_dry_run_admits_despite_reject_decision(self):
+        c = self._make_controller(
+            admission_mode="level0",
+            admission_violation_threshold=0.2,
+            admission_dry_run=True,
+        )
+        c.register_program("active-1", slo=2.0, total_calls=2)
+        c.register_program("new-1", slo=5.0, total_calls=2)
+        c.registry.admit_to_job("active-1", 2.0, "rid-x")
+        active_info = RequestExecutionInfo(
+            rid="rid-x", job_id="active-1",
+            prompt_len=2000, prefix_len_at_admission=1800,
+            decoded_tokens_so_far=200, kv_len_now=2200,
+            elapsed_ms=200_000.0,
+        )
+        # Dry-run: decision is REJECT but controller admits anyway.
+        job = c.register_request(
+            rid="rid-b", halo_job_id="new-1", halo_slo=5.0,
+            prompt_len=4000, prefix_len=0,
+            active_request_infos=[active_info],
+        )
+        self.assertEqual(job.job_id, "new-1")
+
+    def test_admission_decision_log_path_written(self):
+        import os, tempfile, json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "admission_decisions.jsonl")
+            c = self._make_controller(
+                admission_mode="level0",
+                admission_decision_log_path=path,
+            )
+            c.register_program("new-1", slo=5.0, total_calls=2)
+            c.register_request(
+                rid="rid-a", halo_job_id="new-1", halo_slo=5.0,
+                prompt_len=1000, prefix_len=500,
+                active_request_infos=[],
+            )
+            c.close()
+            with open(path) as f:
+                rows = [_json.loads(l) for l in f if l.strip()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rid"], "rid-a")
+        self.assertEqual(rows[0]["job_id"], "new-1")
+        self.assertEqual(rows[0]["decision"], "admit")
+        self.assertEqual(rows[0]["mode"], "level0")
+
+    def test_level2_uses_lookahead_predictor(self):
+        c = self._make_controller(admission_mode="level2")
+        self.assertIsNotNone(c.admission_predictor)
+        self.assertEqual(c.admission_predictor.mode_name, "level2")
+
+
+class TestPhase2StageBConcurrencyCap(unittest.TestCase):
+    """Phase 2 Stage B — per-job declared concurrency cap.
+
+    Stage B is independent of Stage A: it triggers even when admission_mode
+    is off. The cap is enforced strictly (D4 — no queue, P2 — reject).
+    """
+
+    def _config(self) -> HaloConfig:
+        return HaloConfig(enabled=True, default_slo=5.0)
+
+    def test_no_declared_cap_means_no_limit(self):
+        c = HaloController(self._config(), is_rank0=True)
+        c.register_program("a", slo=5.0)  # no declared_max_concurrency
+        # Admit five requests in a row — all should pass.
+        for i in range(5):
+            c.register_request(rid=f"r{i}", halo_job_id="a", halo_slo=5.0)
+        job = c.registry.job_for_id("a")
+        self.assertEqual(job.in_flight_count, 5)
+
+    def test_cap_enforced_at_third_admit(self):
+        c = HaloController(self._config(), is_rank0=True)
+        c.register_program("a", slo=5.0, declared_max_concurrency=2)
+        c.register_request(rid="r1", halo_job_id="a", halo_slo=5.0)
+        c.register_request(rid="r2", halo_job_id="a", halo_slo=5.0)
+        with self.assertRaises(HaloRejectError) as cm:
+            c.register_request(rid="r3", halo_job_id="a", halo_slo=5.0)
+        self.assertEqual(cm.exception.reason, "HALO_CONCURRENCY_CAP")
+        # Counters did not advance on the rejected admit.
+        job = c.registry.job_for_id("a")
+        self.assertEqual(job.in_flight_count, 2)
+
+    def test_in_flight_decremented_on_finish_reopens_slot(self):
+        c = HaloController(self._config(), is_rank0=True)
+        c.register_program("a", slo=5.0, declared_max_concurrency=1)
+        c.register_request(rid="r1", halo_job_id="a", halo_slo=5.0)
+        # r2 is blocked while r1 is in-flight.
+        with self.assertRaises(HaloRejectError):
+            c.register_request(rid="r2", halo_job_id="a", halo_slo=5.0)
+        # Finishing r1 frees the slot.
+        c.on_request_finished("r1")
+        # r3 now succeeds.
+        c.register_request(rid="r3", halo_job_id="a", halo_slo=5.0)
+        job = c.registry.job_for_id("a")
+        self.assertEqual(job.in_flight_count, 1)
+
+    def test_cap_independent_of_admission_mode(self):
+        """Stage B fires even when admission_mode is off — it's a hard
+        contract, not a predictive gate."""
+        cfg = HaloConfig(
+            enabled=True, default_slo=5.0, admission_mode="off"
+        )
+        c = HaloController(cfg, is_rank0=True)
+        c.register_program("a", slo=5.0, declared_max_concurrency=0)
+        # cap=0 means *nothing admitted*. Useful sanity probe.
+        with self.assertRaises(HaloRejectError) as cm:
+            c.register_request(rid="r1", halo_job_id="a", halo_slo=5.0)
+        self.assertEqual(cm.exception.reason, "HALO_CONCURRENCY_CAP")
 
 
 class TestFactory(unittest.TestCase):

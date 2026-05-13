@@ -24,9 +24,21 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.managers.admission_control.cost_model import (
+    HaloStepCostModel,
     try_load_halo_step_cost_model,
     try_load_prefill_cost_model,
     try_load_tbt_cost_model,
+)
+from sglang.srt.managers.halo.admission_decision import (
+    REASON_HALO_ADMISSION_PREDICTED,
+    ActiveCallInfo,
+    AdmissionDecisionResult,
+    AdmissionPredictor,
+    JobLookaheadInput,
+    LookaheadAdmissionPredictor,
+    NewJobInput,
+    SnapshotAdmissionPredictor,
+    decide_admission,
 )
 from sglang.srt.managers.halo.job import Job, JobState
 from sglang.srt.managers.halo.job_registry import (
@@ -47,13 +59,18 @@ from sglang.srt.managers.halo.slowdown_tracker import (
 REASON_NO_JOB_ID = "HALO_NO_JOB_ID"
 REASON_DISABLED = "HALO_DISABLED"
 REASON_JOB_ID_ALREADY_REGISTERED = "JOB_ID_ALREADY_REGISTERED"
-# Re-export from job_registry so external callers only import controller.
+# Phase 2 Stage B — application-declared concurrency cap exceeded.
+REASON_HALO_CONCURRENCY_CAP = "HALO_CONCURRENCY_CAP"
+# Re-export from job_registry + admission_decision so external callers only
+# import controller.
 __all__ = [
     "HaloConfig",
     "HaloController",
     "HaloRejectError",
     "HaloRegisterProgramResult",
     "REASON_DISABLED",
+    "REASON_HALO_ADMISSION_PREDICTED",
+    "REASON_HALO_CONCURRENCY_CAP",
     "REASON_JOB_ID_ALREADY_REGISTERED",
     "REASON_NO_JOB_ID",
     "REASON_PROGRAM_NOT_REGISTERED",
@@ -126,6 +143,13 @@ class HaloConfig:
     # to send halo_job_done. 0 disables. Tune up for workloads with
     # legitimately long mid-chain waits (e.g., human-in-the-loop).
     quiescent_timeout_seconds: float = 300.0
+    # ── Phase 2 admission control (job-level predictive gate) ──────────
+    # See ms_dev/halo_dev/admission_design.md.
+    admission_mode: str = "off"                 # off | level0 | level2
+    admission_violation_threshold: float = 0.2  # D3 — fraction (0..1)
+    admission_lookahead_horizon_sec: float = 0.0  # 0 = SLO-driven (Level 2)
+    admission_dry_run: bool = False             # log only; always admit
+    admission_decision_log_path: Optional[str] = None  # JSONL output
 
 
 class _JobLogger:
@@ -216,13 +240,65 @@ class HaloController:
         self._last_log_monotonic: float = 0.0
         self._log_interval_s: float = max(config.job_log_interval_seconds, 0.0)
 
+        # ── Phase 2 admission predictor + decision log ────────────────────
+        # See ms_dev/halo_dev/admission_design.md.
+        self.admission_predictor: Optional[AdmissionPredictor] = (
+            self._build_admission_predictor(config, step_cost)
+        )
+        self._admission_log: Optional[_JobLogger] = None
+        if (
+            is_rank0
+            and config.admission_decision_log_path
+            and self.admission_predictor is not None
+        ):
+            try:
+                self._admission_log = _JobLogger(config.admission_decision_log_path)
+            except OSError as e:
+                logger.warning("halo: admission decision log disabled — %s", e)
+
         logger.info(
-            "halo: enabled (default_slo=%.2f tick_interval_ms=%.1f rank0=%s log=%s)",
+            "halo: enabled (default_slo=%.2f tick_interval_ms=%.1f rank0=%s log=%s "
+            "admission=%s dry_run=%s threshold=%.2f)",
             config.default_slo,
             config.tick_interval_ms,
             is_rank0,
             config.job_log_path or "off",
+            config.admission_mode,
+            config.admission_dry_run,
+            config.admission_violation_threshold,
         )
+
+    @staticmethod
+    def _build_admission_predictor(
+        config: "HaloConfig",
+        step_cost: Optional[HaloStepCostModel],
+    ) -> Optional[AdmissionPredictor]:
+        """Construct the admission predictor matching config.admission_mode.
+
+        Returns None when admission is off, or when the cost model is
+        missing (the predictor can't function without it).
+        """
+        mode = (config.admission_mode or "off").lower()
+        if mode == "off":
+            return None
+        if step_cost is None:
+            logger.warning(
+                "halo: admission_mode=%s requested but no Halo Step Cost Model "
+                "loaded — admission disabled. Set --halo-step-cost-model-path.",
+                mode,
+            )
+            return None
+        if mode == "level0":
+            return SnapshotAdmissionPredictor(step_cost)
+        if mode == "level2":
+            return LookaheadAdmissionPredictor(
+                step_cost,
+                horizon_sec=float(config.admission_lookahead_horizon_sec),
+            )
+        logger.warning(
+            "halo: unknown admission_mode=%r — admission disabled", mode
+        )
+        return None
 
     # ------------------------------------------------------------------
     # Admission / finish hooks
@@ -233,33 +309,325 @@ class HaloController:
         rid: str,
         halo_job_id: Optional[str],
         halo_slo: Optional[float],
+        *,
+        prompt_len: int = 0,
+        prefix_len: int = 0,
+        active_request_infos: Optional[List[RequestExecutionInfo]] = None,
     ) -> Job:
-        """Strict-mode admission hook (Option B transport).
+        """Admission hook combining strict-mode (Phase 1) + predictive
+        gate (Phase 2 Stage A).
 
-        Per spec:
-        - Q7: Halo enabled ⇒ `halo_job_id` REQUIRED. Missing → 400.
-        - Q12: Halo enabled + job_id NOT pre-registered → 400. No lazy-create.
+        Order of checks (the first one that fails wins):
+            1. Strict mode Q7 — halo_job_id REQUIRED.
+            2. Strict mode Q12 — job_id MUST be pre-registered.
+            3. Stage A — Predictive admission, if admission_mode != off
+               and active_request_infos was supplied.
+            4. (Stage B / concurrency cap — lands in PR4.)
+            5. Actually admit (rid → job mapping, counters).
+
+        Args new in Phase 2:
+            prompt_len, prefix_len      — first-call shape, for the Stage A
+                                          batch composition feature.
+            active_request_infos        — snapshot of currently in-flight
+                                          Halo-tracked requests (the same
+                                          list the periodic sweep consumes).
+                                          When None or empty, Stage A is
+                                          skipped.
 
         Missing `halo_slo` → use `config.default_slo` (the registry's
-        pre-registered slo wins anyway, see Q10).
+        pre-registered slo still wins, see Q10).
         """
+        # ── 1. Q7 — halo_job_id required ─────────────────────────────────
         if halo_job_id is None or halo_job_id == "":
             if self.metrics is not None:
                 self.metrics.record_request_rejected(REASON_NO_JOB_ID)
             raise HaloRejectError(reason=REASON_NO_JOB_ID, rid=rid)
         slo = halo_slo if halo_slo is not None else self.config.default_slo
+
+        # ── 2. Q12 — program must be pre-registered ──────────────────────
+        # Look up the Job *before* admit_to_job so Stage A has access to its
+        # declared structure (total_calls, stage_sequence, expected lens).
+        new_job_record = self.registry.job_for_id(halo_job_id)
+        if new_job_record is None:
+            if self.metrics is not None:
+                self.metrics.record_request_rejected(REASON_PROGRAM_NOT_REGISTERED)
+            raise HaloRejectError(reason=REASON_PROGRAM_NOT_REGISTERED, rid=rid)
+
+        # ── 3. Stage A — Predictive admission (Phase 2) ──────────────────
+        # Empty active list is still a valid input (auto-admit + log row);
+        # only None means "scheduler did not provide the snapshot" → skip.
+        if (
+            self.admission_predictor is not None
+            and active_request_infos is not None
+        ):
+            decision = self._stage_a_decide(
+                new_job=new_job_record,
+                new_slo=slo,
+                prompt_len=prompt_len,
+                prefix_len=prefix_len,
+                active_request_infos=active_request_infos,
+                exclude_job_id=halo_job_id,  # don't score the arriving job
+            )
+            self._log_admission_decision(rid, halo_job_id, decision)
+            if not decision.admit and not self.config.admission_dry_run:
+                if self.metrics is not None:
+                    self.metrics.record_request_rejected(
+                        REASON_HALO_ADMISSION_PREDICTED
+                    )
+                raise HaloRejectError(
+                    reason=REASON_HALO_ADMISSION_PREDICTED, rid=rid
+                )
+
+        # ── 4. Stage B — Concurrency hard cap (Phase 2) ──────────────────
+        # When the application declared a max in-flight count for this job,
+        # reject the call if accepting it would push past that promise.
+        cap = new_job_record.declared_max_concurrency
+        if cap is not None and new_job_record.in_flight_count >= cap:
+            if self.metrics is not None:
+                self.metrics.record_request_rejected(REASON_HALO_CONCURRENCY_CAP)
+            raise HaloRejectError(
+                reason=REASON_HALO_CONCURRENCY_CAP, rid=rid
+            )
+
+        # ── 5. Actually admit ────────────────────────────────────────────
         result: JobAdmissionResult = self.registry.admit_to_job(
             halo_job_id, slo, rid
         )
         if not result.admitted:
+            # Defensive (should not happen given step 2 above, but cheap).
             reason = result.reason or REASON_PROGRAM_NOT_REGISTERED
-            # Q12 path: program was not pre-registered.
             if self.metrics is not None:
                 self.metrics.record_request_rejected(reason)
             raise HaloRejectError(reason=reason, rid=rid)
         if self.metrics is not None:
             self.metrics.record_request_admitted()
         return result.job
+
+    # ------------------------------------------------------------------
+    # Phase 2 — Stage A helpers
+    # ------------------------------------------------------------------
+
+    def _stage_a_decide(
+        self,
+        new_job: Job,
+        new_slo: float,
+        prompt_len: int,
+        prefix_len: int,
+        active_request_infos: List[RequestExecutionInfo],
+        exclude_job_id: str,
+    ) -> AdmissionDecisionResult:
+        """Run the admission predictor + decide_admission against the
+        current request-execution snapshot."""
+        active_jobs_input = self._build_active_jobs_input(
+            active_request_infos, exclude_job_id=exclude_job_id
+        )
+        new_job_input = self._build_new_job_input(
+            new_job, new_slo, prompt_len, prefix_len
+        )
+        predictions = self.admission_predictor.predict(
+            active_jobs_input, new_job_input
+        )
+        slos_map = {j.job_id: j.slo for j in active_jobs_input}
+        return decide_admission(
+            predictions,
+            slos_map,
+            threshold=self.config.admission_violation_threshold,
+            mode=self.admission_predictor.mode_name,
+            horizon_sec=(
+                self.config.admission_lookahead_horizon_sec
+                if self.admission_predictor.mode_name == "level2"
+                else None
+            ),
+        )
+
+    def _build_active_jobs_input(
+        self,
+        infos: List[RequestExecutionInfo],
+        *,
+        exclude_job_id: Optional[str] = None,
+    ) -> List[JobLookaheadInput]:
+        """Group RequestExecutionInfo by job_id, attach declared structure
+        from the registry, return the per-job inputs the predictor expects."""
+        by_job: Dict[str, List[RequestExecutionInfo]] = {}
+        for info in infos:
+            if info.job_id is None:
+                continue
+            if exclude_job_id is not None and info.job_id == exclude_job_id:
+                continue
+            by_job.setdefault(info.job_id, []).append(info)
+
+        out: List[JobLookaheadInput] = []
+        for jid, info_list in by_job.items():
+            job = self.registry.job_for_id(jid)
+            if job is None:
+                continue
+            active_calls = tuple(
+                ActiveCallInfo(
+                    rid=i.rid,
+                    # If decoded_tokens > 0 the call has finished prefill.
+                    is_prefill=i.decoded_tokens_so_far <= 0,
+                    prompt_len=i.prompt_len,
+                    prefix_len=i.prefix_len_at_admission,
+                    decoded_tokens=i.decoded_tokens_so_far,
+                    kv_len_now=i.kv_len_now,
+                    elapsed_actual_ms=i.elapsed_ms,
+                )
+                for i in info_list
+            )
+            # current_actual_elapsed: take the max over the job's in-flight
+            # requests (their elapsed_ms). current_solo: rebuild via the
+            # tracker's solo helper for each active call's prompt + decoded.
+            current_actual_ms = max(i.elapsed_ms for i in info_list)
+            current_solo_ms = self._current_solo_ms_for_job(info_list)
+            out.append(
+                JobLookaheadInput(
+                    job_id=jid,
+                    slo=job.slo,
+                    active_calls=active_calls,
+                    current_actual_elapsed_ms=current_actual_ms,
+                    current_solo_elapsed_ms=current_solo_ms,
+                    remaining_calls=self._declared_remaining_calls(job, info_list),
+                    remaining_stage_sequence=self._declared_remaining_sequence(
+                        job, info_list
+                    ),
+                    expected_input_lens=self._declared_remaining_lengths(
+                        job.expected_input_lens, job, info_list
+                    ),
+                    expected_output_lens=self._declared_remaining_lengths(
+                        job.expected_output_lens, job, info_list
+                    ),
+                    expected_cached_prefix_lens=None,
+                )
+            )
+        return out
+
+    def _build_new_job_input(
+        self,
+        new_job: Job,
+        slo: float,
+        prompt_len: int,
+        prefix_len: int,
+    ) -> NewJobInput:
+        return NewJobInput(
+            job_id=new_job.job_id,
+            slo=slo,
+            first_call_input_len=prompt_len,
+            first_call_prefix_len=prefix_len,
+            total_calls=new_job.total_calls_expected,
+            stage_sequence=(
+                tuple(new_job.stage_sequence)
+                if new_job.stage_sequence is not None
+                else None
+            ),
+            expected_input_lens=(
+                tuple(new_job.expected_input_lens)
+                if new_job.expected_input_lens is not None
+                else None
+            ),
+            expected_output_lens=(
+                tuple(new_job.expected_output_lens)
+                if new_job.expected_output_lens is not None
+                else None
+            ),
+            expected_cached_prefix_lens=None,
+        )
+
+    @staticmethod
+    def _declared_remaining_calls(
+        job: Job, infos: List[RequestExecutionInfo]
+    ) -> Optional[int]:
+        if job.total_calls_expected is None:
+            return None
+        # admitted_count tracked on Job is the number of LLM requests already
+        # admitted into this job — so remaining = total - admitted.
+        return max(0, job.total_calls_expected - job.total_request_number)
+
+    @staticmethod
+    def _declared_remaining_sequence(
+        job: Job, infos: List[RequestExecutionInfo]
+    ) -> Optional[Tuple[str, ...]]:
+        if job.stage_sequence is None or job.total_calls_expected is None:
+            return None
+        admitted = job.total_request_number
+        if admitted >= len(job.stage_sequence):
+            return ()
+        return tuple(job.stage_sequence[admitted:])
+
+    @staticmethod
+    def _declared_remaining_lengths(
+        full: Optional[List[int]],
+        job: Job,
+        infos: List[RequestExecutionInfo],
+    ) -> Optional[Tuple[int, ...]]:
+        if full is None or job.total_calls_expected is None:
+            return None
+        admitted = job.total_request_number
+        if admitted >= len(full):
+            return ()
+        return tuple(full[admitted:])
+
+    def _current_solo_ms_for_job(
+        self, infos: List[RequestExecutionInfo]
+    ) -> float:
+        """Total solo time so far across the job's in-flight calls,
+        computed the same way SlowdownTracker does."""
+        tracker = self.tracker
+        total = 0.0
+        for info in infos:
+            if tracker.step_cost is not None:
+                prefill = tracker.step_cost.estimate_solo_prefill_total_ms(
+                    info.prompt_len, info.prefix_len_at_admission
+                )
+                tbt = tracker.step_cost.estimate_solo_tbt_ms(
+                    max(info.kv_len_now, 0)
+                )
+            elif tracker.prefill_cost is not None or tracker.tbt_cost is not None:
+                prefill = (
+                    tracker.prefill_cost.estimate_ms(
+                        info.prompt_len, info.prefix_len_at_admission
+                    )
+                    if tracker.prefill_cost is not None
+                    else 0.0
+                )
+                tbt = (
+                    tracker.tbt_cost.estimate_ms(
+                        batch_size=1, per_req_kv=max(info.kv_len_now, 0)
+                    )
+                    if tracker.tbt_cost is not None
+                    else 0.0
+                )
+            else:
+                # No cost model — degenerate; report 0 so caller's slowdown
+                # calc returns its fallback path.
+                continue
+            total += prefill + tbt * max(0, info.decoded_tokens_so_far)
+        return total
+
+    def _log_admission_decision(
+        self,
+        rid: str,
+        job_id: str,
+        decision: AdmissionDecisionResult,
+    ) -> None:
+        if self._admission_log is None:
+            return
+        self._admission_log.write(
+            {
+                "ts_ns": time.time_ns(),
+                "rid": rid,
+                "job_id": job_id,
+                "mode": decision.mode,
+                "dry_run": self.config.admission_dry_run,
+                "decision": "admit" if decision.admit else "reject",
+                "reason": decision.reason,
+                "violation_ratio": decision.violation_ratio,
+                "violation_count": decision.violation_count,
+                "active_jobs_total": decision.active_jobs_total,
+                "threshold": decision.threshold,
+                "horizon_sec": decision.horizon_sec,
+                "predicted_slowdowns": decision.predicted_slowdowns,
+            }
+        )
 
     def register_program(
         self,
@@ -271,6 +639,7 @@ class HaloController:
         expected_input_lens: Optional[List[int]] = None,
         expected_output_lens: Optional[List[int]] = None,
         dag: Optional[Dict[str, Any]] = None,
+        declared_max_concurrency: Optional[int] = None,
     ) -> HaloRegisterProgramResult:
         """Pre-register a job (Option A — `POST /halo/programs`).
 
@@ -296,6 +665,7 @@ class HaloController:
             expected_input_lens=expected_input_lens,
             expected_output_lens=expected_output_lens,
             dag=dag,
+            declared_max_concurrency=declared_max_concurrency,
         )
         if not fresh:
             if self.metrics is not None:
@@ -486,6 +856,19 @@ def build_halo_controller_from_server_args(
         ),
         step_cost_model_path=getattr(
             server_args, "halo_step_cost_model_path", None
+        ),
+        admission_mode=getattr(server_args, "halo_admission_mode", "off") or "off",
+        admission_violation_threshold=float(
+            getattr(server_args, "halo_admission_violation_threshold", 0.2)
+        ),
+        admission_lookahead_horizon_sec=float(
+            getattr(server_args, "halo_admission_lookahead_horizon_sec", 0.0)
+        ),
+        admission_dry_run=bool(
+            getattr(server_args, "halo_admission_dry_run", False)
+        ),
+        admission_decision_log_path=getattr(
+            server_args, "halo_admission_decision_log", None
         ),
         program_idle_timeout_seconds=float(
             getattr(server_args, "halo_program_idle_timeout_seconds", 300.0)

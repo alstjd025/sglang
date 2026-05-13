@@ -394,6 +394,13 @@ class ServerArgs:
     halo_cost_model_sample_log: Optional[str] = None
     # Subsample rate: write every Nth step. Default 1 (every step).
     halo_cost_model_sample_every: int = 1
+    # ── Phase 2 admission control ──────────────────────────────────────
+    # See ms_dev/halo_dev/admission_design.md.
+    halo_admission_mode: str = "off"               # off | level0 | level2
+    halo_admission_violation_threshold: float = 0.2  # D3
+    halo_admission_lookahead_horizon_sec: float = 0.0  # 0 = SLO-driven
+    halo_admission_dry_run: bool = False           # log only; admit
+    halo_admission_decision_log: Optional[str] = None  # JSONL path
     # Q13: pre-registered programs that never get an LLM request are dropped
     # after this many seconds. Set to 0 to keep them indefinitely.
     halo_program_idle_timeout_seconds: float = 300.0
@@ -4676,6 +4683,37 @@ class ServerArgs:
             type=int,
             default=ServerArgs.halo_cost_model_sample_every,
             help="Subsample rate for --halo-cost-model-sample-log: write every Nth step. Default 1 (every step). Increase to reduce JSONL size or hot-path queue pressure during long runs.",
+        )
+        parser.add_argument(
+            "--halo-admission-mode",
+            type=str,
+            choices=("off", "level0", "level2"),
+            default=ServerArgs.halo_admission_mode,
+            help="Halo Phase 2 job-level admission control mode. 'off' disables predictive admission (Phase 1 strict-mode still applies). 'level0' is snapshot scaling (cheap, time-invariant). 'level2' is SLO-driven lookahead. See ms_dev/halo_dev/admission_design.md.",
+        )
+        parser.add_argument(
+            "--halo-admission-violation-threshold",
+            type=float,
+            default=ServerArgs.halo_admission_violation_threshold,
+            help="Fraction in [0,1]. If more than this share of active jobs are predicted to exceed their SLO after admitting the new request, reject. Default 0.2 (20%%).",
+        )
+        parser.add_argument(
+            "--halo-admission-lookahead-horizon-sec",
+            type=float,
+            default=ServerArgs.halo_admission_lookahead_horizon_sec,
+            help="Level 2 lookahead horizon in seconds. 0 (default) means SLO-driven: simulate until the earliest SLO-violation moment across active jobs.",
+        )
+        parser.add_argument(
+            "--halo-admission-dry-run",
+            action="store_true",
+            default=ServerArgs.halo_admission_dry_run,
+            help="Halo admission Phase 2 dry-run: compute the decision and write it to the decision log, but ALWAYS admit. Mirrors --admission-dry-run.",
+        )
+        parser.add_argument(
+            "--halo-admission-decision-log",
+            type=str,
+            default=ServerArgs.halo_admission_decision_log,
+            help="JSONL path for per-decision admission logs (rank-0 only). Auto-routed by run_experiment.py to <session>/admission_decisions.jsonl when unset.",
         )
         parser.add_argument(
             "--halo-program-idle-timeout-seconds",

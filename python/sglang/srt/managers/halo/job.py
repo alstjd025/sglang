@@ -92,6 +92,13 @@ class Job:
     dag: Optional[Dict[str, Any]] = None
     # Distinguishes pre-registered jobs from jobs built directly (tests, etc).
     from_program: bool = False
+    # ---- Phase 2 Stage B — concurrency cap ----
+    # Application-declared max in-flight concurrent LLM calls for this job.
+    # None ⇒ no cap (D4). Server enforces by counting `in_flight_count`.
+    declared_max_concurrency: Optional[int] = None
+    # Running count of in-flight (admitted but not yet finished) requests.
+    # Updated by HaloController.register_request / on_request_finished.
+    in_flight_count: int = 0
 
     def __post_init__(self) -> None:
         # Honor the spec: initial slowdown == SLO (worst-case fallback).
@@ -107,6 +114,7 @@ class Job:
         self.request_ids.add(rid)
         self.total_request_number += 1
         self.remaining_request_number += 1
+        self.in_flight_count += 1
         self.last_update_ts = _now_monotonic()
         if self.state == JobState.COMPLETE:
             # Re-opened with a new request — back to running.
@@ -129,6 +137,8 @@ class Job:
         self.request_ids.discard(rid)
         if self.remaining_request_number > 0:
             self.remaining_request_number -= 1
+        if self.in_flight_count > 0:
+            self.in_flight_count -= 1
         self.last_update_ts = _now_monotonic()
         # NOTE: deliberately NOT transitioning to COMPLETE here.
 
@@ -175,6 +185,9 @@ class Job:
             "expected_input_lens": self.expected_input_lens,
             "expected_output_lens": self.expected_output_lens,
             "dag": self.dag,
+            # Phase 2 — Stage B.
+            "declared_max_concurrency": self.declared_max_concurrency,
+            "in_flight_count": self.in_flight_count,
         }
 
     def is_idle(self) -> bool:

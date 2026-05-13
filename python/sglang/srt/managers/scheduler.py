@@ -2606,21 +2606,54 @@ class Scheduler(
         # traffic the user never issued.
         if getattr(recv_req, "halo_bypass", False):
             return False
+        # Compute prefix match length *before* the admission call — Phase 2
+        # Stage A needs (prompt_len, prefix_len) to score the new arrival's
+        # contribution to the batch. We reuse the admission_control helper
+        # so the two paths see the exact same number (avoids drift).
+        prompt_len = len(getattr(recv_req, "origin_input_ids", None) or [])
+        try:
+            prefix_len = self._admission_match_prefix_len(recv_req)
+        except Exception:  # noqa: BLE001 — Halo must never crash request path
+            prefix_len = 0
+        # Snapshot of currently in-flight Halo requests. The same builder
+        # the periodic sweep uses — keeps Stage A consistent with R1.
+        active_infos = (
+            self._halo_build_request_execution_infos()
+            if getattr(controller, "admission_predictor", None) is not None
+            else None
+        )
+
         try:
             controller.register_request(
                 rid=recv_req.rid,
                 halo_job_id=getattr(recv_req, "halo_job_id", None),
                 halo_slo=getattr(recv_req, "halo_slo", None),
+                prompt_len=prompt_len,
+                prefix_len=prefix_len,
+                active_request_infos=active_infos,
             )
         except HaloRejectError as e:
-            # HALO: per managers/halo/CLAUDE.md §13 Q7 + Q12. Reason-specific
-            # message so the client can tell apart "missing field" vs "missing
-            # pre-registration call".
+            # HALO: per managers/halo/CLAUDE.md §13 Q7 + Q12 +
+            # admission_design.md (Phase 2). Reason-specific message so the
+            # client can distinguish missing field / missing pre-registration
+            # / predictive rejection.
             if e.reason == "HALO_PROGRAM_NOT_REGISTERED":
                 message = (
                     "Halo rejected: program not pre-registered. Call "
                     "POST /halo/programs with this halo_job_id before issuing "
                     "LLM requests."
+                )
+            elif e.reason == "HALO_ADMISSION_PREDICTED":
+                message = (
+                    "Halo rejected: predictive admission gate — admitting this "
+                    "request would push too many active jobs over their SLO. "
+                    "Retry later or raise --halo-admission-violation-threshold."
+                )
+            elif e.reason == "HALO_CONCURRENCY_CAP":
+                message = (
+                    "Halo rejected: per-job concurrency cap exceeded "
+                    "(declared_max_concurrency in register_program). "
+                    "Wait for an in-flight call to finish before retrying."
                 )
             else:
                 message = (
@@ -2645,16 +2678,8 @@ class Scheduler(
             )
             return True
 
-        # Mark admission timestamp + capture prefix match length for solo-run
-        # baseline. We reuse the admission_control prefix-len helper so the
-        # two paths see the exact same number (avoids drift).
         recv_req.halo_first_admitted_ts = time.monotonic()
-        try:
-            recv_req.halo_prefix_len_at_admission = (
-                self._admission_match_prefix_len(recv_req)
-            )
-        except Exception:  # noqa: BLE001 — Halo must never crash request path
-            recv_req.halo_prefix_len_at_admission = 0
+        recv_req.halo_prefix_len_at_admission = prefix_len
         return False
 
     def _halo_on_request_finished(self, req: Req) -> None:
@@ -2746,6 +2771,9 @@ class Scheduler(
             expected_input_lens=recv_req.expected_input_lens,
             expected_output_lens=recv_req.expected_output_lens,
             dag=recv_req.dag,
+            declared_max_concurrency=getattr(
+                recv_req, "declared_max_concurrency", None
+            ),
         )
         return HaloRegisterProgramReqOutput(
             registered=result.registered,
