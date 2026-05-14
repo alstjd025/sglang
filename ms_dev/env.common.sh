@@ -74,7 +74,7 @@ export SGLANG_ADMISSION_DECISION_LOG="${SGLANG_ADMISSION_DECISION_LOG:-}"
 # Off by default. See managers/halo/CLAUDE.md and ms_dev/halo_dev/CLAUDE.md.
 # Translated to --halo-* CLI flags by lib_server.sh::append_halo_args.
 # To turn on for an experiment, set SGLANG_HALO_ENABLED=1 (one-off) or
-# source ms_dev/experiments/halo_observe_only.sh.
+# source ms_dev/experiments/halo_base.sh.
 export SGLANG_HALO_ENABLED="${SGLANG_HALO_ENABLED:-0}"
 export SGLANG_HALO_DEFAULT_SLO="${SGLANG_HALO_DEFAULT_SLO:-}"
 export SGLANG_HALO_TICK_INTERVAL_MS="${SGLANG_HALO_TICK_INTERVAL_MS:-}"
@@ -88,7 +88,7 @@ export SGLANG_HALO_QUIESCENT_TIMEOUT_SECONDS="${SGLANG_HALO_QUIESCENT_TIMEOUT_SE
 # ms_dev/halo_dev/prediction_model.md and tools/halo/README.md.
 # When SGLANG_HALO_STEP_COST_MODEL is set, it supersedes the legacy
 # prefill/tbt path pair. When SGLANG_HALO_COST_MODEL_SAMPLE_LOG is set
-# (to "auto", "1", or an explicit path), expctl/run_experiment.py
+# (to "auto", "1", or an explicit path), expctl/server_run_experiment.py
 # auto-routes to <session>/halo_cost_samples.jsonl (unless an absolute
 # path is given) AND auto-adds --disable-overlap-schedule because the
 # sampler is only valid in normal-mode scheduling.
@@ -96,7 +96,7 @@ export SGLANG_HALO_STEP_COST_MODEL="${SGLANG_HALO_STEP_COST_MODEL:-}"
 export SGLANG_HALO_COST_MODEL_SAMPLE_LOG="${SGLANG_HALO_COST_MODEL_SAMPLE_LOG:-}"
 export SGLANG_HALO_COST_MODEL_SAMPLE_EVERY="${SGLANG_HALO_COST_MODEL_SAMPLE_EVERY:-}"
 # Phase 2 admission control — see ms_dev/halo_dev/admission_design.md.
-# When SGLANG_HALO_ADMISSION_MODE != "off", expctl/run_experiment.py auto-
+# When SGLANG_HALO_ADMISSION_MODE != "off", expctl/server_run_experiment.py auto-
 # routes SGLANG_HALO_ADMISSION_DECISION_LOG to <session>/admission_decisions.jsonl.
 export SGLANG_HALO_ADMISSION_MODE="${SGLANG_HALO_ADMISSION_MODE:-off}"
 export SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD="${SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD:-}"

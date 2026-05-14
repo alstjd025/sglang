@@ -196,7 +196,7 @@ process batch stats.
 
 ```bash
 # Live monitor + saved session
-python3 ms_dev/expctl/run_experiment.py --mode single
+python3 ms_dev/expctl/server_run_experiment.py --mode single
 
 # After run
 python3 ms_dev/expctl/export_session_csv.py --session-dir <sess>

@@ -32,13 +32,13 @@ the §18 TBT cost-model cliff).
 Set **one** env var (`SGLANG_HALO_COST_MODEL_SAMPLE_LOG`) to enable
 collection; everything else is automatic.
 
-### Terminal 1 — Server orchestrator (`expctl/run_experiment.py`)
+### Terminal 1 — Server orchestrator (`expctl/server_run_experiment.py`)
 
 ```bash
 # "auto" → file is auto-routed to <session>/halo_cost_samples.jsonl.
 # Use an absolute path instead if you need to pin the location.
 SGLANG_HALO_COST_MODEL_SAMPLE_LOG=auto \
-python3 ms_dev/expctl/run_experiment.py --mode single --session-name halo_cost_fit
+python3 ms_dev/expctl/server_run_experiment.py --mode single --session-name halo_cost_fit
 ```
 
 What this does automatically:
@@ -59,7 +59,7 @@ Other env vars you can set (all optional):
 | `SGLANG_HALO_COST_MODEL_SAMPLE_EVERY=<N>` | subsample: write every Nth step. Default 1. Bump up if hot-path queue pressure shows in WARNs or disk fills too fast. |
 | `SGLANG_HALO_ENABLED=1` | also run the Halo controller. Not needed for fit-data collection — the sampler is fully independent. |
 
-You don't need to set anything else — `expctl/run_experiment.py` already
+You don't need to set anything else — `expctl/server_run_experiment.py` already
 launches the single server, scrapes Prometheus, renders the live panel, and
 saves the session folder.
 
@@ -175,13 +175,13 @@ Useful filters when diagnosing fit subsets:
 
 ## 3. Use the fitted model
 
-The easy path: source `ms_dev/experiments/halo_observe_only.sh` — it sets
+The easy path: source `ms_dev/experiments/halo_base.sh` — it sets
 `SGLANG_HALO_STEP_COST_MODEL` to the split JSON path by default. This is
 the recommended way to launch Halo on this host:
 
 ```bash
-source ms_dev/experiments/halo_observe_only.sh
-python3 ms_dev/expctl/run_experiment.py --mode single --session-name <name>
+source ms_dev/experiments/halo_base.sh
+python3 ms_dev/expctl/server_run_experiment.py --mode single --session-name <name>
 ```
 
 If running outside that wrapper, set the env var directly:
@@ -189,7 +189,7 @@ If running outside that wrapper, set the env var directly:
 ```bash
 SGLANG_HALO_ENABLED=1 \
 SGLANG_HALO_STEP_COST_MODEL=ms_dev/runtime/cost_models/halo_step_split_llama3-70b_b200x4.json \
-python3 ms_dev/expctl/run_experiment.py --mode single --session-name halo_step_verify
+python3 ms_dev/expctl/server_run_experiment.py --mode single --session-name halo_step_verify
 ```
 
 When `SGLANG_HALO_STEP_COST_MODEL` is set, the server **supersedes** the

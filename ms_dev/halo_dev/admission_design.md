@@ -195,8 +195,8 @@ python/sglang/srt/managers/halo/
 |---|---|
 | `ms_dev/env.common.sh` | 5 개 새 env vars (SGLANG_HALO_ADMISSION_*) |
 | `ms_dev/lib_server.sh::append_halo_args` | env var → CLI 변환 |
-| `ms_dev/expctl/run_experiment.py` | env var snapshot 확장. decision_log auto-route. meta 기록 |
-| `ms_dev/experiments/halo_observe_only.sh` | 기본은 admission off 유지. 사용자가 명시적으로 켜는 패턴 |
+| `ms_dev/expctl/server_run_experiment.py` | env var snapshot 확장. decision_log auto-route. meta 기록 |
+| `ms_dev/experiments/halo_base.sh` | 기본은 admission off 유지. 사용자가 명시적으로 켜는 패턴 |
 
 ## 7. JSON / decision log 스키마
 

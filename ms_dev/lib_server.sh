@@ -182,7 +182,7 @@ append_halo_args() {
 
   # The cost-model sampler is INDEPENDENT of --halo-enabled — fit-data
   # collection works with Halo off. Forward those two flags even when the
-  # Halo controller is disabled. expctl/run_experiment.py already routes
+  # Halo controller is disabled. expctl/server_run_experiment.py already routes
   # the sample-log path into the session dir.
   if [[ -n "${SGLANG_HALO_COST_MODEL_SAMPLE_LOG:-}" ]]; then
     _halo_out+=(--halo-cost-model-sample-log "${SGLANG_HALO_COST_MODEL_SAMPLE_LOG}")

@@ -44,7 +44,7 @@ python tools/admission_control/fit_cost_model.py tbt \
 
 ```bash
 source ms_dev/experiments/admission_dryrun.sh
-python3 ms_dev/expctl/run_experiment.py --mode single
+python3 ms_dev/expctl/server_run_experiment.py --mode single
 ```
 
 이렇게 하면:
@@ -75,7 +75,7 @@ export SGLANG_ADMISSION_TBT_COST_MODEL=ms_dev/runtime/cost_models/tbt_llama3-70b
 export SGLANG_ADMISSION_DRY_RUN=1                 # ★ 거절 안 함, 결정만 기록
 
 # DECISION_LOG는 명시 안 해도 됨 — run_experiment가 자동으로 세션 폴더에 라우팅
-python3 ms_dev/expctl/run_experiment.py --mode single
+python3 ms_dev/expctl/server_run_experiment.py --mode single
 ```
 
 ### 1-C. SLO 튠 (replay)
@@ -488,7 +488,7 @@ features: server_hicache_l2=ON | server_hicache_l3=OFF | admission=DRY_RUN ttft=
 
 ```bash
 source ms_dev/experiments/admission_ratio_with_safety.sh
-python3 ms_dev/expctl/run_experiment.py --mode single
+python3 ms_dev/expctl/server_run_experiment.py --mode single
 ```
 
 새 실험이 필요하면 같은 패턴으로 추가. `ms_dev/experiments/README.md` 참고.
@@ -529,7 +529,7 @@ export SGLANG_ADMISSION_TBT_COST_MODEL=/abs/path/tbt.json
 
 ```bash
 source ms_dev/experiments/admission_dryrun.sh
-python3 ms_dev/expctl/run_experiment.py --mode single --session-name slo_tune_$(date +%Y%m%d_%H%M%S)
+python3 ms_dev/expctl/server_run_experiment.py --mode single --session-name slo_tune_$(date +%Y%m%d_%H%M%S)
 # (평소 stress test 워크로드 발사 — 최소 1000건+ 결정 모음)
 ```
 
@@ -652,7 +652,7 @@ event_loop_normal() → forward_step() → response
 | Shell 와이어링 | `ms_dev/env.common.sh`, `ms_dev/lib_server.sh`, `ms_dev/env.sh` |
 | Experiment wrappers | `ms_dev/experiments/admission_*.sh` |
 | Personal default (gitignored) | `ms_dev/env.local.sh` |
-| Per-session 자동 라우팅 | `ms_dev/expctl/run_experiment.py` (`admission_config` block, decision log) |
+| Per-session 자동 라우팅 | `ms_dev/expctl/server_run_experiment.py` (`admission_config` block, decision log) |
 | 단위 테스트 | `test/registered/admission/test_admission_control.py` (72 cases) |
 
 ---

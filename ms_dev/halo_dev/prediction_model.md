@@ -224,7 +224,7 @@ legacy 동작.
 
 `num_prefill_reqs`, `num_decode_reqs`, `max_kv` 는 옵션 필드 (fit 자체에는 안 쓰이지만 진단·다항식 확장 시 유용).
 
-`ms_dev/expctl/run_experiment.py` 가 session 시작 시 `SGLANG_HALO_COST_MODEL_SAMPLE_LOG` 를 `<session_dir>/halo_cost_samples.jsonl` 로 auto-route (pin 안 됐을 때).
+`ms_dev/expctl/server_run_experiment.py` 가 session 시작 시 `SGLANG_HALO_COST_MODEL_SAMPLE_LOG` 를 `<session_dir>/halo_cost_samples.jsonl` 로 auto-route (pin 안 됐을 때).
 
 ## 10. Fit 절차
 
@@ -300,7 +300,7 @@ else:
 | `tools/halo/__init__.py`, `tools/halo/CLAUDE.md` | 디렉터리 정비 |
 | `test/registered/halo/test_halo_phase1.py` 또는 신규 | `HaloStepCostModel` 단위 테스트 (식 sanity, JSON roundtrip, solo↔batched 일관성) |
 | `ms_dev/env.common.sh`, `ms_dev/lib_server.sh` | 두 env var → 두 CLI 플래그 변환 |
-| `ms_dev/expctl/run_experiment.py` | `halo_cost_samples.jsonl` auto-route + meta 기록 |
+| `ms_dev/expctl/server_run_experiment.py` | `halo_cost_samples.jsonl` auto-route + meta 기록 |
 | `ms_dev/expctl/monitoring_view.py` | runtime feature-flag 행에 `halo_step_cost_model=loaded/legacy/off` 표시 |
 | `runtime/cost_models/README.md` | 새 `halo_step_*.json` 형식 인덱스 + cliff 해결 노트 |
 | `python/sglang/srt/managers/halo/CLAUDE.md` | "Cost model brittleness inherited" 섹션 갱신, prediction_model.md 참조 |
@@ -529,7 +529,7 @@ T_decode_step ≈ θ_d1·Σrⱼ + θ_d2·bs_d + θ_c_d
 
 - `tools/halo/fit_halo_cost_model.py --form` default = `split`.
   unified 로 fit 하려면 명시적으로 `--form unified` 필요.
-- `ms_dev/experiments/halo_observe_only.sh` 가 `SGLANG_HALO_STEP_COST_MODEL`
+- `ms_dev/experiments/halo_base.sh` 가 `SGLANG_HALO_STEP_COST_MODEL`
   을 split JSON path 로 default export. legacy 두 모델 path 도 fallback
   으로 살아 있지만, step 모델이 set 되어 있으면 server 가 그걸 우선 사용.
 

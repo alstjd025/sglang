@@ -8,7 +8,7 @@
 #
 # Usage:
 #   source ms_dev/experiments/admission_dryrun.sh
-#   python3 ms_dev/expctl/run_experiment.py --mode single
+#   python3 ms_dev/expctl/server_run_experiment.py --mode single
 #
 # Then after the session:
 #   python tools/admission_control/replay_admission.py \

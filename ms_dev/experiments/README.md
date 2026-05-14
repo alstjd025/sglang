@@ -18,8 +18,8 @@ experiment creates dirty git diffs and makes runs hard to compare. Instead:
 
 ```bash
 #!/usr/bin/env bash
-# Source this file before running ms_dev/expctl/run_experiment.py.
-# Usage:   source ms_dev/experiments/<name>.sh && python3 ms_dev/expctl/run_experiment.py --mode single
+# Source this file before running ms_dev/expctl/server_run_experiment.py.
+# Usage:   source ms_dev/experiments/<name>.sh && python3 ms_dev/expctl/server_run_experiment.py --mode single
 
 # ... export SGLANG_* env vars here ...
 ```
@@ -38,7 +38,7 @@ the calling shell, so anything `export`ed here flows all the way to
 | `admission_ratio_ttft_only.sh` | Hybrid: TTFT ratio + absolute TBT SLO with reactive EWMA. Use when TBT cost model is brittle. |
 | `admission_dryrun.sh` | Same as `_with_safety.sh` but with dry-run on — for SLO tuning against real traffic. |
 | `admission_off.sh` | Unsets every `SGLANG_ADMISSION_*` env var so the next run launches sglang with no admission control at all. Useful as a clean baseline or after sourcing a wrapper you want to undo. |
-| `halo_observe_only.sh` | **Project Halo Phase 1** — turns on job-level slowdown tracking (observation only, no admission/scheduling decisions). Each request MUST carry `halo_job_id` (HTTP 400 otherwise). Per-sweep snapshot logged to `<session>/halo_jobs.jsonl`. See `ms_dev/halo_dev/CLAUDE.md`. |
+| `halo_base.sh` | **Project Halo Phase 1** — turns on job-level slowdown tracking (observation only, no admission/scheduling decisions). Each request MUST carry `halo_job_id` (HTTP 400 otherwise). Per-sweep snapshot logged to `<session>/halo_jobs.jsonl`. See `ms_dev/halo_dev/CLAUDE.md`. |
 | `halo_off.sh` | Unsets every `SGLANG_HALO_*` env var so the next run launches sglang with no Halo tracking. |
 
 After running an experiment session, the resulting session folder contains

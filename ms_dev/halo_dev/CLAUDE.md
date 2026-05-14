@@ -338,7 +338,7 @@ python/sglang/srt/managers/halo/                ← 신규 패키지
   - SlowdownTracker.sweep() 시뮬레이션 (가짜 req 리스트 + 가짜 cost model)
   - Aggregator (max/avg) 정확성
   - off-by-default 동작 (controller=None일 때 hook이 zero-cost)
-- 통합 테스트: ms_dev/experiments/halo_observe_only.sh 로 짧은 실험 1회 돌려
+- 통합 테스트: ms_dev/experiments/halo_base.sh 로 짧은 실험 1회 돌려
   `halo_jobs.jsonl` 이 생성되고 slowdown 분포가 합리적인지 확인.
 
 ## 6. 구현 순서 (제안)
@@ -416,7 +416,7 @@ class Job:
 13. ✅ `/server_info` halo_state 노출
 14. ✅ `test/registered/halo/test_halo_phase1.py` — 19 tests, all green (CPU stage-a)
 15. ✅ `ms_dev/` 통합 (env vars, lib_server.sh, experiments wrapper, expctl monitoring)
-16. ⏳ 짧은 통합 실험 1회 + 결과 캡처 (사용자 실행 필요 — `source ms_dev/experiments/halo_observe_only.sh && python3 ms_dev/expctl/run_experiment.py --mode single`)
+16. ⏳ 짧은 통합 실험 1회 + 결과 캡처 (사용자 실행 필요 — `source ms_dev/experiments/halo_base.sh && python3 ms_dev/expctl/server_run_experiment.py --mode single`)
 17. ⏳ Agent_applications 클라이언트 측에 `halo_job_id` / `halo_slo` 필드 추가 (Phase 1 strict mode → 빠지면 400)
 
 ## 10. 커밋 히스토리 (전체, 시간 역순)
@@ -1104,7 +1104,7 @@ T_step ≈ θ_p1·Σnᵢ² + θ_p2·Σ(nᵢ·rᵢ) + θ_p3·Σnᵢ
 | ID | 결정 |
 |---|---|
 | 모델 형태 | `HaloStepCostModel` — 두 form 지원: **unified (`halo_step_v1`, 6 계수)** + **split (`halo_step_split_v1`, 7 계수, MuxWise 원본 형태)** |
-| Form 선택 기준 | MIXED step 발생 시 unified, 없으면 split. 본 호스트 (mixed_chunk off) 에선 **split default 채택** (2026-05-14, ground-truth 검증 후 — [`prediction_model.md`](prediction_model.md) §17). `fit_halo_cost_model.py --form` default=`split`. `halo_observe_only.sh` 가 split JSON 을 default export. |
+| Form 선택 기준 | MIXED step 발생 시 unified, 없으면 split. 본 호스트 (mixed_chunk off) 에선 **split default 채택** (2026-05-14, ground-truth 검증 후 — [`prediction_model.md`](prediction_model.md) §17). `fit_halo_cost_model.py --form` default=`split`. `halo_base.sh` 가 split JSON 을 default export. |
 | Solo vs batched | 같은 모델·계수, caller 가 입력 모드 선택. Halo R1 분모는 solo (1 요청 가정) |
 | `Σ(nᵢ·rᵢ)` cross-term | 포함 (cache hit ≥ 90% 워크로드라 비중 큼) |
 | Contention guard | 없음 (drift 보이면 추후 EWMA 보정 추가) |
@@ -1158,7 +1158,7 @@ python/sglang/srt/entrypoints/{http_server, openai/{protocol, serving_chat, serv
 python/sglang/srt/server_args.py
 test/registered/halo/{CLAUDE.md, test_halo_phase1.py}          ← 39 tests
 ms_dev/{env.common.sh, lib_server.sh, start_server_no_pd.sh, CLAUDE.md}
-ms_dev/experiments/{halo_observe_only.sh, halo_off.sh, README.md}
+ms_dev/experiments/{halo_base.sh, halo_off.sh, README.md}
 ms_dev/expctl/{run_experiment.py, monitoring_view.py, CLAUDE.md}
 ms_dev/halo_dev/{CLAUDE.md, halo_api_reference.md, verify/{CLAUDE.md, microbench_overhead.py, e2e_smoke.sh}}
 ```

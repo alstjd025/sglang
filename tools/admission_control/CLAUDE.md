@@ -141,7 +141,7 @@ The simplest path:
 
 ```bash
 source ms_dev/experiments/admission_dryrun.sh
-python3 ms_dev/expctl/run_experiment.py --mode single
+python3 ms_dev/expctl/server_run_experiment.py --mode single
 # ...drive your stress workload...
 ```
 

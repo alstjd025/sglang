@@ -11,7 +11,7 @@
 #
 # Usage:
 #   source ms_dev/experiments/admission_ratio_only.sh
-#   python3 ms_dev/expctl/run_experiment.py --mode single
+#   python3 ms_dev/expctl/server_run_experiment.py --mode single
 
 # Cost models (regenerate via tools/admission_control/fit_cost_model.py if
 # the model / GPU / TP / quantization / kernel cache changes).

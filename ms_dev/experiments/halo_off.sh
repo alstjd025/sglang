@@ -7,7 +7,7 @@
 #
 # Usage:
 #   source ms_dev/experiments/halo_off.sh
-#   python3 ms_dev/expctl/run_experiment.py --mode single
+#   python3 ms_dev/expctl/server_run_experiment.py --mode single
 
 _vars="$(compgen -v 2>/dev/null | grep '^SGLANG_HALO_' || true)"
 if [[ -n "$_vars" ]]; then

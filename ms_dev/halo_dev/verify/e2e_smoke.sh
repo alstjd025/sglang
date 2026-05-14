@@ -9,8 +9,8 @@
 # shows admission and Halo state in real time:
 #
 #   # Terminal 1
-#   source ms_dev/experiments/halo_observe_only.sh
-#   python3 ms_dev/expctl/run_experiment.py --mode single
+#   source ms_dev/experiments/halo_base.sh
+#   python3 ms_dev/expctl/server_run_experiment.py --mode single
 #
 #   # Terminal 2 — wait for "Server ready" in terminal 1, then:
 #   bash ms_dev/halo_dev/verify/e2e_smoke.sh
@@ -24,7 +24,7 @@
 #   - mean_smax / mean_smean / worst_smax / slo_violations
 #
 # Standalone fallback (no monitor panel — still works):
-#   source ms_dev/experiments/halo_observe_only.sh
+#   source ms_dev/experiments/halo_base.sh
 #   bash ms_dev/start_server_no_pd.sh
 #
 # Usage:

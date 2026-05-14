@@ -15,12 +15,12 @@ For internal design / phase plan / decision log, see:
 
 Halo is off by default. To turn on, launch sglang with `--halo-enabled`
 plus at least the SLO-related cost model paths so slowdown math has
-something to chew on. The pre-baked wrapper `ms_dev/experiments/halo_observe_only.sh`
+something to chew on. The pre-baked wrapper `ms_dev/experiments/halo_base.sh`
 sets sensible defaults:
 
 ```bash
-source ms_dev/experiments/halo_observe_only.sh
-python3 ms_dev/expctl/run_experiment.py --mode single
+source ms_dev/experiments/halo_base.sh
+python3 ms_dev/expctl/server_run_experiment.py --mode single
 ```
 
 ### CLI flags

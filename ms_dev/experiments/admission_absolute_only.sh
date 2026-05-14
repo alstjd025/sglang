@@ -6,7 +6,7 @@
 #
 # Usage:
 #   source ms_dev/experiments/admission_absolute_only.sh
-#   python3 ms_dev/expctl/run_experiment.py --mode single
+#   python3 ms_dev/expctl/server_run_experiment.py --mode single
 
 # Resolve repo root from this script's own location so cwd doesn't matter.
 _self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

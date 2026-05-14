@@ -81,13 +81,13 @@ sessions/<YYMMDD_HHMM>_<name>/
 ### 1) PD 모드 (기본)
 
 ```bash
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py
 ```
 
 ### 2) Single 모드
 
 ```bash
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py --mode single
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py --mode single
 ```
 
 ## After The Run
@@ -148,7 +148,7 @@ export SGLANG_PD_DECODE_OFFLOAD_ENABLE=0
 ### 1) PD 기본 포트
 
 ```bash
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py
 ```
 
 기본 포트:
@@ -160,7 +160,7 @@ python3 /workspace/sglang/ms_dev/expctl/run_experiment.py
 ### 2) PD 포트 변경
 
 ```bash
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py \
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py \
   --prefill-port 31002 \
   --decode-port 31001 \
   --router-port 31000 \
@@ -170,7 +170,7 @@ python3 /workspace/sglang/ms_dev/expctl/run_experiment.py \
 ### 3) Single 모드 + 포트 지정
 
 ```bash
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py \
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py \
   --mode single \
   --single-port 31000
 ```
@@ -178,7 +178,7 @@ python3 /workspace/sglang/ms_dev/expctl/run_experiment.py \
 ### 4) 세션 이름/저장 경로 지정
 
 ```bash
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py \
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py \
   --session-name long_stress_v1 \
   --session-root /workspace/sglang/ms_dev/runtime/sessions
 ```
@@ -186,7 +186,7 @@ python3 /workspace/sglang/ms_dev/expctl/run_experiment.py \
 ### 5) 폴링/상태판 주기 조정
 
 ```bash
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py \
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py \
   --scrape-interval 1.0 \
   --status-interval 3.0 \
   --metrics-timeout 5.0
@@ -195,22 +195,22 @@ python3 /workspace/sglang/ms_dev/expctl/run_experiment.py \
 ### 6) 상태판 끄기 / 컬러 제어
 
 ```bash
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py --quiet-status
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py --no-color
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py --force-color
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py --quiet-status
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py --no-color
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py --force-color
 ```
 
 ### 7) PD에서 일부 역할 제외
 
 ```bash
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py --no-router
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py --no-decode
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py --no-router
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py --no-decode
 ```
 
 ## CLI
 
 ```bash
-python3 /workspace/sglang/ms_dev/expctl/run_experiment.py --help
+python3 /workspace/sglang/ms_dev/expctl/server_run_experiment.py --help
 ```
 
 주요 옵션:

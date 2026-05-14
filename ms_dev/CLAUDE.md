@@ -190,7 +190,7 @@ Same three patterns as admission control: ad-hoc shell `export`, committed
 wrapper under `ms_dev/experiments/halo_*.sh`, or host-local `env.local.sh`.
 Pre-baked wrappers:
 
-- `halo_observe_only.sh` — turn on with sensible defaults + cost models from
+- `halo_base.sh` — turn on with sensible defaults + cost models from
   admission_control. **Strict mode**: clients must send `halo_job_id`.
 - `halo_off.sh` — clean baseline (unsets all `SGLANG_HALO_*`).
 
@@ -209,8 +209,8 @@ bash ms_dev/start_server_pd_decode.sh
 bash ms_dev/start_router_pd.sh
 
 # Orchestrated (recommended) — runs everything + monitor + saves session
-python3 ms_dev/expctl/run_experiment.py --mode single
-python3 ms_dev/expctl/run_experiment.py --mode pd
+python3 ms_dev/expctl/server_run_experiment.py --mode single
+python3 ms_dev/expctl/server_run_experiment.py --mode pd
 
 # Stop everything
 bash ms_dev/stop_servers.sh
@@ -235,7 +235,7 @@ export SGLANG_ADMISSION_PREFILL_COST_MODEL=ms_dev/runtime/cost_models/prefill_ll
 export SGLANG_ADMISSION_TBT_COST_MODEL=ms_dev/runtime/cost_models/tbt_llama3-70b.json
 export SGLANG_ADMISSION_DRY_RUN=1
 
-python3 ms_dev/expctl/run_experiment.py --mode single
+python3 ms_dev/expctl/server_run_experiment.py --mode single
 # status panel shows: admission=DRY_RUN ttft=30s tbt=200ms
 ```
 
