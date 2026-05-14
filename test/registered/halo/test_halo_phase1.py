@@ -715,10 +715,61 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
         self.assertEqual(rows[0]["decision"], "admit")
         self.assertEqual(rows[0]["mode"], "level0")
 
-    def test_level2_uses_lookahead_predictor(self):
-        c = self._make_controller(admission_mode="level2")
+    def test_level2_falls_back_to_level0_with_warn(self):
+        """DEPRECATED 2026-05-15 — admission_mode=level2 must fall back to
+        SnapshotAdmissionPredictor with a startup warning. The lookahead
+        class lingers in the source tree but is not on the admission path."""
+        with self.assertLogs(
+            "sglang.srt.managers.halo.controller", level="WARNING"
+        ) as captured:
+            c = self._make_controller(admission_mode="level2")
         self.assertIsNotNone(c.admission_predictor)
-        self.assertEqual(c.admission_predictor.mode_name, "level2")
+        self.assertEqual(c.admission_predictor.mode_name, "level0")
+        self.assertTrue(
+            any("DEPRECATED" in m for m in captured.output),
+            captured.output,
+        )
+
+    def test_followup_requests_skip_stage_a(self):
+        """Job-level reject (2026-05-15): admission decision is taken
+        *once per job* — at the first request. Follow-up requests inside
+        the same job must bypass Stage A, even when active load would
+        trip it. We verify this by stuffing a violating predictor (mock)
+        and confirming the *second* register_request succeeds anyway."""
+        c = self._make_controller(admission_mode="level0",
+                                  admission_violation_threshold=0.2)
+        c.register_program("agent-1", slo=5.0, total_calls=2)
+        # First request admits.
+        c.register_request(
+            rid="rid-1", halo_job_id="agent-1", halo_slo=5.0,
+            prompt_len=1000, prefix_len=500,
+            active_request_infos=[],
+        )
+        # Force-replace the predictor with one that always rejects. If
+        # Stage A were called, this would raise.
+        from sglang.srt.managers.halo.admission_decision import (
+            AdmissionPredictor,
+        )
+
+        class _AlwaysRejectPredictor(AdmissionPredictor):
+            mode_name = "test_reject_all"
+            def predict(self, active_jobs, new_job):
+                return {j.job_id: 999.0 for j in active_jobs}
+
+        c.admission_predictor = _AlwaysRejectPredictor(c.tracker.step_cost)
+        # Build a fake active info so the controller would otherwise run
+        # Stage A. The second call belongs to the same job → must skip.
+        info = RequestExecutionInfo(
+            rid="rid-1", job_id="agent-1", prompt_len=1000,
+            prefix_len_at_admission=500, decoded_tokens_so_far=20,
+            kv_len_now=1020, elapsed_ms=200.0,
+        )
+        job = c.register_request(
+            rid="rid-2", halo_job_id="agent-1", halo_slo=5.0,
+            prompt_len=2000, prefix_len=1500,
+            active_request_infos=[info],
+        )
+        self.assertEqual(job.job_id, "agent-1")
 
 
 class TestPhase2StageBConcurrencyCap(unittest.TestCase):

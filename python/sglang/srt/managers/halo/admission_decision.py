@@ -6,12 +6,16 @@ Core idea (different from request-level admission_control):
     Reject a new job if admitting it would push too many *currently active
     jobs* over their SLO. Decision uses the Halo Step Cost Model (the same
     cost model that powers R1 slowdown tracking) to predict each active
-    job's final slowdown after the new arrival.
+    job's *predicted virtual job slowdown* after the new arrival.
 
-Three pluggable predictor variants share one interface:
-    - SnapshotAdmissionPredictor  (Level 0): time-invariant snapshot scaling.
-    - LookaheadAdmissionPredictor (Level 2): 1-second slice forward simulation.
-    - (future) Level 1 fixed-horizon, EWMA-corrected, etc.
+Predictor variants:
+    - SnapshotAdmissionPredictor  (Level 0): per-job stretch model. Current
+      production default. Each active job's stretch is taken from its own
+      current phase (prefill vs decode). No DAG / remaining-call lookahead.
+    - LookaheadAdmissionPredictor (Level 2): 1-second slice forward simulation
+      that used declared DAG / remaining lengths. **DEPRECATED 2026-05-15**:
+      not selected at runtime (controller falls back to level0 with a WARN).
+      Code retained for reference but is not on the admission path.
 
 decide_admission(...) glues a predictor's output to the violation-ratio
 threshold (D3 = 0.2) and returns AdmissionDecisionResult — the controller
@@ -56,8 +60,10 @@ class JobLookaheadInput:
     """Per-active-job snapshot consumed by AdmissionPredictor.
 
     All fields after ``current_solo_elapsed_ms`` are *declared* and may be
-    None if the job's register_program payload omitted them — predictors
-    must handle that gracefully (e.g. fall back to "no remaining estimate").
+    None. **As of 2026-05-15 (per-job-stretch refactor)** the production
+    SnapshotAdmissionPredictor IGNORES every declared field — they are kept
+    on the dataclass solely for the deprecated LookaheadAdmissionPredictor
+    and any future predictor that may reuse them.
     """
 
     job_id: str
@@ -66,7 +72,7 @@ class JobLookaheadInput:
     active_calls: Tuple[ActiveCallInfo, ...]
     current_actual_elapsed_ms: float
     current_solo_elapsed_ms: float  # cost_model.solo accumulated so far
-    # Declared structure (opt-in — None if not registered)
+    # ---- LEGACY (not used by SnapshotAdmissionPredictor since 2026-05-15) ----
     remaining_calls: Optional[int] = None
     remaining_stage_sequence: Optional[Tuple[str, ...]] = None
     expected_input_lens: Optional[Tuple[int, ...]] = None
@@ -81,6 +87,10 @@ class NewJobInput:
     The first call's input_len / prefix_len is always known at admit time
     (it's exactly what triggered the admission decision). Everything else
     is declared via register_program and is Optional.
+
+    **As of 2026-05-15** SnapshotAdmissionPredictor uses ONLY
+    ``first_call_input_len`` and ``first_call_prefix_len``. The remaining
+    fields are kept for the deprecated LookaheadAdmissionPredictor.
     """
 
     job_id: str
@@ -89,7 +99,7 @@ class NewJobInput:
     first_call_input_len: int
     first_call_prefix_len: int = 0
     first_call_expected_output_len: int = 0
-    # Declared structure (opt-in)
+    # ---- LEGACY (not used by SnapshotAdmissionPredictor since 2026-05-15) ----
     total_calls: Optional[int] = None
     stage_sequence: Optional[Tuple[str, ...]] = None
     expected_input_lens: Optional[Tuple[int, ...]] = None
@@ -111,7 +121,9 @@ class AdmissionDecisionResult:
     violation_count: int
     active_jobs_total: int
     threshold: float
-    predicted_slowdowns: Dict[str, float]  # job_id → predicted final slowdown_max
+    # Renamed 2026-05-15 (was: predicted_slowdowns). Job-id → predicted
+    # virtual job slowdown after admitting the new job.
+    predicted_virtual_job_slowdowns: Dict[str, float]
     # Optional / mode-specific diagnostic fields:
     horizon_sec: Optional[float] = None    # Level 2 only
     mode: str = ""                          # "level0" | "level2"
@@ -153,27 +165,33 @@ class AdmissionPredictor(ABC):
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers shared by predictors
 # ─────────────────────────────────────────────────────────────────────────────
-def _build_current_batch_features(
+def _split_current_batch_features(
     active_jobs: Sequence[JobLookaheadInput],
 ) -> Tuple[List[Tuple[int, int]], List[int]]:
-    """Returns (prefill_infos, decode_kvs) describing the current batch
-    composition as the cost model's estimate_step_ms expects."""
-    prefill_infos: List[Tuple[int, int]] = []
-    decode_kvs: List[int] = []
+    """Returns (current_prefill, current_decode) — the (n, r) list for
+    prefill-phase active calls and the KV-length list for decode-phase
+    active calls. Used to compose the cost-model inputs for the two
+    *separate* step types (sample env has mixed_chunk=OFF)."""
+    current_prefill: List[Tuple[int, int]] = []
+    current_decode: List[int] = []
     for job in active_jobs:
         for call in job.active_calls:
             if call.is_prefill:
                 n = max(0, call.prompt_len - call.prefix_len)
-                prefill_infos.append((n, call.prefix_len))
+                current_prefill.append((n, call.prefix_len))
             else:
-                decode_kvs.append(call.kv_len_now)
-    return prefill_infos, decode_kvs
+                current_decode.append(call.kv_len_now)
+    return current_prefill, current_decode
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# LEGACY HELPERS — kept for the deprecated LookaheadAdmissionPredictor.
+# Not used by SnapshotAdmissionPredictor since 2026-05-15.
+# ─────────────────────────────────────────────────────────────────────────────
 def _solo_call_ms(cost_model: HaloStepCostModel, n: int, r: int, out_len: int) -> float:
-    """Total solo wall-clock for one call: prefill + (output_len × per-step TBT
-    at average context). The split-form cost model is linear in r, so the
-    average KV (= input + output/2) is an exact integral substitute."""
+    """LEGACY (2026-05-15: declared lengths no longer used by admission).
+    Total solo wall-clock for one call.
+    """
     n_new = max(0, n - r)
     prefill_ms = cost_model.estimate_solo_prefill_total_ms(n_new, r)
     avg_kv = n + max(0, out_len // 2)
@@ -185,11 +203,8 @@ def _estimate_remaining_solo_ms(
     cost_model: HaloStepCostModel,
     job: JobLookaheadInput,
 ) -> Optional[float]:
-    """Sum of per-call solo time across the job's declared *remaining* calls.
-
-    Returns None when declared lengths are insufficient — predictors should
-    treat that as "no proactive prediction" (typically: keep the job's
-    current observed ratio as the prediction).
+    """LEGACY (2026-05-15: declared lengths no longer used by admission).
+    Sum of per-call solo time across the job's declared remaining calls.
     """
     seq = job.remaining_stage_sequence
     if not seq:
@@ -215,25 +230,40 @@ def _estimate_remaining_solo_ms(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Level 0 — Snapshot scaling
+# Level 0 — Per-job snapshot stretch (M-2, current production design)
 # ─────────────────────────────────────────────────────────────────────────────
 class SnapshotAdmissionPredictor(AdmissionPredictor):
-    """Time-invariant snapshot model.
+    """Per-job snapshot stretch — admits/rejects using only *current* batch
+    state plus the arriving request's first-call shape.
 
-    Algorithm:
-        current_step_ms   = cost_model.estimate_step_ms(current_batch)
-        augmented_step_ms = cost_model.estimate_step_ms(current_batch + new_first_call)
-        stretch_factor    = augmented_step_ms / current_step_ms
+    Algorithm (M-2, decided 2026-05-15):
 
-    For each active job j with declared remaining-solo R_solo_j:
-        remaining_actual_j  = R_solo_j * stretch_factor
-        final_actual_j      = current_actual_elapsed_j + remaining_actual_j
-        final_solo_j        = current_solo_elapsed_j   + R_solo_j
-        predicted_j         = final_actual_j / final_solo_j
+        # 1. Current batch composition
+        current_prefill = [(n_i, r_i) for prefill-phase active calls]
+        current_decode  = [kv_j      for decode-phase active calls]
 
-    If R_solo_j is unavailable (declared insufficient), fall back to the
-    job's *current observed* slowdown — the predictor refuses to extrapolate
-    without the structural information.
+        # 2. EXTEND step stretch — applies to prefill-phase active jobs
+        stretch_extend = cost([prefill + new_req_first_call], []) / cost(prefill, [])
+                         (= 1.0 when current_prefill is empty)
+
+        # 3. DECODE step stretch — applies to decode-phase active jobs
+        stretch_decode = cost([], [decode + new_req.prompt_len]) / cost([], decode)
+                         (= 1.0 when current_decode is empty)
+
+        # 4. Per-job: stretch by current phase
+        for each active job i:
+            if i has any active prefill call:
+                stretch_i = stretch_extend
+            else:
+                stretch_i = stretch_decode
+            current_VJS_i = (actual / solo) if solo > 0 else i.slo
+            predicted_VJS_i = current_VJS_i × stretch_i
+
+    No DAG, no remaining-call lookahead, no future-phase modelling. The
+    rationale (sample env runs with mixed_chunk=OFF so prefill and decode
+    are time-separated; admission decides only on the *immediate* impact of
+    the new request on each job's *own* current step type) is described in
+    ms_dev/halo_dev/admission_design.md §4.
     """
 
     mode_name = "level0"
@@ -243,43 +273,49 @@ class SnapshotAdmissionPredictor(AdmissionPredictor):
         active_jobs: Sequence[JobLookaheadInput],
         new_job: NewJobInput,
     ) -> Dict[str, float]:
-        current_prefill, current_decode = _build_current_batch_features(active_jobs)
-        current_step_ms = self.cost_model.estimate_step_ms(
-            current_prefill, current_decode
-        )
-        # New job's first call: prefill on (n, r).
+        current_prefill, current_decode = _split_current_batch_features(active_jobs)
+
+        # ── stretch_extend (used by prefill-phase active jobs) ───────────
         n_new = max(
             0,
             new_job.first_call_input_len - new_job.first_call_prefix_len,
         )
-        augmented_prefill = current_prefill + [(n_new, new_job.first_call_prefix_len)]
-        augmented_step_ms = self.cost_model.estimate_step_ms(
-            augmented_prefill, current_decode
-        )
-        # Guard against degenerate current state (empty batch).
-        if current_step_ms <= 0:
-            current_step_ms = max(augmented_step_ms, 1.0)
-        stretch = augmented_step_ms / current_step_ms
+        r_new = new_job.first_call_prefix_len
+        if current_prefill:
+            base_ext = self.cost_model.estimate_step_ms(current_prefill, [])
+            aug_ext = self.cost_model.estimate_step_ms(
+                current_prefill + [(n_new, r_new)], []
+            )
+            stretch_extend = aug_ext / base_ext if base_ext > 0 else 1.0
+        else:
+            # No prefill-phase active job will consume this anyway.
+            stretch_extend = 1.0
 
+        # ── stretch_decode (used by decode-phase active jobs) ────────────
+        if current_decode:
+            base_dec = self.cost_model.estimate_step_ms([], current_decode)
+            aug_dec = self.cost_model.estimate_step_ms(
+                [], current_decode + [new_job.first_call_input_len]
+            )
+            stretch_decode = aug_dec / base_dec if base_dec > 0 else 1.0
+        else:
+            stretch_decode = 1.0
+
+        # ── per-job: pick stretch by current phase ───────────────────────
         predictions: Dict[str, float] = {}
         for job in active_jobs:
-            remaining_solo = _estimate_remaining_solo_ms(self.cost_model, job)
-            if remaining_solo is None:
-                # No declared info — use current observed slowdown.
-                if job.current_solo_elapsed_ms > 0:
-                    predictions[job.job_id] = (
-                        job.current_actual_elapsed_ms / job.current_solo_elapsed_ms
-                    )
-                else:
-                    predictions[job.job_id] = job.slo
-                continue
-            remaining_actual = remaining_solo * stretch
-            final_actual = job.current_actual_elapsed_ms + remaining_actual
-            final_solo = job.current_solo_elapsed_ms + remaining_solo
-            if final_solo > 0:
-                predictions[job.job_id] = final_actual / final_solo
+            job_is_in_prefill = any(call.is_prefill for call in job.active_calls)
+            stretch_i = stretch_extend if job_is_in_prefill else stretch_decode
+
+            if job.current_solo_elapsed_ms > 0:
+                current_vjs = (
+                    job.current_actual_elapsed_ms / job.current_solo_elapsed_ms
+                )
             else:
-                predictions[job.job_id] = float("inf")
+                # Matches R1's initial slowdown_max = SLO convention.
+                current_vjs = job.slo
+
+            predictions[job.job_id] = current_vjs * stretch_i
         return predictions
 
 
@@ -287,7 +323,7 @@ class SnapshotAdmissionPredictor(AdmissionPredictor):
 # Decision wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 def decide_admission(
-    predictions: Dict[str, float],
+    predicted_virtual_job_slowdowns: Dict[str, float],
     slos: Dict[str, float],
     threshold: float,
     mode: str = "",
@@ -296,7 +332,8 @@ def decide_admission(
     """Apply the violation-ratio threshold to a predictor's output.
 
     Args:
-        predictions: {job_id: predicted_final_slowdown_max}
+        predicted_virtual_job_slowdowns: {job_id: predicted virtual job
+            slowdown after admitting the new job}.
         slos:        {job_id: SLO}. Falls back to the prediction's value if
                      missing (treats missing SLO as "always satisfied").
         threshold:   D3 — fraction (0..1). If violation_ratio > threshold,
@@ -307,6 +344,7 @@ def decide_admission(
     Returns:
         AdmissionDecisionResult with all fields populated.
     """
+    predictions = predicted_virtual_job_slowdowns
     total = len(predictions)
     if total == 0:
         return AdmissionDecisionResult(
@@ -316,7 +354,7 @@ def decide_admission(
             violation_count=0,
             active_jobs_total=0,
             threshold=threshold,
-            predicted_slowdowns={},
+            predicted_virtual_job_slowdowns={},
             horizon_sec=horizon_sec,
             mode=mode,
         )
@@ -334,7 +372,7 @@ def decide_admission(
             violation_count=violations,
             active_jobs_total=total,
             threshold=threshold,
-            predicted_slowdowns=dict(predictions),
+            predicted_virtual_job_slowdowns=dict(predictions),
             horizon_sec=horizon_sec,
             mode=mode,
         )
@@ -345,7 +383,7 @@ def decide_admission(
         violation_count=violations,
         active_jobs_total=total,
         threshold=threshold,
-        predicted_slowdowns=dict(predictions),
+        predicted_virtual_job_slowdowns=dict(predictions),
         horizon_sec=horizon_sec,
         mode=mode,
     )
@@ -380,33 +418,20 @@ class _SimJob:
 
 
 class LookaheadAdmissionPredictor(AdmissionPredictor):
-    """1-second slice forward simulation.
+    """**DEPRECATED 2026-05-15** — not used by the controller.
 
-    For each slice:
-      1. Compute step_ms from cost_model.estimate_step_ms over the current
-         simulated batch composition.
-      2. Advance each active call by `slice_ms / step_ms` steps. Prefill
-         calls finish their prefill in their first slice (the prefill cost
-         is folded into that slice's step_ms via the cost-model's prefill
-         terms) and flip to the decode phase afterwards.
-      3. When a call's decoded ≥ expected_output_len, retire it and pull
-         the job's next declared call (if any) into the active set.
-      4. All jobs accumulate elapsed_actual = elapsed_actual + slice_ms.
+    Original 1-second slice forward simulation that relied on each job's
+    *declared* DAG (remaining_stage_sequence, expected_input_lens,
+    expected_output_lens) to project future batch composition.
 
-    Termination:
-      * t ≥ horizon_sec, OR
-      * no job has any active or pending call.
-
-    Horizon selection (config_horizon_sec arg):
-      * > 0 → use it directly
-      * == 0 → SLO-driven: max over active jobs of
-                ((current_solo_elapsed + remaining_solo) × SLO / 1000),
-                capped at MAX_HORIZON_SEC.
-
-    Fallback: when a job has no declared expected_output_lens for its
-    *currently active* calls, the call has no terminating condition. We
-    treat it as "decode forever" within the horizon — accurate enough as
-    long as the horizon itself is bounded.
+    The 2026-05-15 design decision is to use *current state only* — no
+    DAG, no remaining-call lookahead. ``HaloController._build_admission_predictor``
+    now treats ``admission_mode='level2'`` as a soft fallback to
+    SnapshotAdmissionPredictor with a WARN at startup. This class is kept
+    in the source tree for reference (e.g. to revive once
+    `expected_output_lens` becomes reliable enough to project the cumulative
+    effect of new arrivals on existing jobs' slowdown), but it is not on
+    the production admission path.
     """
 
     mode_name = "level2"

@@ -291,10 +291,17 @@ class HaloController:
         if mode == "level0":
             return SnapshotAdmissionPredictor(step_cost)
         if mode == "level2":
-            return LookaheadAdmissionPredictor(
-                step_cost,
-                horizon_sec=float(config.admission_lookahead_horizon_sec),
+            # DEPRECATED 2026-05-15 — see admission_decision.py docstring.
+            # Lookahead used declared DAG/remaining-lengths which we now
+            # ignore (admission uses current state only). Fall back to
+            # level0 with a startup warning so misconfigured runs still
+            # proceed instead of silently disabling admission.
+            logger.warning(
+                "halo: admission_mode=level2 is DEPRECATED (2026-05-15); "
+                "falling back to level0 (snapshot per-job stretch). See "
+                "ms_dev/halo_dev/admission_design.md §4."
             )
+            return SnapshotAdmissionPredictor(step_cost)
         logger.warning(
             "halo: unknown admission_mode=%r — admission disabled", mode
         )
@@ -354,10 +361,19 @@ class HaloController:
             raise HaloRejectError(reason=REASON_PROGRAM_NOT_REGISTERED, rid=rid)
 
         # ── 3. Stage A — Predictive admission (Phase 2) ──────────────────
+        # Job-level reject (2026-05-15 design): the admission decision
+        # is made *once per job*, at the first request. Any follow-up
+        # request belonging to a job whose first request was already
+        # admitted bypasses Stage A entirely — rejecting it mid-chain
+        # would leave the job half-done and waste the work already put
+        # into earlier calls.
+        is_first_request = new_job_record.total_request_number == 0
+
         # Empty active list is still a valid input (auto-admit + log row);
         # only None means "scheduler did not provide the snapshot" → skip.
         if (
-            self.admission_predictor is not None
+            is_first_request
+            and self.admission_predictor is not None
             and active_request_infos is not None
         ):
             decision = self._stage_a_decide(
@@ -625,7 +641,9 @@ class HaloController:
                 "active_jobs_total": decision.active_jobs_total,
                 "threshold": decision.threshold,
                 "horizon_sec": decision.horizon_sec,
-                "predicted_slowdowns": decision.predicted_slowdowns,
+                # Renamed 2026-05-15: was "predicted_slowdowns".
+                "predicted_virtual_job_slowdowns":
+                    decision.predicted_virtual_job_slowdowns,
             }
         )
 

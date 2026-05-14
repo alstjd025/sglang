@@ -1182,13 +1182,17 @@ Phase 2 는 그 위에 **새 job 받기 결정** 을 *기존 job 들의 예측 s
 
 | Stage | 목적 | 입력 | 출력 |
 |---|---|---|---|
-| **A — Predictive (Level 0 / Level 2)** | 새 job 받으면 *기존 job 들의 predicted final slowdown_max 분포* | active jobs + new job + cost model | admit / reject + per-job 예측치 |
+| **A — Predictive (Level 0 only, M-2)** | 새 job 받으면 *기존 active job 들의 predicted virtual job slowdown 분포*. 결정은 *job 단위* — 첫 request 만 검사, 후속 request 는 자동 admit | active jobs + new job's first request + cost model | admit / reject + per-job 예측치 |
 | **B — Concurrency hard cap** | application 이 declare 한 *동시 in-flight* 약속을 enforce | declared_max_concurrency + current in_flight_count | admit / reject |
 
-### Level 0 / Level 2
+### Level 0 (현재 default), Level 2 (DEPRECATED)
 
-- **Level 0** (snapshot scaling): 지금 부하가 *그대로 유지된다* 가정. 한 step time 의 *비율* 로 남은 시간 stretch. 가장 단순, 매우 빠름.
-- **Level 2** (SLO-driven lookahead): 1초 slice 로 미래 batch composition 시뮬. *다른 job 종료* 와 *새 job 후속 calls* 효과 반영. 정확하지만 declared 정보 필요.
+- **Level 0 — Per-job snapshot stretch (M-2, 2026-05-15 design)**:
+  - 각 active job 의 *현재 단계* (prefill / decode) 에 따라 *그 단계의 step time 변화율* 을 stretch 로 사용.
+  - `stretch_extend = aug_extend / base_extend`, `stretch_decode = aug_decode / base_decode`
+  - `predicted_VJS_i = current_VJS_i × stretch_i`
+  - 사용 정보: *현재 batch + 새 request 의 prompt/prefix*. **DAG / remaining / expected_output 안 씀**.
+- **Level 2 (DEPRECATED 2026-05-15)**: 옛 1 초 slice lookahead. 코드는 남아있지만 admission path 에서 호출 안 됨 (controller 가 자동 level0 폴백 + WARN).
 
 ### 새 components (계획)
 
