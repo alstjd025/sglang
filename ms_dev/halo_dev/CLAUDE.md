@@ -423,9 +423,11 @@ class Job:
 
 ### `sglang` repo · 브랜치 `project-halo-phase1` (분기: `28797d9e6` from `admission-control-mooncakelike`)
 
-**최신 (2026-05-14) — Phase 2 admission round**:
+**최신 (2026-05-15) — Phase 2 admission refactor round**:
 ```
-5fb6c3d9f add(halo): Phase 2 admission control — Stage A (Level 0+2) + Stage B  ← §21
+b8ff4a984 refactor(halo): admission Phase 2 — job-level, snapshot-only, per-job stretch  ← §21 갱신
+3b33beda9 docs(halo): refresh §10 commit history (29→30) — Phase 2 admission round
+5fb6c3d9f add(halo): Phase 2 admission control — Stage A (Level 0+2) + Stage B
 eb52d10b4 docs(halo): refresh §10 commit history (26→29) — Step Cost Model round
 ```
 
@@ -470,7 +472,7 @@ acdfc411f add(halo): Phase 1 module skeleton — Job, JobRegistry, SlowdownTrack
 e496ea707 docs(halo): Phase 1 plan + decisions in ms_dev/halo_dev/CLAUDE.md
 ```
 
-총 **30 commits** (29 + Phase 2 admission 1). Push 는 사용자가 직접 (`git push origin project-halo-phase1`).
+총 **32 commits** (30 + Phase 2 admission refactor 2). Push 는 사용자가 직접 (`git push origin project-halo-phase1`).
 
 ### `Agent_applications` repo · 브랜치 `project-halo-phase1-client` (분기: `4d3cc51` from `main`)
 
