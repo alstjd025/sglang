@@ -53,25 +53,62 @@ export SGLANG_HALO_ENABLED=1
 export SGLANG_HALO_DEFAULT_SLO="${SGLANG_HALO_DEFAULT_SLO:-5.0}"
 export SGLANG_HALO_TICK_INTERVAL_MS="${SGLANG_HALO_TICK_INTERVAL_MS:-100}"
 
+# Auto-detect hardware tag for cost-model filename lookup. Cost-model
+# coefficients are fit per-(GPU type × TP size), so the same JSON cannot
+# be reused across nodes with different GPU counts or GPU types — moving
+# from B200x4 to B200x2 means refitting. Override by exporting
+# SGLANG_HALO_HW_TAG before sourcing (e.g. "b200x2", "h100x8").
+# Detection: nvidia-smi → "<gpu_short>x<count>", e.g. "b200x4". Falls
+# back to "b200x4" if nvidia-smi is unavailable or unparseable.
+_halo_detect_hw_tag() {
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "b200x4"; return
+  fi
+  local count first_name short
+  count="$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')"
+  first_name="$(nvidia-smi -L 2>/dev/null | head -1)"
+  if [[ -z "$count" || "$count" -le 0 ]]; then
+    echo "b200x4"; return
+  fi
+  if   [[ "$first_name" == *"B200"* ]]; then short="b200"
+  elif [[ "$first_name" == *"H200"* ]]; then short="h200"
+  elif [[ "$first_name" == *"H100"* ]]; then short="h100"
+  elif [[ "$first_name" == *"A100"* ]]; then short="a100"
+  elif [[ "$first_name" == *"L40"*  ]]; then short="l40s"
+  else short="gpu"
+  fi
+  echo "${short}x${count}"
+}
+export SGLANG_HALO_HW_TAG="${SGLANG_HALO_HW_TAG:-$(_halo_detect_hw_tag)}"
+
 # Default cost model: Halo Step Cost Model in SPLIT form. Validated as the
 # best-balanced model (closest tail/p90 to ground truth; cliff resolved) —
 # see ms_dev/halo_dev/prediction_model.md §17. When this var is set, the
 # server logs INFO and ignores SGLANG_HALO_PREFILL_COST_MODEL /
 # SGLANG_HALO_TBT_COST_MODEL. To opt back into the legacy two-model pair,
 # explicitly set SGLANG_HALO_STEP_COST_MODEL="" before sourcing.
-export SGLANG_HALO_STEP_COST_MODEL="${SGLANG_HALO_STEP_COST_MODEL-${SGLANG_REPO_ROOT}/ms_dev/runtime/cost_models/halo_step_split_llama3-70b_b200x4.json}"
+export SGLANG_HALO_STEP_COST_MODEL="${SGLANG_HALO_STEP_COST_MODEL-${SGLANG_REPO_ROOT}/ms_dev/runtime/cost_models/halo_step_split_llama3-70b_${SGLANG_HALO_HW_TAG}.json}"
 
 # Legacy fallback. Used only when SGLANG_HALO_STEP_COST_MODEL is empty;
 # otherwise ignored by the server.
-export SGLANG_HALO_PREFILL_COST_MODEL="${SGLANG_HALO_PREFILL_COST_MODEL:-${SGLANG_REPO_ROOT}/ms_dev/runtime/cost_models/prefill_llama3-70b_b200x4.json}"
-export SGLANG_HALO_TBT_COST_MODEL="${SGLANG_HALO_TBT_COST_MODEL:-${SGLANG_REPO_ROOT}/ms_dev/runtime/cost_models/tbt_llama3-70b_b200x4.json}"
+export SGLANG_HALO_PREFILL_COST_MODEL="${SGLANG_HALO_PREFILL_COST_MODEL:-${SGLANG_REPO_ROOT}/ms_dev/runtime/cost_models/prefill_llama3-70b_${SGLANG_HALO_HW_TAG}.json}"
+export SGLANG_HALO_TBT_COST_MODEL="${SGLANG_HALO_TBT_COST_MODEL:-${SGLANG_REPO_ROOT}/ms_dev/runtime/cost_models/tbt_llama3-70b_${SGLANG_HALO_HW_TAG}.json}"
 
 # Job log path is auto-routed to <session_dir>/halo_jobs.jsonl by
 # ms_dev/expctl/server_run_experiment.py; leave unset here.
 unset SGLANG_HALO_JOB_LOG
 
+# Warn loudly if the auto-selected step cost model doesn't exist on this
+# host — most likely cause is "haven't fit on this hardware yet". Server
+# would die at startup with a less obvious error; surface it earlier.
+if [[ -n "${SGLANG_HALO_STEP_COST_MODEL}" && ! -f "${SGLANG_HALO_STEP_COST_MODEL}" ]]; then
+  echo "[experiments/halo_base] WARN: cost model not found for hw_tag=${SGLANG_HALO_HW_TAG}:" >&2
+  echo "[experiments/halo_base]       ${SGLANG_HALO_STEP_COST_MODEL}" >&2
+  echo "[experiments/halo_base]       Fit one with tools/halo/fit_halo_cost_model.py, or override SGLANG_HALO_HW_TAG / SGLANG_HALO_STEP_COST_MODEL." >&2
+fi
+
 if [[ -n "${SGLANG_HALO_STEP_COST_MODEL}" ]]; then
-  echo "[experiments/halo_base] halo_enabled=${SGLANG_HALO_ENABLED} default_slo=${SGLANG_HALO_DEFAULT_SLO} tick_ms=${SGLANG_HALO_TICK_INTERVAL_MS} step_cost=${SGLANG_HALO_STEP_COST_MODEL##*/}"
+  echo "[experiments/halo_base] halo_enabled=${SGLANG_HALO_ENABLED} default_slo=${SGLANG_HALO_DEFAULT_SLO} tick_ms=${SGLANG_HALO_TICK_INTERVAL_MS} hw=${SGLANG_HALO_HW_TAG} step_cost=${SGLANG_HALO_STEP_COST_MODEL##*/}"
 else
-  echo "[experiments/halo_base] halo_enabled=${SGLANG_HALO_ENABLED} default_slo=${SGLANG_HALO_DEFAULT_SLO} tick_ms=${SGLANG_HALO_TICK_INTERVAL_MS} prefill_cost=${SGLANG_HALO_PREFILL_COST_MODEL##*/} tbt_cost=${SGLANG_HALO_TBT_COST_MODEL##*/} (legacy fallback)"
+  echo "[experiments/halo_base] halo_enabled=${SGLANG_HALO_ENABLED} default_slo=${SGLANG_HALO_DEFAULT_SLO} tick_ms=${SGLANG_HALO_TICK_INTERVAL_MS} hw=${SGLANG_HALO_HW_TAG} prefill_cost=${SGLANG_HALO_PREFILL_COST_MODEL##*/} tbt_cost=${SGLANG_HALO_TBT_COST_MODEL##*/} (legacy fallback)"
 fi

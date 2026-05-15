@@ -36,7 +36,10 @@ GCSUDO="${GCSUDO:-/engrid/ensh/gpubin/ctn_gcsudo}"
   libssl-dev \
   protobuf-compiler \
   libprotobuf-dev \
-  ca-certificates
+  ca-certificates \
+  python3 \
+  python3-venv \
+  python3-pip
 
 echo "[install_dev] installing rustup + recent stable Rust..."
 if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
