@@ -991,9 +991,8 @@ def render_status_single(
     # attn_tp_rank=0; series_sum returns the actual count.
     server_halo_active = metric_value(server, "sglang:halo_active_jobs")
     server_halo_total_known = metric_value(server, "sglang:halo_total_known_jobs")
-    server_halo_mean_smax = metric_value(server, "sglang:halo_mean_slowdown_max")
-    server_halo_mean_smean = metric_value(server, "sglang:halo_mean_slowdown_mean")
-    server_halo_max_smax = metric_value(server, "sglang:halo_max_slowdown_max")
+    server_halo_mean_vjs = metric_value(server, "sglang:halo_mean_vjs")
+    server_halo_max_vjs = metric_value(server, "sglang:halo_max_vjs")
     server_halo_violations = metric_value(server, "sglang:halo_slo_violations_total")
     server_halo_registered = metric_value(
         server, "sglang:halo_programs_registered_total"
@@ -1155,8 +1154,8 @@ def render_status_single(
     # launch command). Two rows so the panel stays scannable:
     #   row 1 — fleet shape: active jobs, total known, lifetime registered/
     #           admitted/rejected counters.
-    #   row 2 — fleet slowdown: mean(slowdown_max), mean(slowdown_mean),
-    #           worst single job's slowdown_max, lifetime SLO violations.
+    #   row 2 — fleet slowdown: mean virtual job slowdown, worst single
+    #           job's virtual job slowdown, lifetime SLO violations.
     if feature_states.get("server_halo") is True:
         active_int = (
             int(server_halo_active) if server_halo_active is not None else None
@@ -1232,19 +1231,14 @@ def render_status_single(
             "        "
             + metric_row(
                 [
-                    ("halo_mean_smax", color_high_bad(
-                        server_halo_mean_smax,
-                        _fmt_x(server_halo_mean_smax),
+                    ("halo_mean_vjs", color_high_bad(
+                        server_halo_mean_vjs,
+                        _fmt_x(server_halo_mean_vjs),
                         warn=2.0, bad=3.0, enabled=use_color,
                     )),
-                    ("halo_mean_smean", color_high_bad(
-                        server_halo_mean_smean,
-                        _fmt_x(server_halo_mean_smean),
-                        warn=2.0, bad=3.0, enabled=use_color,
-                    )),
-                    ("halo_worst_smax", color_high_bad(
-                        server_halo_max_smax,
-                        _fmt_x(server_halo_max_smax),
+                    ("halo_worst_vjs", color_high_bad(
+                        server_halo_max_vjs,
+                        _fmt_x(server_halo_max_vjs),
                         warn=3.0, bad=5.0, enabled=use_color,
                     )),
                     ("halo_slo_violations", color_high_bad(

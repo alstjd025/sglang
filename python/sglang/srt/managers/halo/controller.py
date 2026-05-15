@@ -21,7 +21,7 @@ import logging
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from sglang.srt.managers.admission_control.cost_model import (
     HaloStepCostModel,
@@ -495,8 +495,14 @@ class HaloController:
         *,
         exclude_job_id: Optional[str] = None,
     ) -> List[JobLookaheadInput]:
-        """Group RequestExecutionInfo by job_id, attach declared structure
-        from the registry, return the per-job inputs the predictor expects."""
+        """Group RequestExecutionInfo by job_id and build the per-job inputs
+        the predictor expects.
+
+        `current_vjs` is the job's *current* virtual job slowdown — computed
+        by the same SlowdownTracker.compute_job_vjs the periodic sweep uses,
+        over the job's completed call spans plus its in-flight spans. This is
+        the single source of truth for VJS (admission then multiplies it by a
+        per-phase stretch)."""
         by_job: Dict[str, List[RequestExecutionInfo]] = {}
         for info in infos:
             if info.job_id is None:
@@ -522,33 +528,25 @@ class HaloController:
                     elapsed_actual_ms=i.elapsed_ms,
                     # Per-call solo baseline — the request-scoped predictor
                     # divides elapsed by this to get the per-request slowdown.
-                    solo_elapsed_ms=self._solo_ms_for_info(i),
+                    solo_elapsed_ms=self._solo_ms_for_request(i),
                 )
                 for i in info_list
             )
-            # current_actual_elapsed: take the max over the job's in-flight
-            # requests (their elapsed_ms). current_solo: rebuild via the
-            # tracker's solo helper for each active call's prompt + decoded.
-            current_actual_ms = max(i.elapsed_ms for i in info_list)
-            current_solo_ms = self._current_solo_ms_for_job(info_list)
+            # current_vjs: lifetime VJS over completed + in-flight calls,
+            # via the same compute_job_vjs the sweep uses (one source of truth).
+            inflight_spans = [
+                self.tracker.span_from_info(i) for i in info_list
+            ]
+            current_vjs = self.tracker.compute_job_vjs(
+                job.completed_call_spans + inflight_spans,
+                fallback_slo=job.slo,
+            )
             out.append(
                 JobLookaheadInput(
                     job_id=jid,
                     slo=job.slo,
                     active_calls=active_calls,
-                    current_actual_elapsed_ms=current_actual_ms,
-                    current_solo_elapsed_ms=current_solo_ms,
-                    remaining_calls=self._declared_remaining_calls(job, info_list),
-                    remaining_stage_sequence=self._declared_remaining_sequence(
-                        job, info_list
-                    ),
-                    expected_input_lens=self._declared_remaining_lengths(
-                        job.expected_input_lens, job, info_list
-                    ),
-                    expected_output_lens=self._declared_remaining_lengths(
-                        job.expected_output_lens, job, info_list
-                    ),
-                    expected_cached_prefix_lens=None,
+                    current_vjs=current_vjs,
                 )
             )
         return out
@@ -584,79 +582,21 @@ class HaloController:
             expected_cached_prefix_lens=None,
         )
 
-    @staticmethod
-    def _declared_remaining_calls(
-        job: Job, infos: List[RequestExecutionInfo]
-    ) -> Optional[int]:
-        if job.total_calls_expected is None:
-            return None
-        # admitted_count tracked on Job is the number of LLM requests already
-        # admitted into this job — so remaining = total - admitted.
-        return max(0, job.total_calls_expected - job.total_request_number)
+    def _solo_ms_for_request(self, info: RequestExecutionInfo) -> float:
+        """Cost-model solo wall-clock so far for one in-flight request,
+        treated *alone* (batch of 1): prefill_solo + decode_step × decoded.
 
-    @staticmethod
-    def _declared_remaining_sequence(
-        job: Job, infos: List[RequestExecutionInfo]
-    ) -> Optional[Tuple[str, ...]]:
-        if job.stage_sequence is None or job.total_calls_expected is None:
-            return None
-        admitted = job.total_request_number
-        if admitted >= len(job.stage_sequence):
-            return ()
-        return tuple(job.stage_sequence[admitted:])
-
-    @staticmethod
-    def _declared_remaining_lengths(
-        full: Optional[List[int]],
-        job: Job,
-        infos: List[RequestExecutionInfo],
-    ) -> Optional[Tuple[int, ...]]:
-        if full is None or job.total_calls_expected is None:
-            return None
-        admitted = job.total_request_number
-        if admitted >= len(full):
-            return ()
-        return tuple(full[admitted:])
-
-    def _solo_ms_for_info(self, info: RequestExecutionInfo) -> float:
-        """Cost-model solo wall-clock so far for one in-flight request —
-        prefill + tbt × decoded_tokens. Same formula SlowdownTracker uses.
+        Used only by the request-scoped admission baseline, which scores
+        each request on its own (no job aggregation). The job-scoped path
+        uses SlowdownTracker.compute_job_vjs instead. Both go through the
+        tracker's prefill_solo_ms / decode_step_ms primitives so the
+        prefill `n = prompt_len - prefix_len` correction lives in one place.
         Returns 0.0 when no cost model is loaded (callers fall back)."""
-        tracker = self.tracker
-        if tracker.step_cost is not None:
-            prefill = tracker.step_cost.estimate_solo_prefill_total_ms(
-                info.prompt_len, info.prefix_len_at_admission
-            )
-            tbt = tracker.step_cost.estimate_solo_tbt_ms(
-                max(info.kv_len_now, 0)
-            )
-        elif tracker.prefill_cost is not None or tracker.tbt_cost is not None:
-            prefill = (
-                tracker.prefill_cost.estimate_ms(
-                    info.prompt_len, info.prefix_len_at_admission
-                )
-                if tracker.prefill_cost is not None
-                else 0.0
-            )
-            tbt = (
-                tracker.tbt_cost.estimate_ms(
-                    batch_size=1, per_req_kv=max(info.kv_len_now, 0)
-                )
-                if tracker.tbt_cost is not None
-                else 0.0
-            )
-        else:
-            # No cost model — degenerate; report 0 so the caller's slowdown
-            # calc takes its fallback path.
-            return 0.0
-        return prefill + tbt * max(0, info.decoded_tokens_so_far)
-
-    def _current_solo_ms_for_job(
-        self, infos: List[RequestExecutionInfo]
-    ) -> float:
-        """Total solo time so far across the job's in-flight calls,
-        computed the same way SlowdownTracker does."""
-        return sum(self._solo_ms_for_info(info) for info in infos)
+        prefill = self.tracker.prefill_solo_ms(
+            info.prompt_len, info.prefix_len_at_admission
+        )
+        decode_step = self.tracker.decode_step_ms([max(info.kv_len_now, 0)])
+        return prefill + decode_step * max(0, info.decoded_tokens_so_far)
 
     def _log_admission_decision(
         self,
@@ -762,19 +702,35 @@ class HaloController:
             active_jobs=len(self.registry.active_jobs()),
         )
 
-    def on_request_finished(self, rid: str, halo_job_done: bool = False) -> None:
+    def on_request_finished(
+        self,
+        rid: str,
+        finished_info: Optional[RequestExecutionInfo] = None,
+        halo_job_done: bool = False,
+    ) -> None:
         """Called from the scheduler's finish path.
 
-        If the client set `halo_job_done=true` on this request, mark the
-        owning job COMPLETE *before* record_completion pops the rid→job
-        mapping (otherwise mark_job_done can't look up the job). Then
-        decrement counters as normal.
+        `finished_info` is the just-finished request's final snapshot. Its
+        time span (admit → finish) + token features are frozen into the
+        owning job's `completed_call_spans` so the call keeps contributing
+        to the job's lifetime VJS after the request object is gone. This
+        happens *before* record_completion pops the rid→job mapping.
 
-        Emits a `job_complete` row to the JSONL job log so the
-        termination is observable even when the COMPLETE state doesn't
-        survive long enough to be captured by the periodic sweep
-        snapshot (retain_seconds < job_log_interval_seconds).
+        If the client set `halo_job_done=true` on this request, mark the
+        owning job COMPLETE (also before record_completion). Then decrement
+        counters as normal.
+
+        Emits a `job_complete` row to the JSONL job log so the termination
+        is observable even when the COMPLETE state doesn't survive long
+        enough to be captured by the periodic sweep snapshot.
         """
+        # Freeze the finished call's span onto its job (lifetime VJS).
+        if finished_info is not None:
+            job = self.registry.job_for_request(rid)
+            if job is not None:
+                job.record_completed_call(
+                    self.tracker.span_from_info(finished_info)
+                )
         if halo_job_done:
             job = self.registry.mark_job_done(rid)
             if job is not None and self._log is not None:
@@ -813,8 +769,8 @@ class HaloController:
             self.tracker.sweep(infos)
 
         # JSONL log is gated independently from the sweep — the sweep
-        # itself stays high-frequency (so per-job slowdown_max/mean and
-        # the metrics gauges update every tick), but the verbose
+        # itself stays high-frequency (so each job's virtual_job_slowdown
+        # and the metrics gauges update every tick), but the verbose
         # per-sweep snapshot only lands on disk every
         # config.job_log_interval_seconds. Set the gate to 0 to write
         # every sweep (legacy behavior, useful for very short tests).

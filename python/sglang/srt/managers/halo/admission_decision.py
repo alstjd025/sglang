@@ -5,7 +5,7 @@ Design + rationale: ms_dev/halo_dev/admission_design.md.
 Core idea:
     Reject a new arrival if admitting it would push too many *currently
     active units* over their SLO. The decision uses the Halo Step Cost
-    Model (the same cost model that powers R1 slowdown tracking) to
+    Model (the same cost model that powers job slowdown tracking) to
     predict each active unit's slowdown after the new arrival.
 
 Two admission scopes — the difference is the *unit of the decision*:
@@ -79,20 +79,25 @@ class ActiveCallInfo:
 class JobLookaheadInput:
     """Per-active-job snapshot consumed by AdmissionPredictor.
 
-    All fields after ``current_solo_elapsed_ms`` are *declared* and may be
-    None. **As of 2026-05-15 (per-job-stretch refactor)** the production
-    SnapshotAdmissionPredictor IGNORES every declared field — they are kept
-    on the dataclass solely for the deprecated LookaheadAdmissionPredictor
-    and any future predictor that may reuse them.
+    ``current_vjs`` is the job's current virtual job slowdown, computed by
+    ``SlowdownTracker.compute_job_vjs`` over the job's completed + in-flight
+    call spans — the same value the periodic sweep records. The job-scoped
+    predictor multiplies it by a per-phase stretch.
+
+    The fields after ``current_vjs`` are *legacy*: the production predictors
+    ignore them. ``current_actual_elapsed_ms`` / ``current_solo_elapsed_ms``
+    and the declared structure are kept solely for the deprecated
+    LookaheadAdmissionPredictor.
     """
 
     job_id: str
     slo: float
-    # Current observed state (from Halo R1 / Job + RequestExecutionInfo)
+    # Current observed state (from SlowdownTracker + RequestExecutionInfo).
     active_calls: Tuple[ActiveCallInfo, ...]
-    current_actual_elapsed_ms: float
-    current_solo_elapsed_ms: float  # cost_model.solo accumulated so far
-    # ---- LEGACY (not used by SnapshotAdmissionPredictor since 2026-05-15) ----
+    current_vjs: float
+    # ---- LEGACY — LookaheadAdmissionPredictor only (DEPRECATED 2026-05-15) ----
+    current_actual_elapsed_ms: float = 0.0
+    current_solo_elapsed_ms: float = 0.0
     remaining_calls: Optional[int] = None
     remaining_stage_sequence: Optional[Tuple[str, ...]] = None
     expected_input_lens: Optional[Tuple[int, ...]] = None
@@ -336,20 +341,14 @@ class JobSlowdownAdmissionPredictor(AdmissionPredictor):
         )
 
         # ── per-job: pick stretch by current phase ───────────────────────
+        # current_vjs is the job's lifetime virtual job slowdown, already
+        # computed by SlowdownTracker.compute_job_vjs (with the SLO fallback
+        # baked in for jobs with no measurable solo time yet).
         predictions: Dict[str, float] = {}
         for job in active_jobs:
             job_is_in_prefill = any(call.is_prefill for call in job.active_calls)
             stretch_i = stretch_extend if job_is_in_prefill else stretch_decode
-
-            if job.current_solo_elapsed_ms > 0:
-                current_vjs = (
-                    job.current_actual_elapsed_ms / job.current_solo_elapsed_ms
-                )
-            else:
-                # Matches R1's initial slowdown_max = SLO convention.
-                current_vjs = job.slo
-
-            predictions[job.job_id] = current_vjs * stretch_i
+            predictions[job.job_id] = job.current_vjs * stretch_i
         return predictions
 
 
@@ -402,7 +401,7 @@ class RequestSlowdownAdmissionPredictor(AdmissionPredictor):
                         call.elapsed_actual_ms / call.solo_elapsed_ms
                     )
                 else:
-                    # Matches R1's initial slowdown = SLO convention.
+                    # Matches Job's initial-slowdown = SLO convention.
                     current_slowdown = job.slo
                 predictions[call.rid] = current_slowdown * stretch_c
         return predictions

@@ -316,7 +316,7 @@ class JobRegistry:
     def snapshot_dict(self, limit: int = 32) -> dict:
         """JSON-able snapshot for /server_info. Truncates the per-job list."""
         active = self.active_jobs()
-        active.sort(key=lambda j: j.slowdown_max, reverse=True)
+        active.sort(key=lambda j: j.virtual_job_slowdown, reverse=True)
         return {
             "active_jobs": len(active),
             "total_known_jobs": len(self._jobs),

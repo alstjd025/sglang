@@ -73,8 +73,8 @@ class HaloMetrics:
         self._slo_violations_total = Counter(
             name="sglang:halo_slo_violations_total",
             documentation=(
-                "Halo: per-sweep increments where a job's slowdown_max "
-                "exceeded its SLO bound."
+                "Halo: per-sweep increments where a job's virtual job "
+                "slowdown exceeded its SLO bound."
             ),
             labelnames=label_keys,
             **common_kwargs,
@@ -98,31 +98,21 @@ class HaloMetrics:
             **gauge_extra,
             **common_kwargs,
         )
-        self._mean_slowdown_max = Gauge(
-            name="sglang:halo_mean_slowdown_max",
+        self._mean_vjs = Gauge(
+            name="sglang:halo_mean_vjs",
             documentation=(
-                "Halo: mean over active jobs of each job's slowdown_max — "
-                "rises when worst-case slowdown is bad across the fleet."
+                "Halo: mean over active jobs of each job's virtual job "
+                "slowdown — fleet-average slowdown."
             ),
             labelnames=label_keys,
             **gauge_extra,
             **common_kwargs,
         )
-        self._mean_slowdown_mean = Gauge(
-            name="sglang:halo_mean_slowdown_mean",
+        self._max_vjs = Gauge(
+            name="sglang:halo_max_vjs",
             documentation=(
-                "Halo: mean over active jobs of each job's slowdown_mean — "
-                "rises when fleet-average slowdown is bad."
-            ),
-            labelnames=label_keys,
-            **gauge_extra,
-            **common_kwargs,
-        )
-        self._max_slowdown_max = Gauge(
-            name="sglang:halo_max_slowdown_max",
-            documentation=(
-                "Halo: max over active jobs of slowdown_max — the worst "
-                "single job seen this sweep."
+                "Halo: max over active jobs of virtual job slowdown — the "
+                "worst single job seen this sweep."
             ),
             labelnames=label_keys,
             **gauge_extra,
@@ -169,19 +159,15 @@ class HaloMetrics:
         if n == 0:
             # No active jobs — zero out the slowdown gauges so the panel
             # doesn't show a stale spike.
-            self._mean_slowdown_max.labels(**self._labels).set(0.0)
-            self._mean_slowdown_mean.labels(**self._labels).set(0.0)
-            self._max_slowdown_max.labels(**self._labels).set(0.0)
+            self._mean_vjs.labels(**self._labels).set(0.0)
+            self._max_vjs.labels(**self._labels).set(0.0)
             return
 
-        sum_max = 0.0
-        sum_mean = 0.0
-        peak_max = 0.0
+        sum_vjs = 0.0
+        peak_vjs = 0.0
         for j in actives:
-            sum_max += j.slowdown_max
-            sum_mean += j.slowdown_mean
-            if j.slowdown_max > peak_max:
-                peak_max = j.slowdown_max
-        self._mean_slowdown_max.labels(**self._labels).set(sum_max / n)
-        self._mean_slowdown_mean.labels(**self._labels).set(sum_mean / n)
-        self._max_slowdown_max.labels(**self._labels).set(peak_max)
+            sum_vjs += j.virtual_job_slowdown
+            if j.virtual_job_slowdown > peak_vjs:
+                peak_vjs = j.virtual_job_slowdown
+        self._mean_vjs.labels(**self._labels).set(sum_vjs / n)
+        self._max_vjs.labels(**self._labels).set(peak_vjs)

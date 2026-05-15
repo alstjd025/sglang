@@ -2685,15 +2685,34 @@ class Scheduler(
     def _halo_on_request_finished(self, req: Req) -> None:
         """Called from the scheduler's per-request finish path. No-op if Halo off.
 
-        Forwards the client's `halo_job_done` flag so the controller can
-        explicitly transition the owning job to COMPLETE when this is the
-        last call in the chain. See halo_api_reference.md.
+        Builds the finished request's final snapshot so the controller can
+        freeze its time span onto the owning job (lifetime VJS), and forwards
+        the client's `halo_job_done` flag so the controller can explicitly
+        transition the job to COMPLETE on the chain's last call. See
+        managers/halo/CLAUDE.md and halo_api_reference.md.
         """
         controller = getattr(self, "halo_controller", None)
         if controller is None:
             return
+        finished_info = None
+        job_id = getattr(req, "halo_job_id", None)
+        t0 = getattr(req, "halo_first_admitted_ts", None)
+        if job_id is not None and t0 is not None:
+            finished_info = RequestExecutionInfo(
+                rid=req.rid,
+                job_id=job_id,
+                prompt_len=len(req.origin_input_ids or []),
+                prefix_len_at_admission=getattr(
+                    req, "halo_prefix_len_at_admission", 0
+                ),
+                decoded_tokens_so_far=len(getattr(req, "output_ids", []) or []),
+                kv_len_now=int(getattr(req, "kv_committed_len", 0) or 0),
+                elapsed_ms=(time.monotonic() - t0) * 1000.0,
+                admitted_ts=t0,
+            )
         controller.on_request_finished(
             req.rid,
+            finished_info=finished_info,
             halo_job_done=getattr(req, "halo_job_done", False),
         )
 
@@ -2728,6 +2747,7 @@ class Scheduler(
                     decoded_tokens_so_far=decoded_so_far,
                     kv_len_now=kv_len_now,
                     elapsed_ms=(now - t0) * 1000.0,
+                    admitted_ts=t0,
                 )
             )
 

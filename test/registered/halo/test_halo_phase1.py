@@ -30,6 +30,7 @@ from sglang.srt.managers.halo import (
     HaloController,
     HaloRejectError,
     Job,
+    JobCallSpan,
     JobRegistry,
     JobState,
     RequestExecutionInfo,
@@ -44,8 +45,7 @@ register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 class TestJob(unittest.TestCase):
     def test_initial_slowdown_equals_slo(self):
         job = Job(job_id="agent-1", slo=5.0)
-        self.assertEqual(job.slowdown_max, 5.0)
-        self.assertEqual(job.slowdown_mean, 5.0)
+        self.assertEqual(job.virtual_job_slowdown, 5.0)
         self.assertEqual(job.state, JobState.QUEUED)
         # Option A fields default None / False.
         self.assertIsNone(job.total_calls_expected)
@@ -78,14 +78,16 @@ class TestJob(unittest.TestCase):
         job.mark_done()
         self.assertEqual(job.state, JobState.COMPLETE)
 
-    def test_record_sweep_promotes_to_running_and_counts_violations(self):
+    def test_record_vjs_promotes_to_running_and_counts_violations(self):
         job = Job(job_id="agent-1", slo=2.0)
         job.on_request_admitted("rid-a")
-        job.record_sweep(max_ratio=1.5, mean_ratio=1.2)
+        job.record_vjs(1.5)
         self.assertEqual(job.state, JobState.RUNNING)
+        self.assertEqual(job.virtual_job_slowdown, 1.5)
         self.assertEqual(job.slo_violation_count, 0)
 
-        job.record_sweep(max_ratio=2.5, mean_ratio=1.9)
+        job.record_vjs(2.5)
+        self.assertEqual(job.virtual_job_slowdown, 2.5)
         self.assertEqual(job.slo_violation_count, 1)
         self.assertEqual(len(job.slowdown_history), 2)
 
@@ -297,127 +299,203 @@ def _make_cost_models():
     return prefill, tbt
 
 
-class TestSlowdownTracker(unittest.TestCase):
-    def test_compute_request_slowdown_with_both_models(self):
-        prefill, tbt = _make_cost_models()
-        reg = JobRegistry()
-        tracker = SlowdownTracker(prefill, tbt, reg)
-        info = RequestExecutionInfo(
-            rid="rid-a", job_id="agent-1", prompt_len=100,
-            prefix_len_at_admission=0, decoded_tokens_so_far=10,
-            kv_len_now=200, elapsed_ms=400.0,
-        )
-        # solo_total = 20 + 20.5*10 = 225 → ratio = 400/225
-        ratio = tracker.compute_request_slowdown(info)
-        self.assertAlmostEqual(ratio, 400.0 / 225.0, places=3)
+def _step_model():
+    """Step cost model with trivial coefficients for predictable arithmetic:
+        prefill_solo(n, r) = (prompt_len - prefix_len)   [θ_p3=1, rest 0, θ_c_p=0]
+        decode_step(kvs)   = batch_size + 10             [θ_d2=1, θ_c_d=10, rest 0]
+    """
+    from sglang.srt.managers.admission_control.cost_model import HaloStepCostModel
 
-    def test_no_cost_models_returns_none(self):
-        reg = JobRegistry()
-        tracker = SlowdownTracker(None, None, reg)
-        info = RequestExecutionInfo(
-            rid="rid-a", job_id="agent-1", prompt_len=10,
-            prefix_len_at_admission=0, decoded_tokens_so_far=5,
-            kv_len_now=10, elapsed_ms=50.0,
-        )
-        self.assertIsNone(tracker.compute_request_slowdown(info))
+    return HaloStepCostModel(
+        theta_p1=0.0, theta_p2=0.0, theta_p3=1.0,
+        theta_d1=0.0, theta_d2=1.0, theta_c=0.0,
+        theta_c_p=0.0, theta_c_d=10.0,
+        form="halo_step_split_v1",
+    )
 
-    def test_sweep_aggregates_max_and_mean(self):
-        prefill, tbt = _make_cost_models()
+
+def _span(admitted, end, prompt=100, prefix=0, decoded=10, kv=110):
+    """A JobCallSpan with sensible defaults. ts are monotonic seconds."""
+    return JobCallSpan(
+        admitted_ts=admitted, end_ts=end, prompt_len=prompt,
+        prefix_len=prefix, decoded_tokens=decoded, kv_len=kv,
+    )
+
+
+class TestSlowdownTrackerPrimitives(unittest.TestCase):
+    """prefill_solo_ms / decode_step_ms — the per-call cost-model primitives."""
+
+    def test_prefill_solo_excludes_cached_prefix(self):
+        # n = prompt_len - prefix_len: the radix-cache hit is not prefilled.
+        t = SlowdownTracker(None, None, JobRegistry(), step_cost=_step_model())
+        self.assertAlmostEqual(t.prefill_solo_ms(1000, 600), 400.0, places=6)
+        self.assertAlmostEqual(t.prefill_solo_ms(1000, 0), 1000.0, places=6)
+        # prefix >= prompt → clamped to 0.
+        self.assertAlmostEqual(t.prefill_solo_ms(100, 500), 0.0, places=6)
+
+    def test_decode_step_scales_with_batch(self):
+        t = SlowdownTracker(None, None, JobRegistry(), step_cost=_step_model())
+        self.assertAlmostEqual(t.decode_step_ms([110]), 11.0, places=6)
+        self.assertAlmostEqual(t.decode_step_ms([110, 110]), 12.0, places=6)
+        self.assertAlmostEqual(t.decode_step_ms([110, 110, 110]), 13.0, places=6)
+        self.assertAlmostEqual(t.decode_step_ms([]), 0.0, places=6)
+
+    def test_no_cost_model_primitives_return_zero(self):
+        t = SlowdownTracker(None, None, JobRegistry())
+        self.assertFalse(t.has_cost_model)
+        self.assertEqual(t.prefill_solo_ms(100, 0), 0.0)
+        self.assertEqual(t.decode_step_ms([100]), 0.0)
+
+    def test_step_cost_implies_has_cost_model(self):
+        t = SlowdownTracker(None, None, JobRegistry(), step_cost=_step_model())
+        self.assertTrue(t.has_cost_model)
+
+
+class TestComputeJobVjs(unittest.TestCase):
+    """compute_job_vjs — job-lifetime VJS via the stage-merge model.
+
+    With _step_model(): prefill_solo(100,0)=100, decode_step([110])=11,
+    decode_step([110,110])=12. A single decode call's solo (decoded=10) is
+    100 + 10*11 = 210.
+    """
+
+    def setUp(self):
+        self.t = SlowdownTracker(
+            None, None, JobRegistry(), step_cost=_step_model()
+        )
+
+    def test_empty_spans_returns_fallback(self):
+        self.assertEqual(self.t.compute_job_vjs([], fallback_slo=5.0), 5.0)
+
+    def test_no_cost_model_returns_fallback(self):
+        bare = SlowdownTracker(None, None, JobRegistry())
+        self.assertEqual(
+            bare.compute_job_vjs([_span(0.0, 1.0)], fallback_slo=7.0), 7.0
+        )
+
+    def test_single_call(self):
+        # span [0,1]s → actual 1000 ms; solo = 100 + 10*11 = 210.
+        vjs = self.t.compute_job_vjs([_span(0.0, 1.0)], fallback_slo=5.0)
+        self.assertAlmostEqual(vjs, 1000.0 / 210.0, places=4)
+
+    def test_sequential_calls_sum(self):
+        # Two non-overlapping calls → two stages → actual + solo both sum.
+        spans = [_span(0.0, 1.0), _span(2.0, 3.0)]
+        vjs = self.t.compute_job_vjs(spans, fallback_slo=5.0)
+        self.assertAlmostEqual(vjs, 2000.0 / 420.0, places=4)
+
+    def test_tool_delay_gap_excluded(self):
+        # A long gap between two calls is NOT counted — identical to the
+        # back-to-back sequential case.
+        gapped = [_span(0.0, 1.0), _span(100.0, 101.0)]
+        vjs = self.t.compute_job_vjs(gapped, fallback_slo=5.0)
+        self.assertAlmostEqual(vjs, 2000.0 / 420.0, places=4)
+
+    def test_concurrent_calls_critical_path(self):
+        # Overlapping [0,2] and [1,3] → one stage.
+        # actual = 3 - 0 = 3 s = 3000 ms.
+        # decode_step batch-2 = 12; each call_solo = 100 + 10*12 = 220;
+        # stage_solo = max = 220.
+        spans = [_span(0.0, 2.0), _span(1.0, 3.0)]
+        vjs = self.t.compute_job_vjs(spans, fallback_slo=5.0)
+        self.assertAlmostEqual(vjs, 3000.0 / 220.0, places=4)
+
+    def test_concurrent_solo_uses_batch_k_decode_step(self):
+        # The concurrent stage charges decode steps at the batch-of-2 step
+        # time (12), not batch-of-1 (11) — the job's own self-batching.
+        # If it used batch-1, stage_solo would be 210, not 220.
+        spans = [_span(0.0, 2.0), _span(1.0, 3.0)]
+        vjs = self.t.compute_job_vjs(spans, fallback_slo=5.0)
+        self.assertAlmostEqual(vjs, 3000.0 / 220.0, places=4)
+        self.assertNotAlmostEqual(vjs, 3000.0 / 210.0, places=4)
+
+    def test_prefill_only_call_excludes_cached_prefix(self):
+        # decoded=0 → no decode term. n = 1000 - 600 = 400.
+        sp = _span(0.0, 1.0, prompt=1000, prefix=600, decoded=0, kv=1000)
+        vjs = self.t.compute_job_vjs([sp], fallback_slo=5.0)
+        # actual 1000 ms / solo 400 = 2.5 (would be 1.0 if prefix not excluded).
+        self.assertAlmostEqual(vjs, 2.5, places=4)
+
+    def test_completed_plus_inflight(self):
+        # One completed span [0,1] + one in-flight span [5,6.5], sequential.
+        # stage1: actual 1000, solo 210. stage2: actual 1500, solo 210.
+        spans = [_span(0.0, 1.0), _span(5.0, 6.5)]
+        vjs = self.t.compute_job_vjs(spans, fallback_slo=5.0)
+        self.assertAlmostEqual(vjs, 2500.0 / 420.0, places=4)
+
+
+class TestSweep(unittest.TestCase):
+    """SlowdownTracker.sweep — recompute each job's virtual_job_slowdown."""
+
+    def test_sweep_records_vjs(self):
         reg = JobRegistry()
         reg.register_program("agent-1", 5.0)
         reg.admit_to_job("agent-1", 5.0, "rid-a")
-        reg.admit_to_job("agent-1", 5.0, "rid-b")
-        tracker = SlowdownTracker(prefill, tbt, reg)
-        infos = [
-            RequestExecutionInfo(
-                rid="rid-a", job_id="agent-1", prompt_len=100,
-                prefix_len_at_admission=0, decoded_tokens_so_far=10,
-                kv_len_now=200, elapsed_ms=225.0,  # ratio = 1.0
-            ),
-            RequestExecutionInfo(
-                rid="rid-b", job_id="agent-1", prompt_len=100,
-                prefix_len_at_admission=0, decoded_tokens_so_far=10,
-                kv_len_now=200, elapsed_ms=450.0,  # ratio = 2.0
-            ),
-        ]
-        tracker.sweep(infos)
-        job = reg.job_for_id("agent-1")
-        self.assertAlmostEqual(job.slowdown_max, 2.0, places=3)
-        self.assertAlmostEqual(job.slowdown_mean, 1.5, places=3)
-
-    def test_sweep_skips_unknown_jobs(self):
-        prefill, tbt = _make_cost_models()
-        reg = JobRegistry()
-        tracker = SlowdownTracker(prefill, tbt, reg)
-        info = RequestExecutionInfo(
-            rid="rid-a", job_id="ghost", prompt_len=10,
-            prefix_len_at_admission=0, decoded_tokens_so_far=5,
-            kv_len_now=10, elapsed_ms=50.0,
-        )
-        tracker.sweep([info])  # no exception
-        self.assertEqual(len(reg.all_jobs()), 0)
-
-    def test_step_cost_supersedes_legacy_when_both_provided(self):
-        """When step_cost is given, the legacy pair is ignored.
-
-        We make the legacy pair return a wildly different value from the step
-        model and verify the step model wins.
-        """
-        from sglang.srt.managers.admission_control.cost_model import (
-            HaloStepCostModel,
-        )
-        # Step model: solo_prefill = θ_c only, solo_tbt = θ_d2 + θ_c.
-        step = HaloStepCostModel(
-            theta_p1=0.0, theta_p2=0.0, theta_p3=0.0,
-            theta_d1=0.0, theta_d2=1.0, theta_c=99.0,
-        )
-        legacy_prefill, legacy_tbt = _make_cost_models()  # wildly different
-        reg = JobRegistry()
-        tracker = SlowdownTracker(
-            prefill_cost=legacy_prefill, tbt_cost=legacy_tbt,
-            registry=reg, step_cost=step,
-        )
+        t = SlowdownTracker(None, None, reg, step_cost=_step_model())
         info = RequestExecutionInfo(
             rid="rid-a", job_id="agent-1", prompt_len=100,
             prefix_len_at_admission=0, decoded_tokens_so_far=10,
-            kv_len_now=200, elapsed_ms=200.0,
+            kv_len_now=110, elapsed_ms=1000.0, admitted_ts=0.0,
         )
-        # solo_prefill = 99 (θ_c). solo_tbt = 1 + 99 = 100.
-        # solo_total = 99 + 100*10 = 1099. ratio = 200/1099.
-        ratio = tracker.compute_request_slowdown(info)
-        self.assertAlmostEqual(ratio, 200.0 / 1099.0, places=6)
+        t.sweep([info])
+        job = reg.job_for_id("agent-1")
+        # in-flight span: end_ts = 0 + 1000/1000 = 1.0 s → actual 1000, solo 210.
+        self.assertAlmostEqual(
+            job.virtual_job_slowdown, 1000.0 / 210.0, places=3
+        )
 
-    def test_step_cost_only_path_produces_finite_ratio(self):
-        """With only the step model loaded (no legacy), tracker still works."""
-        from sglang.srt.managers.admission_control.cost_model import (
-            HaloStepCostModel,
-        )
-        step = HaloStepCostModel(
-            theta_p1=1e-7, theta_p2=4e-7, theta_p3=0.08,
-            theta_d1=5e-5, theta_d2=0.3, theta_c=10.0,
-        )
+    def test_sweep_skips_unknown_jobs(self):
         reg = JobRegistry()
-        tracker = SlowdownTracker(
-            prefill_cost=None, tbt_cost=None,
-            registry=reg, step_cost=step,
-        )
+        t = SlowdownTracker(None, None, reg, step_cost=_step_model())
         info = RequestExecutionInfo(
-            rid="rid-a", job_id="agent-1", prompt_len=1000,
-            prefix_len_at_admission=500, decoded_tokens_so_far=20,
-            kv_len_now=1200, elapsed_ms=500.0,
+            rid="r", job_id="ghost", prompt_len=10,
+            prefix_len_at_admission=0, decoded_tokens_so_far=5,
+            kv_len_now=10, elapsed_ms=50.0, admitted_ts=0.0,
         )
-        # solo_prefill = 1e-7·1e6 + 4e-7·500000 + 0.08·1000 + 10
-        #             = 0.1 + 0.2 + 80 + 10 = 90.3
-        # solo_tbt    = 5e-5·1200 + 0.3 + 10 = 0.06 + 10.3 = 10.36
-        # solo_total  = 90.3 + 10.36·20 = 90.3 + 207.2 = 297.5
-        ratio = tracker.compute_request_slowdown(info)
-        self.assertAlmostEqual(ratio, 500.0 / 297.5, places=4)
-        self.assertTrue(tracker.has_cost_model)
+        t.sweep([info])  # no exception
+        self.assertEqual(len(reg.all_jobs()), 0)
+
+    def test_sweep_includes_completed_calls(self):
+        reg = JobRegistry()
+        reg.register_program("agent-1", 5.0)
+        reg.admit_to_job("agent-1", 5.0, "rid-2")
+        job = reg.job_for_id("agent-1")
+        # A finished call already frozen onto the job.
+        job.record_completed_call(_span(0.0, 1.0))
+        t = SlowdownTracker(None, None, reg, step_cost=_step_model())
+        # In-flight second call, sequential after the completed one.
+        info = RequestExecutionInfo(
+            rid="rid-2", job_id="agent-1", prompt_len=100,
+            prefix_len_at_admission=0, decoded_tokens_so_far=10,
+            kv_len_now=110, elapsed_ms=1000.0, admitted_ts=5.0,
+        )
+        t.sweep([info])
+        # completed [0,1] + in-flight [5,6] → 2 stages → 2000/420.
+        self.assertAlmostEqual(
+            job.virtual_job_slowdown, 2000.0 / 420.0, places=3
+        )
+
+    def test_step_cost_supersedes_legacy(self):
+        # With both step + legacy models, compute_job_vjs uses the step model.
+        prefill, tbt = _make_cost_models()
+        t = SlowdownTracker(
+            prefill_cost=prefill, tbt_cost=tbt,
+            registry=JobRegistry(), step_cost=_step_model(),
+        )
+        vjs = t.compute_job_vjs([_span(0.0, 1.0)], fallback_slo=5.0)
+        # Step model wins: 1000 / 210.
+        self.assertAlmostEqual(vjs, 1000.0 / 210.0, places=4)
+
+    def test_legacy_cost_model_path(self):
+        # Legacy PrefillCostModel + TBTCostModel still drive compute_job_vjs.
+        prefill, tbt = _make_cost_models()
+        t = SlowdownTracker(prefill, tbt, JobRegistry())
+        self.assertTrue(t.has_cost_model)
+        vjs = t.compute_job_vjs([_span(0.0, 1.0)], fallback_slo=5.0)
+        self.assertGreater(vjs, 0.0)
 
     def test_no_cost_models_has_cost_model_false(self):
-        reg = JobRegistry()
-        tracker = SlowdownTracker(None, None, reg)
-        self.assertFalse(tracker.has_cost_model)
+        self.assertFalse(SlowdownTracker(None, None, JobRegistry()).has_cost_model)
 
 
 class TestHaloController(unittest.TestCase):
@@ -660,6 +738,7 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
             prompt_len=2000, prefix_len_at_admission=1800,
             decoded_tokens_so_far=200, kv_len_now=2200,
             elapsed_ms=200_000.0,   # 200s elapsed against a small solo budget
+            admitted_ts=0.0,
         )
         with self.assertRaises(HaloRejectError) as cm:
             c.register_request(
@@ -683,6 +762,7 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
             prompt_len=2000, prefix_len_at_admission=1800,
             decoded_tokens_so_far=200, kv_len_now=2200,
             elapsed_ms=200_000.0,
+            admitted_ts=0.0,
         )
         # Dry-run: decision is REJECT but controller admits anyway.
         job = c.register_request(
@@ -764,6 +844,7 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
             rid="rid-1", job_id="agent-1", prompt_len=1000,
             prefix_len_at_admission=500, decoded_tokens_so_far=20,
             kv_len_now=1020, elapsed_ms=200.0,
+            admitted_ts=0.0,
         )
         job = c.register_request(
             rid="rid-2", halo_job_id="agent-1", halo_slo=5.0,
@@ -821,6 +902,7 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
             rid="rid-1", job_id="agent-1", prompt_len=1000,
             prefix_len_at_admission=500, decoded_tokens_so_far=20,
             kv_len_now=1020, elapsed_ms=200.0,
+            admitted_ts=0.0,
         )
         with self.assertRaises(HaloRejectError) as cm:
             c.register_request(

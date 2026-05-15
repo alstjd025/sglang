@@ -16,7 +16,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set
 
 
 class JobState(Enum):
@@ -30,14 +30,38 @@ def _now_monotonic() -> float:
     return time.monotonic()
 
 
+@dataclass(frozen=True)
+class JobCallSpan:
+    """One LLM call's wall-clock span + token features, for the job-lifetime
+    virtual job slowdown (VJS) computation.
+
+    A call occupies the interval ``[admitted_ts, end_ts]``. The feature
+    fields let ``SlowdownTracker.compute_job_vjs`` reconstruct the call's
+    solo time (prefill + decode). For a *completed* call ``end_ts`` is its
+    finish time and the features are final; for an *in-flight* call
+    ``end_ts`` is "now" at computation time and the features are current.
+
+    See ms_dev/halo_dev/prediction_model.md (VJS section) for how spans are
+    merged into stages and turned into a slowdown ratio.
+    """
+
+    admitted_ts: float    # monotonic s — when this call was first admitted
+    end_ts: float         # monotonic s — finish time, or "now" if in-flight
+    prompt_len: int       # total prompt tokens (n + cached prefix)
+    prefix_len: int       # cached prefix length at admission (radix hit)
+    decoded_tokens: int   # output tokens produced so far / in total
+    kv_len: int           # KV span (= prompt_len + decoded_tokens), now/final
+
+
 @dataclass
 class Job:
     """Per-job state record. Single-threaded access; lives inside the scheduler.
 
-    Notes on initial slowdown values (per spec ms_dev/halo_dev/CLAUDE.md §2 Q5):
-    initial `slowdown_max` and `slowdown_mean` are set to `slo` rather than
-    1.0 — meaning "no measurement yet, treat as worst-case (SLO bound) for
-    Phase 2 admission decisions". This is overwritten on the first sweep.
+    Notes on the initial slowdown value (per spec ms_dev/halo_dev/CLAUDE.md §2 Q5):
+    initial `virtual_job_slowdown` is set to `slo` rather than 1.0 — meaning
+    "no measurement yet, treat as worst-case (SLO bound) for Phase 2
+    admission decisions". This is overwritten on the first sweep that sees
+    an in-flight call of this job.
 
     Option A pre-registration fields (`total_calls_expected`, `stage_sequence`,
     expected input/output token lengths, `dag`) are populated only when the
@@ -58,9 +82,11 @@ class Job:
 
     state: JobState = JobState.QUEUED
 
-    # Slowdown observation — see SlowdownTracker.sweep().
-    slowdown_max: float = 0.0     # set in __post_init__ to slo
-    slowdown_mean: float = 0.0    # set in __post_init__ to slo
+    # Virtual job slowdown — the job's lifetime critical-path slowdown.
+    # = (job critical-path actual ms) / (job critical-path solo ms),
+    # recomputed every sweep by SlowdownTracker.compute_job_vjs over the
+    # job's completed + in-flight calls. set in __post_init__ to slo.
+    virtual_job_slowdown: float = 0.0
 
     # Request counters.
     total_request_number: int = 0
@@ -74,10 +100,16 @@ class Job:
     # Member request IDs (rid). Removed when a request finishes.
     request_ids: Set[str] = field(default_factory=set)
 
-    # Bounded (max, mean) history for debugging / /server_info exposure.
-    slowdown_history: Deque[Tuple[float, float]] = field(
+    # Bounded VJS history for debugging / /server_info exposure.
+    slowdown_history: Deque[float] = field(
         default_factory=lambda: deque(maxlen=64)
     )
+
+    # Finished calls of this job, kept for the job-lifetime VJS computation.
+    # Each request that finishes appends its frozen JobCallSpan here (see
+    # HaloController.on_request_finished). Bounded by the job's call count;
+    # dropped wholesale when the job is GC'd.
+    completed_call_spans: List[JobCallSpan] = field(default_factory=list)
 
     # ---- Option A (pre-registration) metadata ----
     # All optional: None for jobs created without pre-registration (forbidden
@@ -102,10 +134,8 @@ class Job:
 
     def __post_init__(self) -> None:
         # Honor the spec: initial slowdown == SLO (worst-case fallback).
-        if self.slowdown_max == 0.0:
-            self.slowdown_max = self.slo
-        if self.slowdown_mean == 0.0:
-            self.slowdown_mean = self.slo
+        if self.virtual_job_slowdown == 0.0:
+            self.virtual_job_slowdown = self.slo
 
     # ---- mutators (scheduler-side; no internal locking) ----
 
@@ -152,16 +182,23 @@ class Job:
         self.last_update_ts = _now_monotonic()
         self.state = JobState.COMPLETE
 
-    def record_sweep(self, max_ratio: float, mean_ratio: float) -> None:
-        """Called from SlowdownTracker after each periodic sweep."""
-        self.slowdown_max = max_ratio
-        self.slowdown_mean = mean_ratio
-        self.slowdown_history.append((max_ratio, mean_ratio))
+    def record_vjs(self, vjs: float) -> None:
+        """Called from SlowdownTracker after each periodic sweep with the
+        freshly computed virtual job slowdown."""
+        self.virtual_job_slowdown = vjs
+        self.slowdown_history.append(vjs)
         self.last_update_ts = _now_monotonic()
-        if max_ratio > self.slo:
+        if vjs > self.slo:
             self.slo_violation_count += 1
         if self.state == JobState.QUEUED and self.request_ids:
             self.state = JobState.RUNNING
+
+    def record_completed_call(self, span: JobCallSpan) -> None:
+        """Freeze a finished call's time span so it keeps contributing to
+        this job's lifetime VJS after the request object is gone. Called
+        from HaloController.on_request_finished."""
+        self.completed_call_spans.append(span)
+        self.last_update_ts = _now_monotonic()
 
     # ---- read-only helpers ----
 
@@ -171,8 +208,7 @@ class Job:
             "job_id": self.job_id,
             "state": self.state.value,
             "slo": self.slo,
-            "slowdown_max": self.slowdown_max,
-            "slowdown_mean": self.slowdown_mean,
+            "virtual_job_slowdown": self.virtual_job_slowdown,
             "total_request_number": self.total_request_number,
             "remaining_request_number": self.remaining_request_number,
             "slo_violation_count": self.slo_violation_count,

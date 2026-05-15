@@ -29,7 +29,7 @@ from sglang.srt.managers.halo.cost_model_sampler import (
     HaloCostModelSampler,
     build_halo_cost_sampler_from_server_args,
 )
-from sglang.srt.managers.halo.job import Job, JobState
+from sglang.srt.managers.halo.job import Job, JobCallSpan, JobState
 from sglang.srt.managers.halo.job_registry import JobAdmissionResult, JobRegistry
 from sglang.srt.managers.halo.metrics import HaloMetrics
 from sglang.srt.managers.halo.slowdown_tracker import (
@@ -49,6 +49,7 @@ __all__ = [
     "HaloRejectError",
     "Job",
     "JobAdmissionResult",
+    "JobCallSpan",
     "JobLookaheadInput",
     "JobRegistry",
     "JobSlowdownAdmissionPredictor",

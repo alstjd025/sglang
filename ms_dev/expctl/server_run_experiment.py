@@ -539,9 +539,8 @@ def main() -> int:
         "sglang:halo_slo_violations_total",
         "sglang:halo_active_jobs",
         "sglang:halo_total_known_jobs",
-        "sglang:halo_mean_slowdown_max",
-        "sglang:halo_mean_slowdown_mean",
-        "sglang:halo_max_slowdown_max",
+        "sglang:halo_mean_vjs",
+        "sglang:halo_max_vjs",
     ]
 
     if mode == "pd":
