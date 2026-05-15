@@ -18,19 +18,18 @@ end-to-end SLO).
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Project Halo                                                        │
 │                                                                      │
-│  Role 1. Job-level slowdown tracking                  [Phase 1: ON]  │
+│  Role 1. Job-level slowdown tracking                  [ON]          │
 │          - SlowdownTracker.sweep() every ~100ms                      │
-│          - per-job slowdown_max / slowdown_mean                      │
+│          - per-job virtual_job_slowdown (VJS) via compute_job_vjs    │
 │                                                                      │
-│  Role 2. Job-level admission gate                     [Phase 1: ON]  │
-│          - JobRegistry.admit_to_job() — strict validation:           │
-│            request must carry halo_job_id AND be pre-registered      │
-│          - Phase 2 will add predictive lookahead admission           │
-│            that reads Role 1's job state                             │
+│  Role 2. Job-level admission gate                     [ON]          │
+│          - strict validation (halo_job_id + pre-registration)        │
+│          - Phase 2 predictive admission: job- and request-scoped     │
+│            gates that read each job's VJS (admission_decision.py)    │
 │                                                                      │
-│  Role 3. Job-level scheduling policy                  [Phase 2]      │
-│          - fairness over slowdown ratios                             │
-│          - reuses Role 1's Job + Registry, no new state              │
+│  Role 3. Job-level scheduling policy                  [future]      │
+│          - fairness over virtual job slowdown                        │
+│          - reuses Job + Registry, no new state                       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -84,7 +83,7 @@ managers/halo/
 ├── __init__.py             # public API: HaloController, Job, JobRegistry
 ├── job.py                  # Job dataclass + JobState enum
 ├── job_registry.py         # JobRegistry: rid↔job, lifecycle
-├── slowdown_tracker.py     # sweep() — compute per-request ratios, aggregate to job
+├── slowdown_tracker.py     # compute_job_vjs() stage-merge VJS + 100ms sweep()
 ├── controller.py           # HaloController: on/off, hook into scheduler
 ├── cost_model_sampler.py   # per-step JSONL sampler for fitting the Halo Step Cost Model
 │                           # (rank-0, background flusher thread, no-op when path unset).
@@ -102,11 +101,12 @@ managers/halo/
 | Class | Responsibility | Role |
 |---|---|---|
 | `JobState` | Enum: `QUEUED / RUNNING / COMPLETE / REJECTED` | shared |
-| `Job` | task_struct-like dataclass: id, slo, slowdown_max/mean, counters, rids set, history, Option A pre-registration fields | Role 1 state |
+| `Job` | task_struct-like dataclass: id, slo, virtual_job_slowdown, completed_call_spans, counters, rids set, history, Option A pre-registration fields | Role 1 state |
 | `JobRegistry` | `register_program / admit_to_job / record_completion / active_jobs / gc_*` | Role 1 + Role 2 |
 | `JobAdmissionResult` | Return type of `admit_to_job` — Halo job-level admission decision (distinct from `admission_control.AdmissionDecision`) | Role 2 |
 | `RequestExecutionInfo` | Plain dataclass the scheduler builds per active req before sweep | Role 1 |
-| `SlowdownTracker` | Pure compute. `compute_request_slowdown()` + `sweep()` | Role 1 |
+| `JobCallSpan` | Frozen per-call time-span + token features; the unit of compute_job_vjs | Role 1 |
+| `SlowdownTracker` | Pure compute. `compute_job_vjs()` (stage-merge VJS) + `sweep()` + cost-model primitives | Role 1 |
 | `HaloConfig` | Snapshot of CLI flags / env-derived parameters | shared |
 | `HaloController` | Glue. Owned by scheduler. `register_program / register_request / on_request_finished / tick / snapshot` | Roles 1 + 2 |
 
@@ -116,42 +116,32 @@ managers/halo/
   No internal locking. Tests must mirror this.
 - **rid→job mapping is the source of truth** for ownership. A request's
   `halo_job_id` field is the seed at admission time; afterwards the registry owns it.
-- **Initial `slowdown_max = slowdown_mean = job.slo`** (spec choice — measurement-less
-  worst-case fallback; tracker overwrites on first sweep).
-- **Aggregation**: `slowdown_max` = max over per-request slowdowns; `slowdown_mean`
-  = arithmetic mean. Both stored on Job; bounded `slowdown_history` deque
-  (`maxlen=64`) stores `(max, mean)` tuples for debugging.
+- **Initial `Job.virtual_job_slowdown = job.slo`** (spec choice — measurement-less
+  worst-case fallback; the sweep overwrites it once the job has an in-flight call).
+- **One canonical slowdown**: each job carries a single `virtual_job_slowdown`
+  (VJS). `slowdown_history` is a bounded (`maxlen=64`) deque of past VJS floats.
 
-## Slowdown computation
+## Virtual job slowdown (VJS)
 
-For each active request `r` belonging to job `j`:
+VJS is the job's **lifetime critical-path slowdown** —
+`(job critical-path actual ms) / (job critical-path solo ms)` accumulated over
+every completed + in-flight call of the job. `SlowdownTracker.compute_job_vjs`
+merges the job's call spans into *stages* by wall-clock interval overlap; per
+stage `actual` is the interval-union span and `solo` is the critical-path (max)
+over the stage's calls with decode steps charged at the batch-of-K step time.
+Tool-delay gaps are excluded; concurrent calls merge by critical path.
 
-```
-actual_elapsed_ms   = now - r.first_admitted_ts
-solo_prefill_ms     = prefill_cost.estimate_ms(prompt_len, prefix_len_at_admission)
-solo_tbt_ms         = tbt_cost.estimate_ms(batch_size=1, per_req_kv=r.kv_len_now)
-solo_elapsed_ms     = solo_prefill_ms + solo_tbt_ms * decoded_tokens_so_far
-request_slowdown    = actual_elapsed_ms / max(solo_elapsed_ms, eps)
-```
+Both the periodic sweep (`SlowdownTracker.sweep` → `Job.record_vjs`) and the
+Phase-2 job-scoped admission gate go through the *same* `compute_job_vjs` — one
+source of truth. The **full definition, the stage-merge algorithm, a worked
+example, and the cost-model formula** are in
+[`ms_dev/halo_dev/prediction_model.md`](../../../../../ms_dev/halo_dev/prediction_model.md) §3.
 
-Then for each job: `slowdown_max = max(...)` and `slowdown_mean = mean(...)`.
-
-**Cost model brittleness inherited**: the TBT cost model currently has a narrow
-prediction range (~55 ms regardless of batch composition — see
-`ms_dev/runtime/cost_models/README.md` item 3). That means `solo_tbt_ms`
-under-discriminates context, which propagates to slowdown estimates. Phase 1 ships
-this as a known limitation; Phase 2 work should refine the cost model first.
-
-**Halo Step Cost Model (post-Phase-1 follow-up, in progress)**: a 6-coefficient
-per-step regression that replaces the `per_req_kv` reparam (root cause of the
-cliff) with a batch-summed `Σrⱼ` plus prefill cross-term `Σ(nᵢ·rᵢ)`. It loads
-from `--halo-step-cost-model-path` and, when present, the tracker swaps to it
-automatically; otherwise the legacy two-model path is used. Full design (each
-term's physical meaning, JSON schema, instrumentation, fit procedure, file
-changes, and PR-sized rollout order) is in
-[`ms_dev/halo_dev/prediction_model.md`](../../../../../ms_dev/halo_dev/prediction_model.md)
-with a one-page summary at
-[`ms_dev/halo_dev/CLAUDE.md`](../../../../../ms_dev/halo_dev/CLAUDE.md) §20.
+The solo baseline comes from the **Halo Step Cost Model** (path A,
+`--halo-step-cost-model-path`) — a 6/7-coefficient per-step regression that
+replaced the old `per_req_kv = total_kv/bs` reparam (the TBT cliff) with a
+batch-summed `Σrⱼ` term. A legacy two-model pair (path B) is used only when no
+step model is loaded. Cost-model design: `prediction_model.md` §2.
 
 ## CLI flags + endpoint surface
 
@@ -249,9 +239,8 @@ sglang:halo_slo_violations_total
 # gauges (refreshed every sweep, ~100 ms)
 sglang:halo_active_jobs
 sglang:halo_total_known_jobs
-sglang:halo_mean_slowdown_max
-sglang:halo_mean_slowdown_mean
-sglang:halo_max_slowdown_max
+sglang:halo_mean_vjs
+sglang:halo_max_vjs
 ```
 
 Consumed by `ms_dev/expctl/monitoring_view.py` to render two rows on the
@@ -275,8 +264,7 @@ rejected` and `mean_smax / mean_smean / worst_smax / slo_violations`).
       "job_id": "agent-42",
       "state": "running",
       "slo": 5.0,
-      "slowdown_max": 2.8,
-      "slowdown_mean": 1.4,
+      "virtual_job_slowdown": 2.8,
       "total_request_number": 4,
       "remaining_request_number": 2,
       "slo_violation_count": 0,

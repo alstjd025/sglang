@@ -1,6 +1,6 @@
 # Halo Phase 2 — Admission Control Design
 
-> Project Halo Phase 2 의 핵심 deliverable. Phase 1 (R1 — slowdown tracking)
+> Project Halo Phase 2 의 핵심 deliverable. Phase 1 (job slowdown tracking)
 > 위에 R2/R3 의 일부를 *job-level admission decision* 으로 구현. `ms_dev/halo_dev/CLAUDE.md`
 > §21 에서 가리키는 상세 문서.
 
@@ -41,7 +41,7 @@
 |---|---|
 | Stage A | 두 scope. **`job`** (per-job snapshot stretch, M-2) = 설계. **`request`** (per-request, no aggregation) = "request-scoped 가 더 나쁘다" 를 보이는 baseline. `--halo-admission-mode=level2` 는 deprecated → `job` 자동 폴백 + WARN. `level0` 은 `job` 의 옛 이름 (silent alias). |
 | Stage B | **Per-job concurrency hard cap** — declared 시 enforce, 미선언 시 무제한 (D4) |
-| 용어 | R1 의 측정값 = `virtual job slowdown`. admission 예측값: mode `job` → `predicted virtual job slowdown`, mode `request` → `predicted request slowdown` (per-request TTFT/TBT slowdown) |
+| 용어 | 측정값 = `virtual job slowdown` (job slowdown tracking 이 sweep 마다 갱신). admission 예측값: mode `job` → `predicted virtual job slowdown`, mode `request` → `predicted request slowdown` (per-request TTFT/TBT slowdown) |
 | 결정 단위 | mode `job`: **job 단위** — 한 job 의 *첫 LLM request* 만 Stage A 거침, 후속은 자동 admit (chain 끊김 방지). mode `request`: **request 단위** — *매 request* Stage A 거침, mid-chain request 도 reject 가능 |
 | 사용 정보 | **현재 상태만** — active unit 들의 *현재* slowdown + 새 request 의 prompt/prefix 만. DAG / remaining call lengths / expected output 안 씀 |
 | Stretch 정의 | 각 active unit 의 *자기 단계 (prefill/decode) 의 step time 변화율* (M-2). `job` / `request` 가 동일한 stretch 식·cost model 을 씀 — 차이는 *aggregation 여부* 뿐 |
@@ -102,14 +102,16 @@ else:
 for each active job i:
     job_is_in_prefill = any(call.is_prefill for call in i.active_calls)
     stretch_i = stretch_extend if job_is_in_prefill else stretch_decode
-
-    if i.current_solo_elapsed_ms > 0:
-        current_VJS_i = i.current_actual_elapsed_ms / i.current_solo_elapsed_ms
-    else:
-        current_VJS_i = i.slo  # R1 initial slowdown_max convention
-
-    predicted_VJS_i = current_VJS_i × stretch_i
+    predicted_VJS_i = i.current_vjs × stretch_i
 ```
+
+`current_vjs` 는 그 job 의 *현재* virtual job slowdown — `SlowdownTracker.
+compute_job_vjs` 가 그 job 의 완료 + in-flight call span 들로 계산한 값으로,
+periodic sweep 이 `Job.virtual_job_slowdown` 에 기록하는 것과 **동일한 함수·
+동일한 정의**. controller 의 `_build_active_jobs_input` 이 admission 시점에
+이걸 다시 계산해 `JobLookaheadInput.current_vjs` 에 채운다. VJS 의 정확한
+정의 (stage-merge, critical-path, tool-delay 제외) 는
+[`prediction_model.md`](prediction_model.md) §3.
 
 **사용자 예시 검증** (A prefill 4096 chunk, B/C decode KV=3000/7000, 새 req prompt=8000/prefix=7500):
 
@@ -146,7 +148,7 @@ for each active call c (모든 job 의 active_calls 를 flatten):
     if c.solo_elapsed_ms > 0:
         current_slowdown_c = c.elapsed_actual_ms / c.solo_elapsed_ms
     else:
-        current_slowdown_c = job.slo            # R1 initial 관행
+        current_slowdown_c = job.slo            # Job initial-VJS 관행
     predicted_request_slowdown_c = current_slowdown_c × stretch_c
 ```
 
@@ -373,7 +375,7 @@ client
   - 단일 prefill-phase job → stretch_extend
   - mixed (사용자 예시: A prefill, B/C decode) → 각자 phase 별 stretch
   - 더 큰 새 도착 → 더 큰 predicted VJS
-  - current_solo_ms = 0 인 fresh job → SLO 로 fallback
+  - predicted_VJS = current_vjs × stretch (predictor 는 곱셈만 — VJS 계산은 compute_job_vjs)
   - declared 필드 있어도 결과 동일 (declared 안 씀)
 - `RequestSlowdownAdmissionPredictor` (mode `request`):
   - 예측 dict key 가 rid (job_id 아님), job aggregation 없음
@@ -415,7 +417,7 @@ client
 - **Mixed-phase job.** 한 job 의 active call 중 prefill / decode 가 섞이면
   *prefill 우선* 으로 stretch_extend 받음 (단순화). 사용자 환경에선 거의 발생 안 함.
 - **Cumulative wait effect.** prefill burst 동안 *decode 중인 job 들이 누적 대기* 받는
-  영향은 명시적으로 모델링 안 함. R1 의 *과거* 측정값에 이미 누적 반영된 것으로
+  영향은 명시적으로 모델링 안 함. VJS 의 *과거* 측정값에 이미 누적 반영된 것으로
   처리 (snapshot 의 한계).
 
 ## 13. 미정 (PR5 검증 후 결정)

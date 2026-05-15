@@ -1033,7 +1033,7 @@ Phase 1 의 *짧은* 대안. (γ) 가 무거우면 임시 (α) 또는 model-less
 
 | | 의도된 동작 | 검증 상태 |
 |---|---|---|
-| **Job tracking** (R1) | 매 100ms sweep, per-job `slowdown_max/mean` 갱신 | ✅ 260513_1550 세션에서 mean 2.03x / worst 2.56x 관찰. 부하 반영 정상 |
+| **Job tracking** (R1) | 매 100ms sweep, per-job `virtual_job_slowdown` 갱신 (lifetime stage-merge VJS — 2026-05-16 통일) | ✅ 260513_1550 세션에서 mean 2.03x / worst 2.56x 관찰. 부하 반영 정상 |
 | **Job-level admission gate** (R2, strict mode) | `halo_job_id` + 사전등록 필수, 둘 다 안되면 400 | ✅ 검증됨 (reject 0건) |
 | **Job-level scheduling** (R3) | n/a — Phase 2 작업 | ⏳ |
 | **Option A: `POST /halo/programs`** | client 가 chain 시작 시 1회 등록. body 에 chain_length 등 | ✅ |

@@ -158,8 +158,7 @@ Existing endpoint. When Halo is on, gains a `halo_state` block:
       "job_id": "agent-42",
       "state": "running",
       "slo": 5.0,
-      "slowdown_max": 2.8,
-      "slowdown_mean": 1.4,
+      "virtual_job_slowdown": 2.8,
       "total_request_number": 4,
       "remaining_request_number": 2,
       "slo_violation_count": 0,
@@ -175,8 +174,8 @@ Existing endpoint. When Halo is on, gains a `halo_state` block:
 ```
 
 `jobs[]` is the top 32 most-slowed active jobs (sorted by
-`slowdown_max` desc); `total_known_jobs` includes completed-but-not-
-yet-GC'd ones.
+`virtual_job_slowdown` desc); `total_known_jobs` includes
+completed-but-not-yet-GC'd ones.
 
 ## Client integration recipes
 
