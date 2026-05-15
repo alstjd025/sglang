@@ -1186,52 +1186,56 @@ Phase 2 는 그 위에 **새 job 받기 결정** 을 *기존 job 들의 예측 s
 
 | Stage | 목적 | 입력 | 출력 |
 |---|---|---|---|
-| **A — Predictive (Level 0 only, M-2)** | 새 job 받으면 *기존 active job 들의 predicted virtual job slowdown 분포*. 결정은 *job 단위* — 첫 request 만 검사, 후속 request 는 자동 admit | active jobs + new job's first request + cost model | admit / reject + per-job 예측치 |
+| **A — Predictive** | 새 request 받으면 *기존 active unit 들의 예측 slowdown 분포*. scope 두 가지 (아래). | active jobs/requests + new request shape + cost model | admit / reject + per-unit 예측치 |
 | **B — Concurrency hard cap** | application 이 declare 한 *동시 in-flight* 약속을 enforce | declared_max_concurrency + current in_flight_count | admit / reject |
 
-### Level 0 (현재 default), Level 2 (DEPRECATED)
+### Stage A — 두 scope (`--halo-admission-mode`)
 
-- **Level 0 — Per-job snapshot stretch (M-2, 2026-05-15 design)**:
-  - 각 active job 의 *현재 단계* (prefill / decode) 에 따라 *그 단계의 step time 변화율* 을 stretch 로 사용.
-  - `stretch_extend = aug_extend / base_extend`, `stretch_decode = aug_decode / base_decode`
-  - `predicted_VJS_i = current_VJS_i × stretch_i`
+- **mode `job` — Per-job snapshot stretch (M-2, 설계)**:
+  - 각 active job 의 *현재 단계* (prefill / decode) 의 step time 변화율을 stretch 로 사용.
+  - `predicted_VJS_i = current_VJS_i × stretch_i`. 결정은 *job 단위* — 첫 request 만 검사, 후속은 자동 admit (chain 보호).
   - 사용 정보: *현재 batch + 새 request 의 prompt/prefix*. **DAG / remaining / expected_output 안 씀**.
-- **Level 2 (DEPRECATED 2026-05-15)**: 옛 1 초 slice lookahead. 코드는 남아있지만 admission path 에서 호출 안 됨 (controller 가 자동 level0 폴백 + WARN).
+- **mode `request` — Per-request stretch (baseline)**:
+  - 같은 stretch 식·cost model. 단 *job aggregation 없음* — 모든 active request 를 독립 단위로 score, 매 request 마다 결정 → mid-chain reject 가능.
+  - "request 단위 admission 이 job 단위보다 나쁘다" 를 보이는 비교용 baseline.
+- **mode `level2` (DEPRECATED 2026-05-15)**: 옛 1 초 slice lookahead. 코드는 남아있지만 admission path 에서 호출 안 됨 (controller 가 자동 `job` 폴백 + WARN). `level0` 은 `job` 의 옛 이름 (alias).
 
-### 새 components (계획)
+### components
 
 ```
-managers/halo/admission_decision.py   ← 신규
-  AdmissionPredictor / SnapshotAdmissionPredictor / LookaheadAdmissionPredictor
+managers/halo/admission_decision.py
+  AdmissionPredictor (ABC)
+  JobSlowdownAdmissionPredictor      (mode "job")
+  RequestSlowdownAdmissionPredictor  (mode "request")
+  LookaheadAdmissionPredictor        (mode "level2", DEPRECATED)
   decide_admission(...)
 managers/halo/job.py                  declared_max_concurrency, in_flight_count
-managers/halo/controller.py            register_request 안 Stage A → Stage B
-server_args.py                         5 새 CLI 플래그 (--halo-admission-*)
-ms_dev/env.common.sh + lib_server.sh   5 새 env vars (SGLANG_HALO_ADMISSION_*)
-test/registered/halo/test_halo_admission_predictors.py  ← 신규
+managers/halo/controller.py           register_request 안 Stage A (mode-aware) → Stage B
+server_args.py                        5 CLI 플래그 (--halo-admission-*)
+ms_dev/env.common.sh + lib_server.sh  5 env vars (SGLANG_HALO_ADMISSION_*)
+test/registered/halo/test_halo_admission_predictors.py
 ```
 
 ### 단계별 PR 순서
 
 | # | 내용 | 영향 |
 |---|---|---|
-| PR1 | AdmissionPredictor ABC + Level 0 + 단위 테스트 | 라이브러리만 |
+| PR1 | AdmissionPredictor ABC + job-scoped predictor + 단위 테스트 | 라이브러리만 |
 | PR2 | Controller 통합 + dry-run + CLI + env vars + decision log | 통합 |
-| PR3 | Level 2 lookahead + 단위 테스트 | 라이브러리 |
+| PR3 | level2 lookahead + 단위 테스트 (그 후 deprecated) | 라이브러리 |
 | PR4 | Stage B (Concurrency cap) | Job/Registry + register_program |
+| PR-request | request-scoped baseline + mode 개명 (`level0`→`job`, `request` 신규) | admission_decision + controller + server_args + tests + docs |
 | PR5 | 검증 실험 + 문서 갱신 | 문서 |
 
-### 진행 상태 (2026-05-14)
+### 진행 상태 (2026-05-15)
 
 | PR | 상태 | 산출물 |
 |---|---|---|
-| PR1 | ✅ | `managers/halo/admission_decision.py` (Snapshot + ABC) + 14 unit tests |
-| PR2 | ✅ | `HaloController.register_request` 가 Stage A 호출 + dry-run + decision log + 5 CLI 플래그 + 5 env vars + expctl auto-route + 6 controller tests |
-| PR3 | ✅ | `LookaheadAdmissionPredictor` (1초 slice 시뮬) + 7 lookahead tests |
-| PR4 | ✅ | `Job.declared_max_concurrency` + `in_flight_count` + `register_program` body field + Stage B reject path + 4 cap tests |
-| PR5 | ⏳ | 사용자 환경 검증 실험 (mode=off / level0 / level2 비교) — 코드 ready |
+| PR1–PR4 | ✅ | job-scoped 게이트 + Stage B + level2(deprecated). admission_design.md §10 참고 |
+| PR-request | ✅ | `RequestSlowdownAdmissionPredictor` (mode `request`) + mode 개명 (`SnapshotAdmissionPredictor`→`JobSlowdownAdmissionPredictor`, `level0`→`job`) + controller mode-aware 분기 + decision-log `is_first_call` |
+| PR5 | ⏳ | 사용자 환경 검증 실험 (mode=off / job / request 3-way 비교) — 코드 ready |
 
-본 라운드 통합 test 수: **201 (43+33+13+9+72 + 4 신규 Phase 2 sets)**.
+halo admission/predictor 단위 test 수: **86 (test_halo_admission_predictors 29 + test_halo_phase1 57)**.
 
 ---
 

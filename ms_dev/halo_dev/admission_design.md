@@ -15,6 +15,11 @@
 
 핵심은 **새 job 의 SLA 보장이 아니라 기존 작업들의 SLA 보호**.
 
+설계의 핵심 arm 은 *job-scoped* 게이트 (mode `job`). 이와 비교하기 위한
+*request-scoped* baseline (mode `request`) 도 같은 framework 안에 구현 —
+"request 단위 admission 이 job 단위보다 나쁘다" 를 실험으로 보이는 용도
+(§4.2).
+
 ## 2. LLM serving admission control 의 특수성
 
 | # | 특수성 | 의미 |
@@ -34,12 +39,12 @@
 
 | ID | 내용 |
 |---|---|
-| Stage A | **Level 0 (per-job snapshot stretch, M-2)** 만 활성. `--halo-admission-mode=level2` 는 *legacy* 라 자동 폴백 + WARN. |
+| Stage A | 두 scope. **`job`** (per-job snapshot stretch, M-2) = 설계. **`request`** (per-request, no aggregation) = "request-scoped 가 더 나쁘다" 를 보이는 baseline. `--halo-admission-mode=level2` 는 deprecated → `job` 자동 폴백 + WARN. `level0` 은 `job` 의 옛 이름 (silent alias). |
 | Stage B | **Per-job concurrency hard cap** — declared 시 enforce, 미선언 시 무제한 (D4) |
-| 용어 | R1 의 측정값 = `virtual job slowdown`, admission 예측값 = `predicted virtual job slowdown` |
-| 결정 단위 | **Job 단위** — 한 job 의 *첫 LLM request* 만 Stage A 거침. 후속 request 는 자동 admit (chain 끊김 방지) |
-| 사용 정보 | **현재 상태만** — active job 들의 *현재* VJS + 새 request 의 prompt/prefix 만. DAG / remaining call lengths / expected output 안 씀 |
-| Stretch 정의 | 각 active job 의 *자기 단계 (prefill/decode) 의 step time 변화율* (M-2) |
+| 용어 | R1 의 측정값 = `virtual job slowdown`. admission 예측값: mode `job` → `predicted virtual job slowdown`, mode `request` → `predicted request slowdown` (per-request TTFT/TBT slowdown) |
+| 결정 단위 | mode `job`: **job 단위** — 한 job 의 *첫 LLM request* 만 Stage A 거침, 후속은 자동 admit (chain 끊김 방지). mode `request`: **request 단위** — *매 request* Stage A 거침, mid-chain request 도 reject 가능 |
+| 사용 정보 | **현재 상태만** — active unit 들의 *현재* slowdown + 새 request 의 prompt/prefix 만. DAG / remaining call lengths / expected output 안 씀 |
+| Stretch 정의 | 각 active unit 의 *자기 단계 (prefill/decode) 의 step time 변화율* (M-2). `job` / `request` 가 동일한 stretch 식·cost model 을 씀 — 차이는 *aggregation 여부* 뿐 |
 | SLO 침해 비율 threshold | **0.2 (20%)** default (D3) |
 | Cap 초과 시 동작 | **reject** (P2) — queue 도입은 추후 |
 | `declared_max_concurrency` | `register_program` body 의 *명시 field* (P4) |
@@ -48,7 +53,14 @@
 
 ## 4. Stage A — Predictive admission
 
-### 4.1 Level 0 — Per-job snapshot stretch (M-2, current default)
+Stage A 는 두 scope 를 가진다 — `--halo-admission-mode` 로 선택:
+`job` (§4.1, 설계) 과 `request` (§4.2, baseline). 둘은 *동일한 stretch 식·
+cost model* 을 쓰고, 차이는 결정의 *단위* (job vs request) 뿐이다.
+
+### 4.1 mode `job` — Per-job snapshot stretch (M-2)
+
+`JobSlowdownAdmissionPredictor`. 결정을 *job 단위* 로 내림 — 한 job 의 첫
+request 만 Stage A 를 거치고, 후속 request 는 자동 admit (chain 보호).
 
 **철학** (2026-05-15 결정):
 - *현재 시점만* 본다. 미래 phase 변화 (예: 현재 prefill 중인 job 이 decode 합류) 안 봄.
@@ -110,10 +122,50 @@ for each active job i:
 - 비용: cost_model 호출 최대 4 회 (각 stretch 의 baseline + augmented). 빈 batch 면 호출 skip.
 - 의도적으로 제외: 미래 phase 합류 (A → decode 후), KV cache pressure, prefill burst 동안의 누적 대기, 새 request 후속 call 들의 부담.
 
-### 4.2 Level 2 — SLO-driven lookahead (DEPRECATED 2026-05-15)
+### 4.2 mode `request` — Per-request stretch (baseline)
+
+`RequestSlowdownAdmissionPredictor`. **비교용 baseline** — "request-scoped
+admission 이 job-scoped 보다 나쁘다" 를 실험으로 보이기 위한 의도적으로
+naive 한 arm.
+
+stretch 식 (`_compute_stretches`) 과 cost model 은 §4.1 과 **완전히 동일**.
+차이는 단 두 가지:
+
+1. **Job aggregation 없음** — active job 으로 묶지 않고, 모든 in-flight
+   request (= active call) 하나하나를 *독립 단위* 로 score. 예측 dict 의
+   key 가 job_id 가 아니라 rid.
+2. **매 request 마다 결정** — controller 가 첫 request 뿐 아니라 *모든*
+   request 에 대해 Stage A 를 돌림. 따라서 mid-chain request 도 reject 될 수
+   있음 (chain 이 중간에 끊김).
+
+```
+stretch_extend, stretch_decode = _compute_stretches(...)   # §4.1 과 동일
+
+for each active call c (모든 job 의 active_calls 를 flatten):
+    stretch_c = stretch_extend if c.is_prefill else stretch_decode
+    if c.solo_elapsed_ms > 0:
+        current_slowdown_c = c.elapsed_actual_ms / c.solo_elapsed_ms
+    else:
+        current_slowdown_c = job.slo            # R1 initial 관행
+    predicted_request_slowdown_c = current_slowdown_c × stretch_c
+```
+
+- prefill 중인 call → TTFT slowdown, decode 중인 call → TBT 포함 elapsed
+  slowdown. (사용자 환경: chunked prefill ON, mixed-chunk OFF → 한 call 은
+  한 시점에 prefill *또는* decode, 둘 중 하나.)
+- `decide_admission` 의 violation_ratio 는 *request* 모수로 계산됨
+  (`violations / num_active_requests`).
+- job-scoped 와 달리 도착 request 의 부모 job 을 점수에서 제외하지 않음 —
+  그 job 의 이미-active 한 call 들도 "현재 존재하는 request" 라 포함.
+
+**왜 더 나쁠 것으로 예상되나** (실험 가설): chain 보호가 없어 mid-chain
+reject 가 발생 → 앞 call 들에 쓴 연산이 낭비됨. 또 한 job 의 여러 call 이
+각각 violation 으로 세어져 violation_ratio 가 job-scoped 보다 noisy 함.
+
+### 4.3 level2 — SLO-driven lookahead (DEPRECATED 2026-05-15)
 
 > ⚠️ 2026-05-15 부터 *deprecated*. `admission_mode=level2` 가 들어와도 controller 가
-> WARN 후 Level 0 으로 자동 폴백.
+> WARN 후 mode `job` 으로 자동 폴백.
 
 본 모드는 *DAG / remaining lengths / expected_output_lens* 같은 declared 정보를 깊게
 활용했음. 2026-05-15 design decision (현재 상태만 사용) 이후로 사용 안 함.
@@ -122,13 +174,13 @@ for each active job i:
 
 추후 (`expected_output_lens` 가 더 신뢰할 만해지면) 부활 가능성 있음.
 
-### 4.3 결정 함수 — `decide_admission`
+### 4.4 결정 함수 — `decide_admission`
 
 ```
-predicted_virtual_job_slowdowns: Dict[job_id, predicted_VJS]
-slos:                            Dict[job_id, SLO]
+predicted_slowdowns: Dict[unit_id, predicted_slowdown]   # unit = job 또는 request
+slos:                Dict[unit_id, SLO]                  # 같은 key 체계
 
-violations      = count of j where predicted_VJS_j > slos[j]
+violations      = count of u where predicted_slowdowns[u] > slos[u]
 violation_ratio = violations / max(1, len(predictions))
 
 if violation_ratio > threshold (default 0.2):
@@ -136,6 +188,9 @@ if violation_ratio > threshold (default 0.2):
 else:
     return ADMIT(...)
 ```
+
+`decide_admission` 은 unit 종류에 무관 — key 가 job_id (mode `job`) 든 rid
+(mode `request`) 든 동일하게 동작. 어느 쪽인지는 결과의 `mode` 필드로 구분.
 
 ## 5. Stage B — Per-job concurrency hard cap
 
@@ -171,8 +226,9 @@ python/sglang/srt/managers/halo/
 │   ├── NewJobInput                (dataclass — register 요청 객체 + declared structure)
 │   ├── AdmissionDecisionResult    (dataclass — admit / reject + diagnostic dict)
 │   ├── AdmissionPredictor         (ABC — predict(active, new, cost_model) → predictions)
-│   ├── SnapshotAdmissionPredictor (Level 0 구현)
-│   ├── LookaheadAdmissionPredictor (Level 2 구현, slice-by-slice 시뮬)
+│   ├── JobSlowdownAdmissionPredictor     (mode "job" — per-job stretch, M-2)
+│   ├── RequestSlowdownAdmissionPredictor (mode "request" — per-request baseline)
+│   ├── LookaheadAdmissionPredictor       (mode "level2" — DEPRECATED, slice 시뮬)
 │   └── decide_admission(predictions, slos, threshold) → AdmissionDecisionResult
 ```
 
@@ -220,33 +276,38 @@ python/sglang/srt/managers/halo/
   "ts_ns": 1717800000000000,
   "rid": "rid-abc-001",
   "job_id": "agent-42",
-  "mode": "level0",
+  "mode": "job",
+  "is_first_call": true,
   "dry_run": false,
   "decision": "reject",
   "reason": "HALO_ADMISSION_PREDICTED",
   "violation_ratio": 0.31,
-  "active_jobs_total": 16,
+  "active_units_total": 16,
   "violation_count": 5,
   "threshold": 0.2,
-  "predicted_virtual_job_slowdowns": {
+  "predicted_slowdowns": {
     "job-1": 4.2, "job-2": 5.8, "job-3": 7.1, ...
   },
   "horizon_sec": null
 }
 ```
-(JSONL 키 `predicted_virtual_job_slowdowns` 는 2026-05-15 rename. 이전 이름: `predicted_slowdowns`.)
+- `mode` ∈ {`job`, `request`}. `predicted_slowdowns` 의 key 는 mode 가
+  `job` 이면 job_id, `request` 이면 rid.
+- `is_first_call` — 이 request 가 자기 job 의 첫 LLM call 인지. mode
+  `request` 에서 `false` 면 mid-chain 결정임을 뜻함.
+- `active_units_total` — score 된 unit 수 (job 또는 request).
 
 목적:
 - offline replay (`tools/halo/replay_admission.py` — 향후. 다른 threshold/mode 비교)
-- 실험 분석 (mode=off/level0/level2 sweep 결과 비교)
+- 실험 분석 (mode=off / job / request sweep 결과 비교)
 
 ## 8. CLI 플래그 / env vars
 
 | CLI 플래그 | env var | Default | 설명 |
 |---|---|---|---|
-| `--halo-admission-mode {off,level0,level2}` | `SGLANG_HALO_ADMISSION_MODE` | `off` | Stage A 켜기/끄기 + level 선택 |
-| `--halo-admission-violation-threshold <f>` | `SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD` | `0.2` | xx%. 0.2 = active job 중 20% 이상 SLO 초과 예상 시 reject |
-| `--halo-admission-lookahead-horizon-sec <f>` | `SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC` | `0` (= SLO-driven) | Level 2 의 horizon. 0 이면 SLO 도달 시점 자동 |
+| `--halo-admission-mode {off,job,request}` | `SGLANG_HALO_ADMISSION_MODE` | `off` | Stage A scope. `job` = 설계, `request` = baseline. `level0`/`level2` 는 deprecated alias |
+| `--halo-admission-violation-threshold <f>` | `SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD` | `0.2` | xx%. 0.2 = active unit 중 20% 이상 SLO 초과 예상 시 reject |
+| `--halo-admission-lookahead-horizon-sec <f>` | `SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC` | `0` (= SLO-driven) | level2 (deprecated) 의 horizon. 0 이면 SLO 도달 시점 자동 |
 | `--halo-admission-dry-run` | `SGLANG_HALO_ADMISSION_DRY_RUN` | `0` | 로그만 + 항상 admit (튜닝 모드) |
 | `--halo-admission-decision-log <path>` | `SGLANG_HALO_ADMISSION_DECISION_LOG` | unset | JSONL 출력. 비어 있으면 expctl 가 `<session>/admission_decisions.jsonl` 로 auto-route |
 
@@ -267,17 +328,21 @@ client
                  │    - not in registry      → REJECT HALO_PROGRAM_NOT_REGISTERED
                  │
                  ├── 2. Stage A — Predictive admission (Phase 2 ★)
-                 │    is_first_request = (job.total_request_number == 0)   ← 2026-05-15
-                 │    if mode != off and is_first_request:
-                 │      predictor   = SnapshotAdmissionPredictor   (level2 → auto-fallback)
+                 │    is_first_request = (job.total_request_number == 0)
+                 │    run_stage_a = mode != off
+                 │                  and (mode == "request" or is_first_request)
+                 │    if run_stage_a:
+                 │      predictor   = Job/RequestSlowdownAdmissionPredictor
+                 │                    (level2 → auto-fallback to job)
                  │      predictions = predictor.predict(active_jobs, new_job)
-                 │                  = {job_id: predicted_virtual_job_slowdown}
+                 │                  = {unit_id: predicted_slowdown}
                  │      decision    = decide_admission(predictions, slos, threshold)
                  │      log to admission_decisions.jsonl
                  │      if reject and not dry_run:
                  │          → REJECT HALO_ADMISSION_PREDICTED
-                 │    (follow-up requests in the same job skip Stage A entirely —
-                 │     job-level reject: never break a chain mid-flight)
+                 │    (mode "job": follow-up requests skip Stage A — never break
+                 │     a chain mid-flight. mode "request": every request scored,
+                 │     mid-chain reject possible.)
                  │
                  └── 3. Stage B — Concurrency cap (Phase 2 ★)
                       if job.declared_max_concurrency is set:
@@ -294,14 +359,15 @@ client
 | **PR2** | `HaloController` 통합: register_request 안 Stage A 호출, dry-run, decision log, CLI 플래그, env vars, expctl auto-route | controller + scheduler + plumbing | ✅ |
 | **PR3** | `LookaheadAdmissionPredictor` (Level 2) + 단위 테스트 | 라이브러리만 | ✅ (그 후 2026-05-15 deprecated) |
 | **PR4** | Stage B (concurrency cap) — Job/Registry 확장, register_program field, controller check, 단위 테스트 | Job/Registry + register_program + controller | ✅ |
-| **PR-refactor** | **2026-05-15 design refresh** — job-level reject (`is_first_request` 분기), snapshot-only per-job stretch (M-2), declared-driven 코드 deprecate, level2 → level0 자동 폴백, `predicted_slowdowns` → `predicted_virtual_job_slowdowns` rename | admission_decision + controller + tests + docs | ✅ |
+| **PR-refactor** | **2026-05-15 design refresh** — job-level reject (`is_first_request` 분기), snapshot-only per-job stretch (M-2), declared-driven 코드 deprecate, level2 → job 자동 폴백 | admission_decision + controller + tests + docs | ✅ |
+| **PR-request-baseline** | **2026-05-15 — request-scoped baseline.** mode 개명 (`level0`→`job`, 신규 `request`), `SnapshotAdmissionPredictor`→`JobSlowdownAdmissionPredictor`, 신규 `RequestSlowdownAdmissionPredictor`, controller mode-aware 분기, decision-log `is_first_call` | admission_decision + controller + server_args + tests + docs | ✅ |
 | **PR5** | 검증 실험 + 분석 + 문서 갱신 (CLAUDE.md / prediction_model.md / 본 문서 §검증 결과) | 문서만 | ⏳ |
 
 ## 11. 단위 테스트 전략
 
 ### 11.1 `test_halo_admission_predictors.py`
 - `decide_admission`: violation_ratio 계산, threshold 경계, missing SLO 처리, frozen dataclass
-- `SnapshotAdmissionPredictor` (M-2 per-job stretch):
+- `JobSlowdownAdmissionPredictor` (mode `job`, M-2 per-job stretch):
   - 빈 active set → 빈 dict
   - 단일 decode-phase job → stretch_decode
   - 단일 prefill-phase job → stretch_extend
@@ -309,17 +375,24 @@ client
   - 더 큰 새 도착 → 더 큰 predicted VJS
   - current_solo_ms = 0 인 fresh job → SLO 로 fallback
   - declared 필드 있어도 결과 동일 (declared 안 씀)
+- `RequestSlowdownAdmissionPredictor` (mode `request`):
+  - 예측 dict key 가 rid (job_id 아님), job aggregation 없음
+  - 한 job 의 여러 call 이 각각 별도 entry
+  - call 별 자기 phase 의 stretch (prefill→extend, decode→decode)
+  - per-request slowdown = elapsed/solo, solo=0 이면 SLO fallback
 - `LookaheadAdmissionPredictor` (DEPRECATED) — 회귀만 잡는 약한 검증
 
 ### 11.2 `test_halo_phase1.py`
 - `TestPhase2AdmissionIntegration`:
   - admission_mode=off → Stage A skip
-  - admission_mode=level0 + 빈 active → admit
-  - admission_mode=level0 + 부담 큰 시나리오 → reject
+  - admission_mode=job + 빈 active → admit
+  - admission_mode=job + 부담 큰 시나리오 → reject
   - dry-run 모드 → 결정 reject 여도 admit
-  - decision log JSONL 1 row + 새 키 `predicted_virtual_job_slowdowns`
-  - **`test_level2_falls_back_to_level0_with_warn`** — DEPRECATED 폴백
-  - **`test_followup_requests_skip_stage_a`** — 같은 job 의 두 번째 request 는 Stage A 건너뜀
+  - decision log JSONL 1 row (`mode`, `is_first_call` 필드)
+  - **`test_level2_falls_back_to_job_with_warn`** — DEPRECATED 폴백
+  - **`test_followup_requests_skip_stage_a`** — mode `job`: 같은 job 의 두 번째 request 는 Stage A 건너뜀
+  - **`test_request_mode_runs_stage_a_on_every_request`** — mode `request`: follow-up 도 Stage A 거침 (mid-chain reject 가능)
+  - **`test_request_mode_admits_when_below_threshold`** / **`..._decision_log_has_is_first_call`**
 - `TestPhase2StageBConcurrencyCap`:
   - declared 없으면 무제한
   - declared 있으면 초과 시 reject
@@ -327,8 +400,8 @@ client
   - admission_mode=off 와도 독립 작동
 
 ### 11.3 통합 / e2e
-- 같은 워크로드 (parallel_tool_delay λ=0.5) 에 mode=off / mode=level0 비교
-- SLO attainment rate / rejection rate / throughput 측정
+- 같은 워크로드 (parallel_tool_delay λ=0.5) 에 mode=off / job / request 3-way 비교
+- SLO attainment rate / rejection rate / throughput / wasted-token (mid-chain reject) 측정
 
 ## 12. 알려진 한계
 
@@ -354,7 +427,8 @@ client
 ## 14. 검증 결과 (placeholder — PR5 후 채움)
 
 (사용자 실험 후 작성)
-- 같은 워크로드 sweep across mode={off, level0}
-- SLO attainment rate 비교
+- 같은 워크로드 sweep across mode={off, job, request}
+- SLO attainment rate / rejection rate 비교 — 가설: `request` < `job`
+- mid-chain reject 로 인한 wasted-token (request mode 에서만 발생)
 - Capacity (admitted job/min) 비교
 - Rejection rate 비교

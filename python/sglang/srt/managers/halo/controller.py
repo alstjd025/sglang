@@ -35,9 +35,10 @@ from sglang.srt.managers.halo.admission_decision import (
     AdmissionDecisionResult,
     AdmissionPredictor,
     JobLookaheadInput,
+    JobSlowdownAdmissionPredictor,
     LookaheadAdmissionPredictor,
     NewJobInput,
-    SnapshotAdmissionPredictor,
+    RequestSlowdownAdmissionPredictor,
     decide_admission,
 )
 from sglang.srt.managers.halo.job import Job, JobState
@@ -143,11 +144,15 @@ class HaloConfig:
     # to send halo_job_done. 0 disables. Tune up for workloads with
     # legitimately long mid-chain waits (e.g., human-in-the-loop).
     quiescent_timeout_seconds: float = 300.0
-    # ── Phase 2 admission control (job-level predictive gate) ──────────
+    # ── Phase 2 admission control (predictive gate) ────────────────────
     # See ms_dev/halo_dev/admission_design.md.
-    admission_mode: str = "off"                 # off | level0 | level2
+    #   off     — no predictive admission (Phase 1 strict mode still applies)
+    #   job     — job-scoped gate, decision once per job at its first request
+    #   request — request-scoped baseline, decision on every request
+    #   level2  — DEPRECATED; accepted as an alias of "job" (WARN)
+    admission_mode: str = "off"                 # off | job | request
     admission_violation_threshold: float = 0.2  # D3 — fraction (0..1)
-    admission_lookahead_horizon_sec: float = 0.0  # 0 = SLO-driven (Level 2)
+    admission_lookahead_horizon_sec: float = 0.0  # 0 = SLO-driven (level2, deprecated)
     admission_dry_run: bool = False             # log only; always admit
     admission_decision_log_path: Optional[str] = None  # JSONL output
 
@@ -288,20 +293,24 @@ class HaloController:
                 mode,
             )
             return None
-        if mode == "level0":
-            return SnapshotAdmissionPredictor(step_cost)
+        # "level0" is the pre-2026-05-15 name for the job-scoped gate; accept
+        # it as a silent alias so stale wrappers / env.local.sh keep working.
+        if mode in ("job", "level0"):
+            return JobSlowdownAdmissionPredictor(step_cost)
+        if mode == "request":
+            return RequestSlowdownAdmissionPredictor(step_cost)
         if mode == "level2":
             # DEPRECATED 2026-05-15 — see admission_decision.py docstring.
             # Lookahead used declared DAG/remaining-lengths which we now
-            # ignore (admission uses current state only). Fall back to
-            # level0 with a startup warning so misconfigured runs still
-            # proceed instead of silently disabling admission.
+            # ignore (admission uses current state only). Fall back to the
+            # job-scoped gate with a startup warning so misconfigured runs
+            # still proceed instead of silently disabling admission.
             logger.warning(
                 "halo: admission_mode=level2 is DEPRECATED (2026-05-15); "
-                "falling back to level0 (snapshot per-job stretch). See "
+                "falling back to mode=job (snapshot per-job stretch). See "
                 "ms_dev/halo_dev/admission_design.md §4."
             )
-            return SnapshotAdmissionPredictor(step_cost)
+            return JobSlowdownAdmissionPredictor(step_cost)
         logger.warning(
             "halo: unknown admission_mode=%r — admission disabled", mode
         )
@@ -361,30 +370,43 @@ class HaloController:
             raise HaloRejectError(reason=REASON_PROGRAM_NOT_REGISTERED, rid=rid)
 
         # ── 3. Stage A — Predictive admission (Phase 2) ──────────────────
-        # Job-level reject (2026-05-15 design): the admission decision
-        # is made *once per job*, at the first request. Any follow-up
-        # request belonging to a job whose first request was already
-        # admitted bypasses Stage A entirely — rejecting it mid-chain
-        # would leave the job half-done and waste the work already put
-        # into earlier calls.
+        # Scope depends on admission_mode (admission_design.md §3/§4):
+        #   mode "job"     — decision made *once per job*, at its first
+        #                    request. Follow-up requests bypass Stage A so a
+        #                    chain is never rejected mid-flight (rejecting
+        #                    it would waste the work in earlier calls).
+        #   mode "request" — decision made on *every* request (the
+        #                    request-scoped baseline). A mid-chain request
+        #                    can be rejected.
         is_first_request = new_job_record.total_request_number == 0
+        predictor = self.admission_predictor
 
         # Empty active list is still a valid input (auto-admit + log row);
         # only None means "scheduler did not provide the snapshot" → skip.
-        if (
-            is_first_request
-            and self.admission_predictor is not None
+        run_stage_a = (
+            predictor is not None
             and active_request_infos is not None
-        ):
+            and (predictor.mode_name == "request" or is_first_request)
+        )
+        if run_stage_a:
+            # Job scope excludes the arriving job (it has no active calls
+            # to protect yet). Request scope scores *all* in-flight
+            # requests — including any already-active calls of the arriving
+            # job — so nothing is excluded.
+            exclude_job_id = (
+                None if predictor.mode_name == "request" else halo_job_id
+            )
             decision = self._stage_a_decide(
                 new_job=new_job_record,
                 new_slo=slo,
                 prompt_len=prompt_len,
                 prefix_len=prefix_len,
                 active_request_infos=active_request_infos,
-                exclude_job_id=halo_job_id,  # don't score the arriving job
+                exclude_job_id=exclude_job_id,
             )
-            self._log_admission_decision(rid, halo_job_id, decision)
+            self._log_admission_decision(
+                rid, halo_job_id, decision, is_first_call=is_first_request
+            )
             if not decision.admit and not self.config.admission_dry_run:
                 if self.metrics is not None:
                     self.metrics.record_request_rejected(
@@ -430,7 +452,7 @@ class HaloController:
         prompt_len: int,
         prefix_len: int,
         active_request_infos: List[RequestExecutionInfo],
-        exclude_job_id: str,
+        exclude_job_id: Optional[str],
     ) -> AdmissionDecisionResult:
         """Run the admission predictor + decide_admission against the
         current request-execution snapshot."""
@@ -443,7 +465,18 @@ class HaloController:
         predictions = self.admission_predictor.predict(
             active_jobs_input, new_job_input
         )
-        slos_map = {j.job_id: j.slo for j in active_jobs_input}
+        # The predictor's output keys differ by scope: job_id for the
+        # job-scoped gate, rid for the request-scoped baseline. Build the
+        # SLO map with the matching keys so decide_admission compares
+        # like-for-like.
+        if self.admission_predictor.mode_name == "request":
+            slos_map = {
+                call.rid: j.slo
+                for j in active_jobs_input
+                for call in j.active_calls
+            }
+        else:
+            slos_map = {j.job_id: j.slo for j in active_jobs_input}
         return decide_admission(
             predictions,
             slos_map,
@@ -487,6 +520,9 @@ class HaloController:
                     decoded_tokens=i.decoded_tokens_so_far,
                     kv_len_now=i.kv_len_now,
                     elapsed_actual_ms=i.elapsed_ms,
+                    # Per-call solo baseline — the request-scoped predictor
+                    # divides elapsed by this to get the per-request slowdown.
+                    solo_elapsed_ms=self._solo_ms_for_info(i),
                 )
                 for i in info_list
             )
@@ -582,48 +618,53 @@ class HaloController:
             return ()
         return tuple(full[admitted:])
 
+    def _solo_ms_for_info(self, info: RequestExecutionInfo) -> float:
+        """Cost-model solo wall-clock so far for one in-flight request —
+        prefill + tbt × decoded_tokens. Same formula SlowdownTracker uses.
+        Returns 0.0 when no cost model is loaded (callers fall back)."""
+        tracker = self.tracker
+        if tracker.step_cost is not None:
+            prefill = tracker.step_cost.estimate_solo_prefill_total_ms(
+                info.prompt_len, info.prefix_len_at_admission
+            )
+            tbt = tracker.step_cost.estimate_solo_tbt_ms(
+                max(info.kv_len_now, 0)
+            )
+        elif tracker.prefill_cost is not None or tracker.tbt_cost is not None:
+            prefill = (
+                tracker.prefill_cost.estimate_ms(
+                    info.prompt_len, info.prefix_len_at_admission
+                )
+                if tracker.prefill_cost is not None
+                else 0.0
+            )
+            tbt = (
+                tracker.tbt_cost.estimate_ms(
+                    batch_size=1, per_req_kv=max(info.kv_len_now, 0)
+                )
+                if tracker.tbt_cost is not None
+                else 0.0
+            )
+        else:
+            # No cost model — degenerate; report 0 so the caller's slowdown
+            # calc takes its fallback path.
+            return 0.0
+        return prefill + tbt * max(0, info.decoded_tokens_so_far)
+
     def _current_solo_ms_for_job(
         self, infos: List[RequestExecutionInfo]
     ) -> float:
         """Total solo time so far across the job's in-flight calls,
         computed the same way SlowdownTracker does."""
-        tracker = self.tracker
-        total = 0.0
-        for info in infos:
-            if tracker.step_cost is not None:
-                prefill = tracker.step_cost.estimate_solo_prefill_total_ms(
-                    info.prompt_len, info.prefix_len_at_admission
-                )
-                tbt = tracker.step_cost.estimate_solo_tbt_ms(
-                    max(info.kv_len_now, 0)
-                )
-            elif tracker.prefill_cost is not None or tracker.tbt_cost is not None:
-                prefill = (
-                    tracker.prefill_cost.estimate_ms(
-                        info.prompt_len, info.prefix_len_at_admission
-                    )
-                    if tracker.prefill_cost is not None
-                    else 0.0
-                )
-                tbt = (
-                    tracker.tbt_cost.estimate_ms(
-                        batch_size=1, per_req_kv=max(info.kv_len_now, 0)
-                    )
-                    if tracker.tbt_cost is not None
-                    else 0.0
-                )
-            else:
-                # No cost model — degenerate; report 0 so caller's slowdown
-                # calc returns its fallback path.
-                continue
-            total += prefill + tbt * max(0, info.decoded_tokens_so_far)
-        return total
+        return sum(self._solo_ms_for_info(info) for info in infos)
 
     def _log_admission_decision(
         self,
         rid: str,
         job_id: str,
         decision: AdmissionDecisionResult,
+        *,
+        is_first_call: bool,
     ) -> None:
         if self._admission_log is None:
             return
@@ -633,17 +674,21 @@ class HaloController:
                 "rid": rid,
                 "job_id": job_id,
                 "mode": decision.mode,
+                # True when this request is its job's first LLM call. In
+                # mode "request" a False here marks a mid-chain decision.
+                "is_first_call": is_first_call,
                 "dry_run": self.config.admission_dry_run,
                 "decision": "admit" if decision.admit else "reject",
                 "reason": decision.reason,
                 "violation_ratio": decision.violation_ratio,
                 "violation_count": decision.violation_count,
-                "active_jobs_total": decision.active_jobs_total,
+                # Count of scored units — jobs (mode "job") or requests
+                # (mode "request").
+                "active_units_total": decision.active_jobs_total,
                 "threshold": decision.threshold,
                 "horizon_sec": decision.horizon_sec,
-                # Renamed 2026-05-15: was "predicted_slowdowns".
-                "predicted_virtual_job_slowdowns":
-                    decision.predicted_virtual_job_slowdowns,
+                # Keys are job_id (mode "job") or rid (mode "request").
+                "predicted_slowdowns": decision.predicted_slowdowns,
             }
         )
 

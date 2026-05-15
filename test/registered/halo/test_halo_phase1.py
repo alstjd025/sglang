@@ -631,9 +631,9 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
         )
         self.assertEqual(job.job_id, "agent-1")
 
-    def test_admission_level0_admits_when_below_threshold(self):
+    def test_admission_job_mode_admits_when_below_threshold(self):
         """No active jobs → violation_ratio = 0 → admit."""
-        c = self._make_controller(admission_mode="level0",
+        c = self._make_controller(admission_mode="job",
                                   admission_violation_threshold=0.2)
         c.register_program("agent-1", slo=5.0, total_calls=2)
         job = c.register_request(
@@ -643,11 +643,11 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
         )
         self.assertEqual(job.job_id, "agent-1")
 
-    def test_admission_level0_rejects_when_predictions_violate(self):
+    def test_admission_job_mode_rejects_when_predictions_violate(self):
         """One active job whose predicted slowdown will exceed its SLO ⇒
         violation_ratio = 1.0 > 0.2 ⇒ reject."""
         c = self._make_controller(
-            admission_mode="level0",
+            admission_mode="job",
             admission_violation_threshold=0.2,
         )
         # Pre-register both jobs.
@@ -671,7 +671,7 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
 
     def test_admission_dry_run_admits_despite_reject_decision(self):
         c = self._make_controller(
-            admission_mode="level0",
+            admission_mode="job",
             admission_violation_threshold=0.2,
             admission_dry_run=True,
         )
@@ -697,7 +697,7 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "admission_decisions.jsonl")
             c = self._make_controller(
-                admission_mode="level0",
+                admission_mode="job",
                 admission_decision_log_path=path,
             )
             c.register_program("new-1", slo=5.0, total_calls=2)
@@ -713,18 +713,19 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
         self.assertEqual(rows[0]["rid"], "rid-a")
         self.assertEqual(rows[0]["job_id"], "new-1")
         self.assertEqual(rows[0]["decision"], "admit")
-        self.assertEqual(rows[0]["mode"], "level0")
+        self.assertEqual(rows[0]["mode"], "job")
 
-    def test_level2_falls_back_to_level0_with_warn(self):
+    def test_level2_falls_back_to_job_with_warn(self):
         """DEPRECATED 2026-05-15 — admission_mode=level2 must fall back to
-        SnapshotAdmissionPredictor with a startup warning. The lookahead
-        class lingers in the source tree but is not on the admission path."""
+        mode=job (JobSlowdownAdmissionPredictor) with a startup warning.
+        The lookahead class lingers in the source tree but is not on the
+        admission path."""
         with self.assertLogs(
             "sglang.srt.managers.halo.controller", level="WARNING"
         ) as captured:
             c = self._make_controller(admission_mode="level2")
         self.assertIsNotNone(c.admission_predictor)
-        self.assertEqual(c.admission_predictor.mode_name, "level0")
+        self.assertEqual(c.admission_predictor.mode_name, "job")
         self.assertTrue(
             any("DEPRECATED" in m for m in captured.output),
             captured.output,
@@ -736,7 +737,7 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
         the same job must bypass Stage A, even when active load would
         trip it. We verify this by stuffing a violating predictor (mock)
         and confirming the *second* register_request succeeds anyway."""
-        c = self._make_controller(admission_mode="level0",
+        c = self._make_controller(admission_mode="job",
                                   admission_violation_threshold=0.2)
         c.register_program("agent-1", slo=5.0, total_calls=2)
         # First request admits.
@@ -770,6 +771,90 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
             active_request_infos=[info],
         )
         self.assertEqual(job.job_id, "agent-1")
+
+    def test_request_mode_admits_when_below_threshold(self):
+        """mode=request: empty active set → violation_ratio 0 → admit."""
+        c = self._make_controller(admission_mode="request",
+                                  admission_violation_threshold=0.2)
+        c.register_program("agent-1", slo=5.0, total_calls=2)
+        job = c.register_request(
+            rid="rid-a", halo_job_id="agent-1", halo_slo=5.0,
+            prompt_len=1000, prefix_len=500,
+            active_request_infos=[],
+        )
+        self.assertEqual(job.job_id, "agent-1")
+
+    def test_request_mode_runs_stage_a_on_every_request(self):
+        """Request-scoped baseline: unlike mode=job, mode=request runs
+        Stage A on *every* request — including follow-ups, so a mid-chain
+        request CAN be rejected. Counterpart to
+        test_followup_requests_skip_stage_a."""
+        c = self._make_controller(admission_mode="request",
+                                  admission_violation_threshold=0.2)
+        c.register_program("agent-1", slo=5.0, total_calls=3)
+        # First request admits (empty active set).
+        c.register_request(
+            rid="rid-1", halo_job_id="agent-1", halo_slo=5.0,
+            prompt_len=1000, prefix_len=500,
+            active_request_infos=[],
+        )
+        # Force a predictor that always rejects. In request mode the gate
+        # runs even for a follow-up → the second request must be rejected.
+        from sglang.srt.managers.halo.admission_decision import (
+            AdmissionPredictor,
+        )
+
+        class _AlwaysRejectRequestPredictor(AdmissionPredictor):
+            mode_name = "request"
+
+            def predict(self, active_jobs, new_job):
+                return {
+                    call.rid: 999.0
+                    for job in active_jobs
+                    for call in job.active_calls
+                }
+
+        c.admission_predictor = _AlwaysRejectRequestPredictor(
+            c.tracker.step_cost
+        )
+        info = RequestExecutionInfo(
+            rid="rid-1", job_id="agent-1", prompt_len=1000,
+            prefix_len_at_admission=500, decoded_tokens_so_far=20,
+            kv_len_now=1020, elapsed_ms=200.0,
+        )
+        with self.assertRaises(HaloRejectError) as cm:
+            c.register_request(
+                rid="rid-2", halo_job_id="agent-1", halo_slo=5.0,
+                prompt_len=2000, prefix_len=1500,
+                active_request_infos=[info],
+            )
+        self.assertEqual(cm.exception.reason, "HALO_ADMISSION_PREDICTED")
+
+    def test_request_mode_decision_log_has_is_first_call(self):
+        """The decision-log row carries is_first_call so post-hoc analysis
+        can separate chain-start rejects from mid-chain rejects."""
+        import json as _json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "admission_decisions.jsonl")
+            c = self._make_controller(
+                admission_mode="request",
+                admission_decision_log_path=path,
+            )
+            c.register_program("new-1", slo=5.0, total_calls=2)
+            c.register_request(
+                rid="rid-a", halo_job_id="new-1", halo_slo=5.0,
+                prompt_len=1000, prefix_len=500,
+                active_request_infos=[],
+            )
+            c.close()
+            with open(path) as f:
+                rows = [_json.loads(l) for l in f if l.strip()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["mode"], "request")
+        self.assertTrue(rows[0]["is_first_call"])
 
 
 class TestPhase2StageBConcurrencyCap(unittest.TestCase):

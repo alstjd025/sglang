@@ -1,21 +1,33 @@
-"""Job-level admission decision for Halo Phase 2.
+"""Predictive admission decision for Halo Phase 2.
 
 Design + rationale: ms_dev/halo_dev/admission_design.md.
 
-Core idea (different from request-level admission_control):
-    Reject a new job if admitting it would push too many *currently active
-    jobs* over their SLO. Decision uses the Halo Step Cost Model (the same
-    cost model that powers R1 slowdown tracking) to predict each active
-    job's *predicted virtual job slowdown* after the new arrival.
+Core idea:
+    Reject a new arrival if admitting it would push too many *currently
+    active units* over their SLO. The decision uses the Halo Step Cost
+    Model (the same cost model that powers R1 slowdown tracking) to
+    predict each active unit's slowdown after the new arrival.
 
-Predictor variants:
-    - SnapshotAdmissionPredictor  (Level 0): per-job stretch model. Current
-      production default. Each active job's stretch is taken from its own
-      current phase (prefill vs decode). No DAG / remaining-call lookahead.
-    - LookaheadAdmissionPredictor (Level 2): 1-second slice forward simulation
-      that used declared DAG / remaining lengths. **DEPRECATED 2026-05-15**:
-      not selected at runtime (controller falls back to level0 with a WARN).
-      Code retained for reference but is not on the admission path.
+Two admission scopes — the difference is the *unit of the decision*:
+
+    - JobSlowdownAdmissionPredictor   (mode "job"): the unit is a job.
+      Per-job stretch model. Each active job's stretch is taken from its
+      own current phase (prefill vs decode); per-request slowdowns are
+      aggregated to the job. The decision is made once per job, at its
+      first request. Predicts *predicted virtual job slowdown*.
+
+    - RequestSlowdownAdmissionPredictor (mode "request"): the unit is a
+      single request. Same stretch math + same cost model, but NO job
+      aggregation — every active request is scored on its own, and the
+      decision runs on *every* request (so a mid-chain request can be
+      rejected). This is a deliberately naive baseline used to show that
+      request-scoped admission is worse than job-scoped. Predicts
+      *predicted request slowdown* (per-request TTFT / TBT slowdown).
+
+    - LookaheadAdmissionPredictor (mode "level2"): 1-second slice forward
+      simulation that used declared DAG / remaining lengths.
+      **DEPRECATED 2026-05-15**: not selected at runtime (controller falls
+      back to "job" with a WARN). Code retained for reference only.
 
 decide_admission(...) glues a predictor's output to the violation-ratio
 threshold (D3 = 0.2) and returns AdmissionDecisionResult — the controller
@@ -44,7 +56,14 @@ REASON_HALO_ADMISSION_PREDICTED = "HALO_ADMISSION_PREDICTED"
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class ActiveCallInfo:
-    """A single in-flight LLM call inside an active job."""
+    """A single in-flight LLM call inside an active job.
+
+    This is a complete per-request snapshot: the job-scoped predictor
+    aggregates these into a job, the request-scoped predictor scores each
+    one on its own. ``solo_elapsed_ms`` is the cost-model solo baseline
+    accumulated so far for *this call* — used by the request-scoped
+    predictor to compute the per-request slowdown.
+    """
 
     rid: str
     is_prefill: bool          # True while still doing prefill (uncached new tokens)
@@ -53,6 +72,7 @@ class ActiveCallInfo:
     decoded_tokens: int       # tokens already produced
     kv_len_now: int           # current KV span (= prompt_len + decoded_tokens)
     elapsed_actual_ms: float  # wall-clock since this call started
+    solo_elapsed_ms: float = 0.0  # cost-model solo time so far for this call
 
 
 @dataclass(frozen=True)
@@ -117,31 +137,34 @@ class AdmissionDecisionResult:
 
     admit: bool
     reason: str                            # REASON_OK or REASON_HALO_ADMISSION_PREDICTED
-    violation_ratio: float                 # violations / active_jobs_total
+    violation_ratio: float                 # violations / active_units_total
     violation_count: int
-    active_jobs_total: int
+    active_jobs_total: int                 # count of scored units (jobs or requests)
     threshold: float
-    # Renamed 2026-05-15 (was: predicted_slowdowns). Job-id → predicted
-    # virtual job slowdown after admitting the new job.
-    predicted_virtual_job_slowdowns: Dict[str, float]
+    # Predicted slowdown per scored unit after admitting the new arrival.
+    # Keys are job_id in mode "job" and rid in mode "request" — disambiguate
+    # via the `mode` field below.
+    predicted_slowdowns: Dict[str, float]
     # Optional / mode-specific diagnostic fields:
-    horizon_sec: Optional[float] = None    # Level 2 only
-    mode: str = ""                          # "level0" | "level2"
+    horizon_sec: Optional[float] = None    # level2 (deprecated) only
+    mode: str = ""                          # "job" | "request" | "level2"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Predictor base
 # ─────────────────────────────────────────────────────────────────────────────
 class AdmissionPredictor(ABC):
-    """Predicts each active job's final slowdown_max *if* the new job is
-    admitted. Concrete subclasses differ in how they extrapolate the future:
+    """Predicts each active unit's slowdown *if* the new arrival is
+    admitted. Concrete subclasses differ in the *unit* of the prediction:
 
-    - Level 0 (SnapshotAdmissionPredictor): treat the current load as
-      time-invariant and stretch each job's declared remaining-solo time by
-      a single factor (augmented_step_ms / current_step_ms).
-    - Level 2 (LookaheadAdmissionPredictor): 1-second slice forward
-      simulation, letting the batch composition evolve as calls finish and
-      new calls of the same job become active.
+    - JobSlowdownAdmissionPredictor (mode "job"): unit = job. Stretches
+      each job's current virtual job slowdown by its own phase's step-time
+      ratio. Returns {job_id: predicted_virtual_job_slowdown}.
+    - RequestSlowdownAdmissionPredictor (mode "request"): unit = request.
+      Same stretch math, no job aggregation. Returns
+      {rid: predicted_request_slowdown}.
+    - LookaheadAdmissionPredictor (mode "level2", DEPRECATED): 1-second
+      slice forward simulation. Not on the production path.
     """
 
     mode_name: str = "abstract"
@@ -155,10 +178,12 @@ class AdmissionPredictor(ABC):
         active_jobs: Sequence[JobLookaheadInput],
         new_job: NewJobInput,
     ) -> Dict[str, float]:
-        """Returns {job_id: predicted_final_slowdown_max} for every active job.
+        """Returns {unit_id: predicted_slowdown} for every active unit.
 
-        New job not included — only existing active jobs are scored (its
-        SLO is the caller's responsibility, not admission control's).
+        The key is job_id (mode "job") or rid (mode "request"). The new
+        arrival is not included — only existing active units are scored
+        (the new arrival's own SLO is the caller's concern, not the
+        admission gate's).
         """
 
 
@@ -230,27 +255,60 @@ def _estimate_remaining_solo_ms(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Level 0 — Per-job snapshot stretch (M-2, current production design)
+# Shared stretch computation — used by both job- and request-scoped predictors
 # ─────────────────────────────────────────────────────────────────────────────
-class SnapshotAdmissionPredictor(AdmissionPredictor):
-    """Per-job snapshot stretch — admits/rejects using only *current* batch
-    state plus the arriving request's first-call shape.
+def _compute_stretches(
+    cost_model: HaloStepCostModel,
+    active_jobs: Sequence[JobLookaheadInput],
+    new_job: NewJobInput,
+) -> Tuple[float, float]:
+    """Returns (stretch_extend, stretch_decode) — the EXTEND-step and
+    DECODE-step time-ratio the arriving request imposes on the current
+    batch. This is the M-2 stretch (decided 2026-05-15); identical for the
+    job- and request-scoped predictors, which differ only in how the
+    stretch is *applied* (per job vs per request).
+
+        stretch_extend = cost([prefill + new_req], []) / cost(prefill, [])
+        stretch_decode = cost([], [decode + new_req.kv]) / cost([], decode)
+
+    Each is 1.0 when its batch half is empty.
+    """
+    current_prefill, current_decode = _split_current_batch_features(active_jobs)
+
+    n_new = max(0, new_job.first_call_input_len - new_job.first_call_prefix_len)
+    r_new = new_job.first_call_prefix_len
+    if current_prefill:
+        base_ext = cost_model.estimate_step_ms(current_prefill, [])
+        aug_ext = cost_model.estimate_step_ms(
+            current_prefill + [(n_new, r_new)], []
+        )
+        stretch_extend = aug_ext / base_ext if base_ext > 0 else 1.0
+    else:
+        stretch_extend = 1.0
+
+    if current_decode:
+        base_dec = cost_model.estimate_step_ms([], current_decode)
+        aug_dec = cost_model.estimate_step_ms(
+            [], current_decode + [new_job.first_call_input_len]
+        )
+        stretch_decode = aug_dec / base_dec if base_dec > 0 else 1.0
+    else:
+        stretch_decode = 1.0
+    return stretch_extend, stretch_decode
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mode "job" — Per-job snapshot stretch (M-2, current production design)
+# ─────────────────────────────────────────────────────────────────────────────
+class JobSlowdownAdmissionPredictor(AdmissionPredictor):
+    """Job-scoped admission — admits/rejects using only *current* batch
+    state plus the arriving request's first-call shape, with per-request
+    slowdowns aggregated to the *job*.
 
     Algorithm (M-2, decided 2026-05-15):
 
-        # 1. Current batch composition
-        current_prefill = [(n_i, r_i) for prefill-phase active calls]
-        current_decode  = [kv_j      for decode-phase active calls]
+        stretch_extend, stretch_decode = _compute_stretches(...)
 
-        # 2. EXTEND step stretch — applies to prefill-phase active jobs
-        stretch_extend = cost([prefill + new_req_first_call], []) / cost(prefill, [])
-                         (= 1.0 when current_prefill is empty)
-
-        # 3. DECODE step stretch — applies to decode-phase active jobs
-        stretch_decode = cost([], [decode + new_req.prompt_len]) / cost([], decode)
-                         (= 1.0 when current_decode is empty)
-
-        # 4. Per-job: stretch by current phase
         for each active job i:
             if i has any active prefill call:
                 stretch_i = stretch_extend
@@ -266,40 +324,16 @@ class SnapshotAdmissionPredictor(AdmissionPredictor):
     ms_dev/halo_dev/admission_design.md §4.
     """
 
-    mode_name = "level0"
+    mode_name = "job"
 
     def predict(
         self,
         active_jobs: Sequence[JobLookaheadInput],
         new_job: NewJobInput,
     ) -> Dict[str, float]:
-        current_prefill, current_decode = _split_current_batch_features(active_jobs)
-
-        # ── stretch_extend (used by prefill-phase active jobs) ───────────
-        n_new = max(
-            0,
-            new_job.first_call_input_len - new_job.first_call_prefix_len,
+        stretch_extend, stretch_decode = _compute_stretches(
+            self.cost_model, active_jobs, new_job
         )
-        r_new = new_job.first_call_prefix_len
-        if current_prefill:
-            base_ext = self.cost_model.estimate_step_ms(current_prefill, [])
-            aug_ext = self.cost_model.estimate_step_ms(
-                current_prefill + [(n_new, r_new)], []
-            )
-            stretch_extend = aug_ext / base_ext if base_ext > 0 else 1.0
-        else:
-            # No prefill-phase active job will consume this anyway.
-            stretch_extend = 1.0
-
-        # ── stretch_decode (used by decode-phase active jobs) ────────────
-        if current_decode:
-            base_dec = self.cost_model.estimate_step_ms([], current_decode)
-            aug_dec = self.cost_model.estimate_step_ms(
-                [], current_decode + [new_job.first_call_input_len]
-            )
-            stretch_decode = aug_dec / base_dec if base_dec > 0 else 1.0
-        else:
-            stretch_decode = 1.0
 
         # ── per-job: pick stretch by current phase ───────────────────────
         predictions: Dict[str, float] = {}
@@ -320,10 +354,65 @@ class SnapshotAdmissionPredictor(AdmissionPredictor):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# mode "request" — Per-request stretch (baseline: request-scoped admission)
+# ─────────────────────────────────────────────────────────────────────────────
+class RequestSlowdownAdmissionPredictor(AdmissionPredictor):
+    """Request-scoped admission baseline — the deliberately naive arm used
+    to demonstrate that request-scoped admission performs worse than the
+    job-scoped gate.
+
+    The stretch math and cost model are IDENTICAL to
+    JobSlowdownAdmissionPredictor; the only differences are:
+
+      - **no job aggregation** — every in-flight request (= active call)
+        across every job is scored on its own. The unit is the request.
+      - the controller runs this on *every* request (not just a job's
+        first), so a mid-chain request can be rejected.
+
+    Per-request slowdown:
+
+        for each active call c (flattened across all jobs):
+            stretch_c = stretch_extend if c.is_prefill else stretch_decode
+            current_slowdown_c = (c.elapsed_actual_ms / c.solo_elapsed_ms)
+                                  if c.solo_elapsed_ms > 0 else job.slo
+            predicted_slowdown_c = current_slowdown_c × stretch_c
+
+    A prefilling call's slowdown is its TTFT slowdown; a decoding call's is
+    its TBT-inclusive elapsed slowdown. Returns {rid: predicted_slowdown}.
+    """
+
+    mode_name = "request"
+
+    def predict(
+        self,
+        active_jobs: Sequence[JobLookaheadInput],
+        new_job: NewJobInput,
+    ) -> Dict[str, float]:
+        stretch_extend, stretch_decode = _compute_stretches(
+            self.cost_model, active_jobs, new_job
+        )
+
+        # ── per-request: each active call scored on its own ──────────────
+        predictions: Dict[str, float] = {}
+        for job in active_jobs:
+            for call in job.active_calls:
+                stretch_c = stretch_extend if call.is_prefill else stretch_decode
+                if call.solo_elapsed_ms > 0:
+                    current_slowdown = (
+                        call.elapsed_actual_ms / call.solo_elapsed_ms
+                    )
+                else:
+                    # Matches R1's initial slowdown = SLO convention.
+                    current_slowdown = job.slo
+                predictions[call.rid] = current_slowdown * stretch_c
+        return predictions
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Decision wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 def decide_admission(
-    predicted_virtual_job_slowdowns: Dict[str, float],
+    predicted_slowdowns: Dict[str, float],
     slos: Dict[str, float],
     threshold: float,
     mode: str = "",
@@ -332,19 +421,21 @@ def decide_admission(
     """Apply the violation-ratio threshold to a predictor's output.
 
     Args:
-        predicted_virtual_job_slowdowns: {job_id: predicted virtual job
-            slowdown after admitting the new job}.
-        slos:        {job_id: SLO}. Falls back to the prediction's value if
-                     missing (treats missing SLO as "always satisfied").
+        predicted_slowdowns: {unit_id: predicted slowdown after admitting
+            the new arrival}. unit_id is job_id (mode "job") or rid
+            (mode "request").
+        slos:        {unit_id: SLO}, keyed the same way. Falls back to the
+                     prediction's value if missing (missing SLO is treated
+                     as "always satisfied").
         threshold:   D3 — fraction (0..1). If violation_ratio > threshold,
                      decision is REJECT.
         mode:        for diagnostic.
-        horizon_sec: Level 2 only — for diagnostic.
+        horizon_sec: level2 (deprecated) only — for diagnostic.
 
     Returns:
         AdmissionDecisionResult with all fields populated.
     """
-    predictions = predicted_virtual_job_slowdowns
+    predictions = predicted_slowdowns
     total = len(predictions)
     if total == 0:
         return AdmissionDecisionResult(
@@ -354,13 +445,13 @@ def decide_admission(
             violation_count=0,
             active_jobs_total=0,
             threshold=threshold,
-            predicted_virtual_job_slowdowns={},
+            predicted_slowdowns={},
             horizon_sec=horizon_sec,
             mode=mode,
         )
     violations = 0
-    for jid, pred in predictions.items():
-        slo = slos.get(jid, pred)
+    for uid, pred in predictions.items():
+        slo = slos.get(uid, pred)
         if pred > slo:
             violations += 1
     violation_ratio = violations / total
@@ -372,7 +463,7 @@ def decide_admission(
             violation_count=violations,
             active_jobs_total=total,
             threshold=threshold,
-            predicted_virtual_job_slowdowns=dict(predictions),
+            predicted_slowdowns=dict(predictions),
             horizon_sec=horizon_sec,
             mode=mode,
         )
@@ -383,7 +474,7 @@ def decide_admission(
         violation_count=violations,
         active_jobs_total=total,
         threshold=threshold,
-        predicted_virtual_job_slowdowns=dict(predictions),
+        predicted_slowdowns=dict(predictions),
         horizon_sec=horizon_sec,
         mode=mode,
     )
@@ -427,7 +518,7 @@ class LookaheadAdmissionPredictor(AdmissionPredictor):
     The 2026-05-15 design decision is to use *current state only* — no
     DAG, no remaining-call lookahead. ``HaloController._build_admission_predictor``
     now treats ``admission_mode='level2'`` as a soft fallback to
-    SnapshotAdmissionPredictor with a WARN at startup. This class is kept
+    JobSlowdownAdmissionPredictor with a WARN at startup. This class is kept
     in the source tree for reference (e.g. to revive once
     `expected_output_lens` becomes reliable enough to project the cumulative
     effect of new arrivals on existing jobs' slowdown), but it is not on
@@ -712,8 +803,9 @@ __all__ = [
     "AdmissionDecisionResult",
     "AdmissionPredictor",
     "JobLookaheadInput",
+    "JobSlowdownAdmissionPredictor",
     "LookaheadAdmissionPredictor",
     "NewJobInput",
-    "SnapshotAdmissionPredictor",
+    "RequestSlowdownAdmissionPredictor",
     "decide_admission",
 ]

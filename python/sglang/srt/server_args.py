@@ -396,7 +396,7 @@ class ServerArgs:
     halo_cost_model_sample_every: int = 1
     # ── Phase 2 admission control ──────────────────────────────────────
     # See ms_dev/halo_dev/admission_design.md.
-    halo_admission_mode: str = "off"               # off | level0 | level2
+    halo_admission_mode: str = "off"               # off | job | request
     halo_admission_violation_threshold: float = 0.2  # D3
     halo_admission_lookahead_horizon_sec: float = 0.0  # 0 = SLO-driven
     halo_admission_dry_run: bool = False           # log only; admit
@@ -4687,9 +4687,9 @@ class ServerArgs:
         parser.add_argument(
             "--halo-admission-mode",
             type=str,
-            choices=("off", "level0", "level2"),
+            choices=("off", "job", "request", "level0", "level2"),
             default=ServerArgs.halo_admission_mode,
-            help="Halo Phase 2 job-level admission control mode. 'off' disables predictive admission (Phase 1 strict-mode still applies). 'level0' is snapshot scaling (cheap, time-invariant). 'level2' is SLO-driven lookahead. See ms_dev/halo_dev/admission_design.md.",
+            help="Halo Phase 2 predictive admission control mode. 'off' disables predictive admission (Phase 1 strict-mode still applies). 'job' is the job-scoped gate (decision once per job, at its first request). 'request' is the request-scoped baseline (decision on every request; a mid-chain request can be rejected). 'level0' is a deprecated alias of 'job'; 'level2' is the deprecated lookahead (falls back to 'job' with a WARN). See ms_dev/halo_dev/admission_design.md.",
         )
         parser.add_argument(
             "--halo-admission-violation-threshold",

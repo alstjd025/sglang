@@ -13,12 +13,15 @@
 #   - SGLANG_HALO_STEP_COST_MODEL=<halo_step_split JSON>
 #       (legacy two-model paths kept as fallback)
 #
-# It does NOT touch SGLANG_HALO_ADMISSION_MODE. To enable Phase 2 job-level
-# predictive admission, prepend SGLANG_HALO_ADMISSION_MODE=level0 to the
-# server-launch command after sourcing this script. Example:
+# It does NOT touch SGLANG_HALO_ADMISSION_MODE. To enable Phase 2
+# predictive admission, prepend SGLANG_HALO_ADMISSION_MODE to the
+# server-launch command after sourcing this script:
+#   - SGLANG_HALO_ADMISSION_MODE=job     → job-scoped gate (the design)
+#   - SGLANG_HALO_ADMISSION_MODE=request → request-scoped baseline
+# Example:
 #
 #   source ms_dev/experiments/halo_base.sh
-#   SGLANG_HALO_ADMISSION_MODE=level0 \
+#   SGLANG_HALO_ADMISSION_MODE=job \
 #       python3 ms_dev/expctl/server_run_experiment.py --mode single
 #
 # What Halo Phase 1 (R1) does once SGLANG_HALO_ENABLED=1:
