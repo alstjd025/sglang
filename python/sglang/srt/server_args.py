@@ -396,11 +396,16 @@ class ServerArgs:
     halo_cost_model_sample_every: int = 1
     # ── Phase 2 admission control ──────────────────────────────────────
     # See ms_dev/halo_dev/admission_design.md.
-    halo_admission_mode: str = "off"               # off | job | request
+    halo_admission_mode: str = "off"  # off | job | request
     halo_admission_violation_threshold: float = 0.2  # D3
     halo_admission_lookahead_horizon_sec: float = 0.0  # 0 = SLO-driven
-    halo_admission_dry_run: bool = False           # log only; admit
+    halo_admission_dry_run: bool = False  # log only; admit
     halo_admission_decision_log: Optional[str] = None  # JSONL path
+    # Stage B′ KV-cache hard cap: reject a new job's first request when the
+    # KV-cache pool usage ratio is at/above this value. Active iff
+    # 0 < ratio < 1 (default 0.0 = disabled); independent of
+    # halo_admission_mode.
+    halo_admission_kv_cap_ratio: float = 0.0
     # Q13: pre-registered programs that never get an LLM request are dropped
     # after this many seconds. Set to 0 to keep them indefinitely.
     halo_program_idle_timeout_seconds: float = 300.0
@@ -4714,6 +4719,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.halo_admission_decision_log,
             help="JSONL path for per-decision admission logs (rank-0 only). Auto-routed by run_experiment.py to <session>/admission_decisions.jsonl when unset.",
+        )
+        parser.add_argument(
+            "--halo-admission-kv-cap-ratio",
+            type=float,
+            default=ServerArgs.halo_admission_kv_cap_ratio,
+            help="Stage B' KV-cache hard cap. Reject a new job's first request when the KV-cache pool usage ratio is at/above this value. Active iff 0 < ratio < 1; default 0.0 = disabled (set to e.g. 0.90 to enable). Independent of --halo-admission-mode (a KV-cap-only run uses mode=off). See ms_dev/halo_dev/admission_design.md.",
         )
         parser.add_argument(
             "--halo-program-idle-timeout-seconds",

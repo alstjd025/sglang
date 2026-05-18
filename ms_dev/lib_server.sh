@@ -244,6 +244,10 @@ append_halo_args() {
   if [[ -n "${SGLANG_HALO_ADMISSION_DECISION_LOG:-}" ]]; then
     _halo_out+=(--halo-admission-decision-log "${SGLANG_HALO_ADMISSION_DECISION_LOG}")
   fi
+  # Stage B' KV-cache hard cap — independent of admission mode.
+  if [[ -n "${SGLANG_HALO_ADMISSION_KV_CAP_RATIO:-}" ]]; then
+    _halo_out+=(--halo-admission-kv-cap-ratio "${SGLANG_HALO_ADMISSION_KV_CAP_RATIO}")
+  fi
 }
 
 # launch_server <cmd...>

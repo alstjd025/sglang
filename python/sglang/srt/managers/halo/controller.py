@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from sglang.srt.managers.admission_control.cost_model import (
@@ -36,12 +36,11 @@ from sglang.srt.managers.halo.admission_decision import (
     AdmissionPredictor,
     JobLookaheadInput,
     JobSlowdownAdmissionPredictor,
-    LookaheadAdmissionPredictor,
     NewJobInput,
     RequestSlowdownAdmissionPredictor,
     decide_admission,
 )
-from sglang.srt.managers.halo.job import Job, JobState
+from sglang.srt.managers.halo.job import Job
 from sglang.srt.managers.halo.job_registry import (
     REASON_PROGRAM_NOT_REGISTERED,
     JobAdmissionResult,
@@ -53,7 +52,6 @@ from sglang.srt.managers.halo.slowdown_tracker import (
     SlowdownTracker,
 )
 
-
 # Reject reason constants returned to the scheduler. Used to build the HTTP
 # error payload and the decision-log entry. Mirror of admission_control's
 # REASON_* convention.
@@ -62,6 +60,8 @@ REASON_DISABLED = "HALO_DISABLED"
 REASON_JOB_ID_ALREADY_REGISTERED = "JOB_ID_ALREADY_REGISTERED"
 # Phase 2 Stage B — application-declared concurrency cap exceeded.
 REASON_HALO_CONCURRENCY_CAP = "HALO_CONCURRENCY_CAP"
+# Phase 2 KV cap — KV-cache pool usage at/above the configured ceiling.
+REASON_HALO_KV_CAP = "HALO_KV_CAP"
 # Re-export from job_registry + admission_decision so external callers only
 # import controller.
 __all__ = [
@@ -72,6 +72,7 @@ __all__ = [
     "REASON_DISABLED",
     "REASON_HALO_ADMISSION_PREDICTED",
     "REASON_HALO_CONCURRENCY_CAP",
+    "REASON_HALO_KV_CAP",
     "REASON_JOB_ID_ALREADY_REGISTERED",
     "REASON_NO_JOB_ID",
     "REASON_PROGRAM_NOT_REGISTERED",
@@ -120,7 +121,9 @@ class HaloConfig:
     enabled: bool = False
     default_slo: float = 5.0
     tick_interval_ms: float = 100.0
-    aggregator: str = "max+mean"     # Phase 1 always tracks both; reserved string for future
+    aggregator: str = (
+        "max+mean"  # Phase 1 always tracks both; reserved string for future
+    )
     job_log_path: Optional[str] = None
     prefill_cost_model_path: Optional[str] = None
     tbt_cost_model_path: Optional[str] = None
@@ -150,11 +153,19 @@ class HaloConfig:
     #   job     — job-scoped gate, decision once per job at its first request
     #   request — request-scoped baseline, decision on every request
     #   level2  — DEPRECATED; accepted as an alias of "job" (WARN)
-    admission_mode: str = "off"                 # off | job | request
+    admission_mode: str = "off"  # off | job | request
     admission_violation_threshold: float = 0.2  # D3 — fraction (0..1)
     admission_lookahead_horizon_sec: float = 0.0  # 0 = SLO-driven (level2, deprecated)
-    admission_dry_run: bool = False             # log only; always admit
+    admission_dry_run: bool = False  # log only; always admit
     admission_decision_log_path: Optional[str] = None  # JSONL output
+    # KV-cache hard cap (Stage B′). Reject a *new job's first request* when
+    # the KV-cache pool usage ratio is at/above this value — admitting it
+    # would risk queueing delay / preemption the VSS gate cannot see (the
+    # cost model has no eviction-cliff term). Active iff 0 < ratio < 1
+    # (default 0.0 = disabled), and independent of admission_mode (works
+    # even when admission_mode=off, so KV-cap-only ablation runs are
+    # possible). See admission_design.md §5.
+    admission_kv_cap_ratio: float = 0.0
 
 
 class _JobLogger:
@@ -207,9 +218,7 @@ class HaloController:
                     "--halo-prefill-cost-model-path / --halo-tbt-cost-model-path"
                 )
         else:
-            prefill_cost = try_load_prefill_cost_model(
-                config.prefill_cost_model_path
-            )
+            prefill_cost = try_load_prefill_cost_model(config.prefill_cost_model_path)
             tbt_cost = try_load_tbt_cost_model(config.tbt_cost_model_path)
 
         if step_cost is None and prefill_cost is None and tbt_cost is None:
@@ -250,11 +259,14 @@ class HaloController:
         self.admission_predictor: Optional[AdmissionPredictor] = (
             self._build_admission_predictor(config, step_cost)
         )
+        # KV-cache hard cap (Stage B′) — independent of admission_mode so a
+        # KV-cap-only ablation (admission_mode=off) still gates.
+        self.kv_cap_enabled: bool = 0.0 < config.admission_kv_cap_ratio < 1.0
         self._admission_log: Optional[_JobLogger] = None
         if (
             is_rank0
             and config.admission_decision_log_path
-            and self.admission_predictor is not None
+            and (self.admission_predictor is not None or self.kv_cap_enabled)
         ):
             try:
                 self._admission_log = _JobLogger(config.admission_decision_log_path)
@@ -311,9 +323,7 @@ class HaloController:
                 "ms_dev/halo_dev/admission_design.md §4."
             )
             return JobSlowdownAdmissionPredictor(step_cost)
-        logger.warning(
-            "halo: unknown admission_mode=%r — admission disabled", mode
-        )
+        logger.warning("halo: unknown admission_mode=%r — admission disabled", mode)
         return None
 
     # ------------------------------------------------------------------
@@ -329,17 +339,21 @@ class HaloController:
         prompt_len: int = 0,
         prefix_len: int = 0,
         active_request_infos: Optional[List[RequestExecutionInfo]] = None,
+        kv_usage_ratio: Optional[float] = None,
+        chunked_prefill_size: Optional[int] = None,
     ) -> Job:
         """Admission hook combining strict-mode (Phase 1) + predictive
-        gate (Phase 2 Stage A).
+        gate (Phase 2 Stage A) + KV-cache hard cap (Stage B′).
 
         Order of checks (the first one that fails wins):
             1. Strict mode Q7 — halo_job_id REQUIRED.
             2. Strict mode Q12 — job_id MUST be pre-registered.
-            3. Stage A — Predictive admission, if admission_mode != off
+            3. Stage B′ — KV cap. New job's first request only; reject when
+               kv_usage_ratio >= admission_kv_cap_ratio.
+            4. Stage A — Predictive VSS admission, if admission_mode != off
                and active_request_infos was supplied.
-            4. (Stage B / concurrency cap — lands in PR4.)
-            5. Actually admit (rid → job mapping, counters).
+            5. Stage B — concurrency cap (declared_max_concurrency).
+            6. Actually admit (rid → job mapping, counters).
 
         Args new in Phase 2:
             prompt_len, prefix_len      — first-call shape, for the Stage A
@@ -349,6 +363,13 @@ class HaloController:
                                           list the periodic sweep consumes).
                                           When None or empty, Stage A is
                                           skipped.
+            kv_usage_ratio              — current KV-cache pool usage ratio
+                                          (0..1) for the Stage B′ KV cap.
+                                          None → KV cap skipped.
+            chunked_prefill_size        — server's effective chunked-prefill
+                                          token budget; bounds the Stage A
+                                          EXTEND-step cost (결함 A). None →
+                                          no cap (chunked prefill disabled).
 
         Missing `halo_slo` → use `config.default_slo` (the registry's
         pre-registered slo still wins, see Q10).
@@ -369,7 +390,29 @@ class HaloController:
                 self.metrics.record_request_rejected(REASON_PROGRAM_NOT_REGISTERED)
             raise HaloRejectError(reason=REASON_PROGRAM_NOT_REGISTERED, rid=rid)
 
-        # ── 3. Stage A — Predictive admission (Phase 2) ──────────────────
+        is_first_request = new_job_record.total_request_number == 0
+
+        # ── 3. Stage B′ — KV-cache hard cap ──────────────────────────────
+        # New job's first request only. Follow-up requests of an
+        # already-admitted job bypass (Phase 2: once a job is admitted its
+        # subsequent requests are unconditionally admitted — there is no
+        # pending queue yet to hold them, and rejecting one would strand a
+        # running job). The cost-model VSS gate cannot see the KV-pressure
+        # cliff (eviction / preemption), so this is a separate hard gate.
+        # dry-run logs the would-reject but still admits.
+        if (
+            is_first_request
+            and self.kv_cap_enabled
+            and kv_usage_ratio is not None
+            and kv_usage_ratio >= self.config.admission_kv_cap_ratio
+        ):
+            self._log_kv_cap_decision(rid, halo_job_id, kv_usage_ratio)
+            if not self.config.admission_dry_run:
+                if self.metrics is not None:
+                    self.metrics.record_request_rejected(REASON_HALO_KV_CAP)
+                raise HaloRejectError(reason=REASON_HALO_KV_CAP, rid=rid)
+
+        # ── 4. Stage A — Predictive VSS admission (Phase 2) ──────────────
         # Scope depends on admission_mode (admission_design.md §3/§4):
         #   mode "job"     — decision made *once per job*, at its first
         #                    request. Follow-up requests bypass Stage A so a
@@ -378,7 +421,6 @@ class HaloController:
         #   mode "request" — decision made on *every* request (the
         #                    request-scoped baseline). A mid-chain request
         #                    can be rejected.
-        is_first_request = new_job_record.total_request_number == 0
         predictor = self.admission_predictor
 
         # Empty active list is still a valid input (auto-admit + log row);
@@ -393,9 +435,7 @@ class HaloController:
             # to protect yet). Request scope scores *all* in-flight
             # requests — including any already-active calls of the arriving
             # job — so nothing is excluded.
-            exclude_job_id = (
-                None if predictor.mode_name == "request" else halo_job_id
-            )
+            exclude_job_id = None if predictor.mode_name == "request" else halo_job_id
             decision = self._stage_a_decide(
                 new_job=new_job_record,
                 new_slo=slo,
@@ -403,6 +443,7 @@ class HaloController:
                 prefix_len=prefix_len,
                 active_request_infos=active_request_infos,
                 exclude_job_id=exclude_job_id,
+                chunked_prefill_size=chunked_prefill_size,
             )
             self._log_admission_decision(
                 rid, halo_job_id, decision, is_first_call=is_first_request
@@ -412,25 +453,19 @@ class HaloController:
                     self.metrics.record_request_rejected(
                         REASON_HALO_ADMISSION_PREDICTED
                     )
-                raise HaloRejectError(
-                    reason=REASON_HALO_ADMISSION_PREDICTED, rid=rid
-                )
+                raise HaloRejectError(reason=REASON_HALO_ADMISSION_PREDICTED, rid=rid)
 
-        # ── 4. Stage B — Concurrency hard cap (Phase 2) ──────────────────
+        # ── 5. Stage B — Concurrency hard cap (Phase 2) ──────────────────
         # When the application declared a max in-flight count for this job,
         # reject the call if accepting it would push past that promise.
         cap = new_job_record.declared_max_concurrency
         if cap is not None and new_job_record.in_flight_count >= cap:
             if self.metrics is not None:
                 self.metrics.record_request_rejected(REASON_HALO_CONCURRENCY_CAP)
-            raise HaloRejectError(
-                reason=REASON_HALO_CONCURRENCY_CAP, rid=rid
-            )
+            raise HaloRejectError(reason=REASON_HALO_CONCURRENCY_CAP, rid=rid)
 
-        # ── 5. Actually admit ────────────────────────────────────────────
-        result: JobAdmissionResult = self.registry.admit_to_job(
-            halo_job_id, slo, rid
-        )
+        # ── 6. Actually admit ────────────────────────────────────────────
+        result: JobAdmissionResult = self.registry.admit_to_job(halo_job_id, slo, rid)
         if not result.admitted:
             # Defensive (should not happen given step 2 above, but cheap).
             reason = result.reason or REASON_PROGRAM_NOT_REGISTERED
@@ -453,6 +488,7 @@ class HaloController:
         prefix_len: int,
         active_request_infos: List[RequestExecutionInfo],
         exclude_job_id: Optional[str],
+        chunked_prefill_size: Optional[int] = None,
     ) -> AdmissionDecisionResult:
         """Run the admission predictor + decide_admission against the
         current request-execution snapshot."""
@@ -463,7 +499,7 @@ class HaloController:
             new_job, new_slo, prompt_len, prefix_len
         )
         predictions = self.admission_predictor.predict(
-            active_jobs_input, new_job_input
+            active_jobs_input, new_job_input, chunked_prefill_size
         )
         # The predictor's output keys differ by scope: job_id for the
         # job-scoped gate, rid for the request-scoped baseline. Build the
@@ -471,9 +507,7 @@ class HaloController:
         # like-for-like.
         if self.admission_predictor.mode_name == "request":
             slos_map = {
-                call.rid: j.slo
-                for j in active_jobs_input
-                for call in j.active_calls
+                call.rid: j.slo for j in active_jobs_input for call in j.active_calls
             }
         else:
             slos_map = {j.job_id: j.slo for j in active_jobs_input}
@@ -498,16 +532,27 @@ class HaloController:
         """Group RequestExecutionInfo by job_id and build the per-job inputs
         the predictor expects.
 
-        `current_vjs` is the job's *current* virtual job slowdown — computed
-        by the same SlowdownTracker.compute_job_vjs the periodic sweep uses,
-        over the job's completed call spans plus its in-flight spans. This is
-        the single source of truth for VJS (admission then multiplies it by a
-        per-phase stretch)."""
+        Memoryless: each JobLookaheadInput carries only the job's SLO and
+        its in-flight calls' *current* shape (prompt/prefix/KV). The VSS
+        predictors derive every solo step time from those — no lifetime VJS,
+        no elapsed history is consulted.
+
+        Calls with `kv_len_now <= 0` are *excluded* (결함 A, 2026-05-18): a
+        request with zero committed KV is sitting in the waiting queue (not
+        yet prefilled, or retracted) — it is in NO forward step, so a
+        step-ratio VSS cannot represent it. Including it as a fake
+        prefill-phase call is what let the whole backlog inflate the EXTEND
+        batch. Note: this means VSS is structurally blind to queued/
+        preempted requests — an accepted limitation (see admission_design.md
+        §12); the periodic VJS sweep still counts their wait."""
         by_job: Dict[str, List[RequestExecutionInfo]] = {}
         for info in infos:
             if info.job_id is None:
                 continue
             if exclude_job_id is not None and info.job_id == exclude_job_id:
+                continue
+            # Skip pure waiting-queue requests — not in any step (결함 A).
+            if info.kv_len_now <= 0:
                 continue
             by_job.setdefault(info.job_id, []).append(info)
 
@@ -525,28 +570,16 @@ class HaloController:
                     prefix_len=i.prefix_len_at_admission,
                     decoded_tokens=i.decoded_tokens_so_far,
                     kv_len_now=i.kv_len_now,
+                    # elapsed_actual_ms — Lookahead (deprecated) only.
                     elapsed_actual_ms=i.elapsed_ms,
-                    # Per-call solo baseline — the request-scoped predictor
-                    # divides elapsed by this to get the per-request slowdown.
-                    solo_elapsed_ms=self._solo_ms_for_request(i),
                 )
                 for i in info_list
-            )
-            # current_vjs: lifetime VJS over completed + in-flight calls,
-            # via the same compute_job_vjs the sweep uses (one source of truth).
-            inflight_spans = [
-                self.tracker.span_from_info(i) for i in info_list
-            ]
-            current_vjs = self.tracker.compute_job_vjs(
-                job.completed_call_spans + inflight_spans,
-                fallback_slo=job.slo,
             )
             out.append(
                 JobLookaheadInput(
                     job_id=jid,
                     slo=job.slo,
                     active_calls=active_calls,
-                    current_vjs=current_vjs,
                 )
             )
         return out
@@ -582,21 +615,28 @@ class HaloController:
             expected_cached_prefix_lens=None,
         )
 
-    def _solo_ms_for_request(self, info: RequestExecutionInfo) -> float:
-        """Cost-model solo wall-clock so far for one in-flight request,
-        treated *alone* (batch of 1): prefill_solo + decode_step × decoded.
-
-        Used only by the request-scoped admission baseline, which scores
-        each request on its own (no job aggregation). The job-scoped path
-        uses SlowdownTracker.compute_job_vjs instead. Both go through the
-        tracker's prefill_solo_ms / decode_step_ms primitives so the
-        prefill `n = prompt_len - prefix_len` correction lives in one place.
-        Returns 0.0 when no cost model is loaded (callers fall back)."""
-        prefill = self.tracker.prefill_solo_ms(
-            info.prompt_len, info.prefix_len_at_admission
+    def _log_kv_cap_decision(
+        self, rid: str, job_id: str, kv_usage_ratio: float
+    ) -> None:
+        """Emit a JSONL row for a Stage B′ KV-cap reject (or dry-run
+        would-reject). Shares the rid/job_id/mode/decision/reason shape with
+        the Stage A admission row so a single parser handles both."""
+        if self._admission_log is None:
+            return
+        self._admission_log.write(
+            {
+                "ts_ns": time.time_ns(),
+                "rid": rid,
+                "job_id": job_id,
+                "mode": "kv_cap",
+                "is_first_call": True,
+                "dry_run": self.config.admission_dry_run,
+                "decision": ("admit" if self.config.admission_dry_run else "reject"),
+                "reason": REASON_HALO_KV_CAP,
+                "kv_usage_ratio": kv_usage_ratio,
+                "kv_cap_ratio": self.config.admission_kv_cap_ratio,
+            }
         )
-        decode_step = self.tracker.decode_step_ms([max(info.kv_len_now, 0)])
-        return prefill + decode_step * max(0, info.decoded_tokens_so_far)
 
     def _log_admission_decision(
         self,
@@ -672,9 +712,7 @@ class HaloController:
         )
         if not fresh:
             if self.metrics is not None:
-                self.metrics.record_program_rejected(
-                    REASON_JOB_ID_ALREADY_REGISTERED
-                )
+                self.metrics.record_program_rejected(REASON_JOB_ID_ALREADY_REGISTERED)
             return HaloRegisterProgramResult(
                 registered=False,
                 job_id=job_id,
@@ -694,7 +732,9 @@ class HaloController:
             self.metrics.record_program_registered()
         logger.info(
             "halo: registered program job_id=%s slo=%.2f total_calls=%s",
-            job_id, slo, total_calls,
+            job_id,
+            slo,
+            total_calls,
         )
         return HaloRegisterProgramResult(
             registered=True,
@@ -728,9 +768,7 @@ class HaloController:
         if finished_info is not None:
             job = self.registry.job_for_request(rid)
             if job is not None:
-                job.record_completed_call(
-                    self.tracker.span_from_info(finished_info)
-                )
+                job.record_completed_call(self.tracker.span_from_info(finished_info))
         if halo_job_done:
             job = self.registry.mark_job_done(rid)
             if job is not None and self._log is not None:
@@ -789,9 +827,7 @@ class HaloController:
         # Safety net BEFORE gc_completed: any job that's been quiescent
         # (no in-flight + no recent update) gets flipped to COMPLETE.
         # Then gc_completed picks them up after retain_seconds.
-        flipped = self.registry.gc_quiescent_jobs(
-            self.config.quiescent_timeout_seconds
-        )
+        flipped = self.registry.gc_quiescent_jobs(self.config.quiescent_timeout_seconds)
         if self._log is not None and flipped:
             ts = time.monotonic()
             for job in flipped:
@@ -813,7 +849,9 @@ class HaloController:
         # counter increment so it never double-counts a sweep.
         if self.metrics is not None:
             actives = self.registry.active_jobs()
-            total_violations = sum(j.slo_violation_count for j in self.registry.all_jobs())
+            total_violations = sum(
+                j.slo_violation_count for j in self.registry.all_jobs()
+            )
             delta = max(0, total_violations - self._last_total_violations)
             self._last_total_violations = total_violations
             self.metrics.update_from_sweep(
@@ -862,20 +900,14 @@ def build_halo_controller_from_server_args(
     config = HaloConfig(
         enabled=True,
         default_slo=float(getattr(server_args, "halo_default_slo", 5.0)),
-        tick_interval_ms=float(
-            getattr(server_args, "halo_tick_interval_ms", 100.0)
-        ),
+        tick_interval_ms=float(getattr(server_args, "halo_tick_interval_ms", 100.0)),
         aggregator=getattr(server_args, "halo_aggregator", "max+mean"),
         job_log_path=getattr(server_args, "halo_job_log", None),
         prefill_cost_model_path=getattr(
             server_args, "halo_prefill_cost_model_path", None
         ),
-        tbt_cost_model_path=getattr(
-            server_args, "halo_tbt_cost_model_path", None
-        ),
-        step_cost_model_path=getattr(
-            server_args, "halo_step_cost_model_path", None
-        ),
+        tbt_cost_model_path=getattr(server_args, "halo_tbt_cost_model_path", None),
+        step_cost_model_path=getattr(server_args, "halo_step_cost_model_path", None),
         admission_mode=getattr(server_args, "halo_admission_mode", "off") or "off",
         admission_violation_threshold=float(
             getattr(server_args, "halo_admission_violation_threshold", 0.2)
@@ -883,11 +915,12 @@ def build_halo_controller_from_server_args(
         admission_lookahead_horizon_sec=float(
             getattr(server_args, "halo_admission_lookahead_horizon_sec", 0.0)
         ),
-        admission_dry_run=bool(
-            getattr(server_args, "halo_admission_dry_run", False)
-        ),
+        admission_dry_run=bool(getattr(server_args, "halo_admission_dry_run", False)),
         admission_decision_log_path=getattr(
             server_args, "halo_admission_decision_log", None
+        ),
+        admission_kv_cap_ratio=float(
+            getattr(server_args, "halo_admission_kv_cap_ratio", 0.0)
         ),
         program_idle_timeout_seconds=float(
             getattr(server_args, "halo_program_idle_timeout_seconds", 300.0)

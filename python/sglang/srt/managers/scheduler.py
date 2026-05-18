@@ -102,7 +102,7 @@ from sglang.srt.managers.halo import (
     build_halo_cost_sampler_from_server_args,
 )
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-from sglang.srt.managers.io_struct import (
+from sglang.srt.managers.io_struct import (  # HALO: Option A — POST /halo/programs IO structs.
     AbortReq,
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
@@ -128,14 +128,13 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
-    # HALO: Option A — POST /halo/programs IO structs.
-    HaloRegisterProgramReqInput,
-    HaloRegisterProgramReqOutput,
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
+    HaloRegisterProgramReqInput,
+    HaloRegisterProgramReqOutput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -1656,9 +1655,7 @@ class Scheduler(
                 # enabled. `is None` short-circuit when sampler is off.
                 # See managers/halo/cost_model_sampler.py.
                 step_t0 = (
-                    time.perf_counter()
-                    if self.halo_cost_sampler is not None
-                    else None
+                    time.perf_counter() if self.halo_cost_sampler is not None else None
                 )
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
@@ -2552,12 +2549,16 @@ class Scheduler(
                     recv_req.rid,
                     decision.reason,
                     decision.predicted_ttft_ms or 0.0,
-                    f"{decision.predicted_tbt_ms:.1f}ms"
-                    if decision.predicted_tbt_ms is not None
-                    else "n/a",
-                    f"{decision.tbt_ewma_ms:.1f}ms"
-                    if decision.tbt_ewma_ms is not None
-                    else "n/a",
+                    (
+                        f"{decision.predicted_tbt_ms:.1f}ms"
+                        if decision.predicted_tbt_ms is not None
+                        else "n/a"
+                    ),
+                    (
+                        f"{decision.tbt_ewma_ms:.1f}ms"
+                        if decision.tbt_ewma_ms is not None
+                        else "n/a"
+                    ),
                 )
             return False
 
@@ -2622,6 +2623,15 @@ class Scheduler(
             if getattr(controller, "admission_predictor", None) is not None
             else None
         )
+        # Stage B′ KV cap — current KV-cache pool usage ratio (0..1). Only
+        # fetched when the controller has the KV cap enabled; guarded so
+        # Halo never crashes the request path.
+        kv_usage_ratio = None
+        if getattr(controller, "kv_cap_enabled", False):
+            try:
+                kv_usage_ratio = self.get_pool_stats().get_kv_token_stats()[1]
+            except Exception:  # noqa: BLE001 — Halo must never crash request path
+                kv_usage_ratio = None
 
         try:
             controller.register_request(
@@ -2631,6 +2641,10 @@ class Scheduler(
                 prompt_len=prompt_len,
                 prefix_len=prefix_len,
                 active_request_infos=active_infos,
+                kv_usage_ratio=kv_usage_ratio,
+                # Effective chunked-prefill token budget — bounds the Stage A
+                # EXTEND-step cost so the prefill term can't blow up (결함 A).
+                chunked_prefill_size=getattr(self, "chunked_prefill_size", None),
             )
         except HaloRejectError as e:
             # HALO: per managers/halo/CLAUDE.md §13 Q7 + Q12 +
@@ -2654,6 +2668,12 @@ class Scheduler(
                     "Halo rejected: per-job concurrency cap exceeded "
                     "(declared_max_concurrency in register_program). "
                     "Wait for an in-flight call to finish before retrying."
+                )
+            elif e.reason == "HALO_KV_CAP":
+                message = (
+                    "Halo rejected: KV-cache pool near capacity. The server "
+                    "is at/above the configured KV-cap ratio "
+                    "(--halo-admission-kv-cap-ratio); retry later."
                 )
             else:
                 message = (
@@ -2702,9 +2722,7 @@ class Scheduler(
                 rid=req.rid,
                 job_id=job_id,
                 prompt_len=len(req.origin_input_ids or []),
-                prefix_len_at_admission=getattr(
-                    req, "halo_prefix_len_at_admission", 0
-                ),
+                prefix_len_at_admission=getattr(req, "halo_prefix_len_at_admission", 0),
                 decoded_tokens_so_far=len(getattr(req, "output_ids", []) or []),
                 kv_len_now=int(getattr(req, "kv_committed_len", 0) or 0),
                 elapsed_ms=(time.monotonic() - t0) * 1000.0,

@@ -24,8 +24,9 @@ end-to-end SLO).
 │                                                                      │
 │  Role 2. Job-level admission gate                     [ON]          │
 │          - strict validation (halo_job_id + pre-registration)        │
-│          - Phase 2 predictive admission: job- and request-scoped     │
-│            gates that read each job's VJS (admission_decision.py)    │
+│          - Phase 2 Stage A: predictive memoryless-VSS gate, job-     │
+│            and request-scoped (admission_decision.py)                │
+│          - Phase 2 Stage B/B′: concurrency cap + KV-cache hard cap   │
 │                                                                      │
 │  Role 3. Job-level scheduling policy                  [future]      │
 │          - fairness over virtual job slowdown                        │
@@ -88,10 +89,10 @@ managers/halo/
 ├── cost_model_sampler.py   # per-step JSONL sampler for fitting the Halo Step Cost Model
 │                           # (rank-0, background flusher thread, no-op when path unset).
 │                           # See ms_dev/halo_dev/prediction_model.md.
-└── admission_decision.py   # ★ Phase 2 predictive admission. AdmissionPredictor ABC +
-                            # JobSlowdownAdmissionPredictor (mode "job", per-job stretch
-                            # M-2 — the design) + RequestSlowdownAdmissionPredictor
-                            # (mode "request", per-request baseline) + Lookahead
+└── admission_decision.py   # ★ Phase 2 Stage A. AdmissionPredictor ABC +
+                            # JobSlowdownAdmissionPredictor (mode "job", per-job
+                            # memoryless VSS — the design) + RequestSlowdownAdmissionPredictor
+                            # (mode "request", per-request VSS baseline) + Lookahead
                             # (mode "level2", DEPRECATED 2026-05-15) + decide_admission.
                             # See ms_dev/halo_dev/admission_design.md.
 ```
@@ -281,8 +282,9 @@ rejected` and `mean_smax / mean_smean / worst_smax / slo_violations`).
 
 ## Edge cases handled
 
-- `prompt_len == 0` or `decoded_len == 0` very early → `solo_elapsed_ms` could be near 0;
-  guard with `max(solo_elapsed_ms, MIN_SOLO_MS=1.0)`.
+- `prompt_len == 0` or `decoded_len == 0` very early → a job's `job_solo_ms` could be
+  near 0; `compute_job_vjs` guards the VJS division with `max(job_solo_ms, MIN_SOLO_MS=1.0)`
+  and the VSS predictors floor each solo step time at 1.0 ms.
 - Job with all requests finished but still in registry → state transitions to COMPLETE,
   excluded from `active_jobs()`, retained for one further tick for observability, then
   GC'd.

@@ -1182,38 +1182,48 @@ Phase 2 는 그 위에 **새 job 받기 결정** 을 *기존 job 들의 예측 s
 > SLO 를 넘을 것 같으면 reject. 새 job 의 SLA 가 아니라 *기존 작업 보호* 가
 > 목적.
 
-### 두 Stage
+### 세 Stage
 
 | Stage | 목적 | 입력 | 출력 |
 |---|---|---|---|
-| **A — Predictive** | 새 request 받으면 *기존 active unit 들의 예측 slowdown 분포*. scope 두 가지 (아래). | active jobs/requests + new request shape + cost model | admit / reject + per-unit 예측치 |
-| **B — Concurrency hard cap** | application 이 declare 한 *동시 in-flight* 약속을 enforce | declared_max_concurrency + current in_flight_count | admit / reject |
+| **A — Predictive (VSS)** | 새 도착을 admit 하면 *기존 active unit 들이 겪을 예측 slowdown* (memoryless VSS). scope 두 가지 (아래). | active calls 의 현재 prompt/prefix/KV + new request shape + cost model | admit / reject + per-unit 예측치 |
+| **B — Concurrency hard cap** | application 이 declare 한 *동시 in-flight* 약속을 enforce | declared_max_concurrency + in_flight_count | admit / reject |
+| **B′ — KV-cache hard cap** | KV pool 이 차서 생기는 queueing / preemption cliff 를 막음 (cost model 이 못 봄) | kv_usage_ratio + admission_kv_cap_ratio | admit / reject |
 
-### Stage A — 두 scope (`--halo-admission-mode`)
+### Stage A — memoryless VSS, 두 scope (`--halo-admission-mode`)
 
-- **mode `job` — Per-job snapshot stretch (M-2, 설계)**:
-  - 각 active job 의 *현재 단계* (prefill / decode) 의 step time 변화율을 stretch 로 사용.
-  - `predicted_VJS_i = current_VJS_i × stretch_i`. 결정은 *job 단위* — 첫 request 만 검사, 후속은 자동 admit (chain 보호).
-  - 사용 정보: *현재 batch + 새 request 의 prompt/prefix*. **DAG / remaining / expected_output 안 씀**.
-- **mode `request` — Per-request stretch (baseline)**:
-  - 같은 stretch 식·cost model. 단 *job aggregation 없음* — 모든 active request 를 독립 단위로 score, 매 request 마다 결정 → mid-chain reject 가능.
-  - "request 단위 admission 이 job 단위보다 나쁘다" 를 보이는 비교용 baseline.
-- **mode `level2` (DEPRECATED 2026-05-15)**: 옛 1 초 slice lookahead. 코드는 남아있지만 admission path 에서 호출 안 됨 (controller 가 자동 `job` 폴백 + WARN). `level0` 은 `job` 의 옛 이름 (alias).
+> **2026-05-16**: admission 신호를 *lifetime VJS* 에서 *memoryless VSS* 로 교체.
+> lifetime-cumulative VJS 는 적분기가 들어있어 부하 변화에 지연 → admission 을
+> 닫힌 채 머물게 함. VJS 는 SLO *측정* 전용으로 유지, admission 은 VSS 사용.
+
+VSS = `S_phase(i)⁺ / solo_step_i` — 새 도착을 더한 augmented batch step time ÷
+unit 의 현재 solo step time. 누적 이력 없음 (job 이 끝나면 다음 step 에 즉시 하락).
+
+- **mode `job` — Per-job VSS (설계)**: 각 active job 을 자기 phase 의
+  augmented step (`S_extend⁺`/`S_decode⁺`) ÷ 자기 self-batched solo step 으로
+  score. 결정은 *job 단위* — 첫 request 만 검사, 후속 자동 admit.
+- **mode `request` — Per-request VSS (baseline)**: 동일한 VSS 식, 단 job
+  aggregation 없음 — 모든 active call 을 독립 단위로 score, 매 request 결정.
+  job 당 call 1 개면 `job` 과 예측치 동일 (차이는 scoring 단위뿐).
+- **mode `level2` (DEPRECATED)**: 옛 lookahead. controller 가 `job` 자동 폴백 + WARN.
 
 ### components
 
 ```
 managers/halo/admission_decision.py
   AdmissionPredictor (ABC)
-  JobSlowdownAdmissionPredictor      (mode "job")
-  RequestSlowdownAdmissionPredictor  (mode "request")
+  _augmented_step_times(...)         S_extend⁺, S_decode⁺ — 공유 VSS 분자
+  JobSlowdownAdmissionPredictor      (mode "job", memoryless VSS)
+  RequestSlowdownAdmissionPredictor  (mode "request", memoryless VSS)
   LookaheadAdmissionPredictor        (mode "level2", DEPRECATED)
   decide_admission(...)
 managers/halo/job.py                  declared_max_concurrency, in_flight_count
-managers/halo/controller.py           register_request 안 Stage A (mode-aware) → Stage B
-server_args.py                        5 CLI 플래그 (--halo-admission-*)
-ms_dev/env.common.sh + lib_server.sh  5 env vars (SGLANG_HALO_ADMISSION_*)
-test/registered/halo/test_halo_admission_predictors.py
+managers/halo/controller.py           register_request: Q7→Q12→Stage B′(KV cap)
+                                       →Stage A(VSS)→Stage B(concurrency)
+server_args.py                        --halo-admission-* (mode/threshold/dry-run/
+                                       decision-log/kv-cap-ratio)
+ms_dev/env.common.sh + lib_server.sh  SGLANG_HALO_ADMISSION_* env vars
+test/registered/halo/test_halo_admission_predictors.py + test_halo_phase1.py
 ```
 
 ### 단계별 PR 순서
@@ -1227,15 +1237,16 @@ test/registered/halo/test_halo_admission_predictors.py
 | PR-request | request-scoped baseline + mode 개명 (`level0`→`job`, `request` 신규) | admission_decision + controller + server_args + tests + docs |
 | PR5 | 검증 실험 + 문서 갱신 | 문서 |
 
-### 진행 상태 (2026-05-15)
+### 진행 상태 (2026-05-16)
 
 | PR | 상태 | 산출물 |
 |---|---|---|
-| PR1–PR4 | ✅ | job-scoped 게이트 + Stage B + level2(deprecated). admission_design.md §10 참고 |
-| PR-request | ✅ | `RequestSlowdownAdmissionPredictor` (mode `request`) + mode 개명 (`SnapshotAdmissionPredictor`→`JobSlowdownAdmissionPredictor`, `level0`→`job`) + controller mode-aware 분기 + decision-log `is_first_call` |
-| PR5 | ⏳ | 사용자 환경 검증 실험 (mode=off / job / request 3-way 비교) — 코드 ready |
+| PR1–PR4 | ✅ | job-scoped 게이트 + Stage B + level2(deprecated) |
+| PR-request | ✅ | `RequestSlowdownAdmissionPredictor` (mode `request`) + mode 개명 + decision-log `is_first_call` |
+| **PR-vss-kvcap** | ✅ | admission 신호를 lifetime VJS → **memoryless VSS** 로 교체 (`predicted_VSS = S⁺/solo`, `current_vjs` 제거, `job`+`request` 둘 다 VSS 통일). **KV-cache hard cap (Stage B′)** 추가 — `--halo-admission-kv-cap-ratio`, admission_mode 와 독립 |
+| PR5 | ⏳ | 검증 실험 — mode={off,job} × kv_cap={off,on} ablation. 코드 ready |
 
-halo admission/predictor 단위 test 수: **86 (test_halo_admission_predictors 29 + test_halo_phase1 57)**.
+halo admission/predictor 단위 test 수: **107 (test_halo_admission_predictors 30 + test_halo_phase1 77)**.
 
 ---
 

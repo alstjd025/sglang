@@ -10,7 +10,7 @@ See managers/halo/CLAUDE.md and ms_dev/expctl/CLAUDE.md.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Iterable, Optional
+from typing import TYPE_CHECKING, Dict, Iterable
 
 if TYPE_CHECKING:  # pragma: no cover
     from sglang.srt.managers.halo.job import Job
@@ -55,9 +55,7 @@ class HaloMetrics:
         )
         self._requests_admitted_total = Counter(
             name="sglang:halo_requests_admitted_total",
-            documentation=(
-                "Halo: LLM requests admitted into a registered job."
-            ),
+            documentation=("Halo: LLM requests admitted into a registered job."),
             labelnames=label_keys,
             **common_kwargs,
         )
@@ -65,7 +63,8 @@ class HaloMetrics:
             name="sglang:halo_requests_rejected_total",
             documentation=(
                 "Halo: LLM requests rejected by the job-level admission gate. "
-                "labels: reason in {HALO_NO_JOB_ID, HALO_PROGRAM_NOT_REGISTERED}."
+                "labels: reason in {HALO_NO_JOB_ID, HALO_PROGRAM_NOT_REGISTERED, "
+                "HALO_ADMISSION_PREDICTED, HALO_CONCURRENCY_CAP, HALO_KV_CAP}."
             ),
             labelnames=label_keys + ["reason"],
             **common_kwargs,
@@ -152,9 +151,7 @@ class HaloMetrics:
         self._total_known_jobs.labels(**self._labels).set(total_known)
 
         if slo_violations_delta > 0:
-            self._slo_violations_total.labels(**self._labels).inc(
-                slo_violations_delta
-            )
+            self._slo_violations_total.labels(**self._labels).inc(slo_violations_delta)
 
         if n == 0:
             # No active jobs — zero out the slowdown gauges so the panel

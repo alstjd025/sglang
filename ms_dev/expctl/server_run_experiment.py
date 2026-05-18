@@ -3,7 +3,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -14,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from urllib.request import urlopen
+
 try:
     from .monitoring_view import (
         detect_runtime_feature_flags,
@@ -33,7 +33,6 @@ try:
     from .monitoring_metrics import RuntimeMetricsCollector
 except ImportError:
     from monitoring_metrics import RuntimeMetricsCollector
-
 
 
 def now_iso() -> str:
@@ -58,9 +57,9 @@ class ShutdownRequested(Exception):
     pass
 
 
-
-
-def wait_http_ready(base_url: str, timeout_s: float, stop_event: Optional[threading.Event] = None) -> str:
+def wait_http_ready(
+    base_url: str, timeout_s: float, stop_event: Optional[threading.Event] = None
+) -> str:
     candidates = ["/health", "/metrics", "/v1/models", "/model_info"]
     deadline = time.time() + timeout_s
     last_error = ""
@@ -70,7 +69,9 @@ def wait_http_ready(base_url: str, timeout_s: float, stop_event: Optional[thread
 
         for path in candidates:
             if stop_event is not None and stop_event.is_set():
-                raise ShutdownRequested(f"shutdown requested while waiting for {base_url}")
+                raise ShutdownRequested(
+                    f"shutdown requested while waiting for {base_url}"
+                )
 
             url = base_url.rstrip("/") + path
             try:
@@ -83,7 +84,9 @@ def wait_http_ready(base_url: str, timeout_s: float, stop_event: Optional[thread
 
         if stop_event is not None:
             if stop_event.wait(0.5):
-                raise ShutdownRequested(f"shutdown requested while waiting for {base_url}")
+                raise ShutdownRequested(
+                    f"shutdown requested while waiting for {base_url}"
+                )
         else:
             time.sleep(0.5)
 
@@ -180,7 +183,9 @@ def find_listening_pids_by_ports(ports: List[int]) -> Dict[int, Set[int]]:
     port_to_pids: Dict[int, Set[int]] = {p: set() for p in ports}
 
     try:
-        out = subprocess.check_output(["ss", "-ltnpH"], text=True, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(
+            ["ss", "-ltnpH"], text=True, stderr=subprocess.DEVNULL
+        )
     except Exception:
         return port_to_pids
 
@@ -241,7 +246,9 @@ def kill_pid_or_group(pid: int, timeout_s: float = 8.0) -> bool:
     return not _is_pid_alive(pid)
 
 
-def cleanup_listening_ports(ports: List[int], timeout_s: float = 8.0) -> Dict[str, object]:
+def cleanup_listening_ports(
+    ports: List[int], timeout_s: float = 8.0
+) -> Dict[str, object]:
     ports = sorted({int(p) for p in ports if int(p) > 0})
     port_to_pids = find_listening_pids_by_ports(ports)
 
@@ -273,8 +280,6 @@ def cleanup_listening_ports(ports: List[int], timeout_s: float = 8.0) -> Dict[st
     }
 
 
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Run SGLang experiment processes and scrape selected metrics into a session folder."
@@ -286,9 +291,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=str(Path(__file__).resolve().parent.parent / "runtime" / "sessions"),
     )
     p.add_argument(
-        "--session-name", type=str, default="",
+        "--session-name",
+        type=str,
+        default="",
         help="Session folder name. Gets a YYMMDD_HHMM_ prefix unless already "
-             "prefixed by the caller. Empty → YYMMDD_HHMMSS.",
+        "prefixed by the caller. Empty → YYMMDD_HHMMSS.",
     )
     p.add_argument("--scrape-interval", type=float, default=0.2)
     p.add_argument("--startup-timeout", type=float, default=180.0)
@@ -300,7 +307,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--metrics-host", type=str, default="127.0.0.1")
     p.add_argument("--router-host", type=str, default="127.0.0.1")
 
-    p.add_argument("--single-port", type=int, default=int(os.environ.get("SGLANG_PORT", "31000")))
+    p.add_argument(
+        "--single-port", type=int, default=int(os.environ.get("SGLANG_PORT", "31000"))
+    )
 
     p.add_argument("--prefill-port", type=int, default=31002)
     p.add_argument("--decode-port", type=int, default=31001)
@@ -311,7 +320,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-decode", action="store_true")
     p.add_argument("--no-auto-kill-ports", action="store_true")
     p.add_argument("--port-kill-timeout", type=float, default=8.0)
-    p.add_argument("--disagg-bootstrap-port", type=int, default=int(os.environ.get("SGLANG_DISAGGREGATION_BOOTSTRAP_PORT", "8998")))
+    p.add_argument(
+        "--disagg-bootstrap-port",
+        type=int,
+        default=int(os.environ.get("SGLANG_DISAGGREGATION_BOOTSTRAP_PORT", "8998")),
+    )
     p.add_argument("--cleanup-extra-ports", type=str, default="")
     return p
 
@@ -337,7 +350,10 @@ def main() -> int:
 
     started_at = datetime.now().astimezone()
     started_unix = time.time()
-    use_color = (not args.no_color) and (args.force_color or (sys.stdout.isatty() and (os.environ.get("NO_COLOR") is None)))
+    use_color = (not args.no_color) and (
+        args.force_color
+        or (sys.stdout.isatty() and (os.environ.get("NO_COLOR") is None))
+    )
 
     # YYMMDD_HHMM prefix to prevent same-named re-runs from mixing data via
     # append-mode log writes. Idempotent: callers (e.g. Agent_applications)
@@ -406,9 +422,7 @@ def main() -> int:
                 admission_config_snapshot["SGLANG_ADMISSION_DECISION_LOG"]
             )
         else:
-            admission_decision_log_path = (
-                session_dir / "admission_decisions.jsonl"
-            )
+            admission_decision_log_path = session_dir / "admission_decisions.jsonl"
             admission_config_snapshot["SGLANG_ADMISSION_DECISION_LOG"] = str(
                 admission_decision_log_path
             )
@@ -433,6 +447,7 @@ def main() -> int:
         "SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC",
         "SGLANG_HALO_ADMISSION_DRY_RUN",
         "SGLANG_HALO_ADMISSION_DECISION_LOG",
+        "SGLANG_HALO_ADMISSION_KV_CAP_RATIO",
     )
     halo_config_snapshot = {
         k: os.environ[k] for k in halo_env_keys if os.environ.get(k)
@@ -442,9 +457,7 @@ def main() -> int:
     halo_job_log_path: Optional[Path] = None
     if halo_enabled:
         if halo_config_snapshot.get("SGLANG_HALO_JOB_LOG"):
-            halo_job_log_path = Path(
-                halo_config_snapshot["SGLANG_HALO_JOB_LOG"]
-            )
+            halo_job_log_path = Path(halo_config_snapshot["SGLANG_HALO_JOB_LOG"])
         else:
             halo_job_log_path = session_dir / "halo_jobs.jsonl"
             halo_config_snapshot["SGLANG_HALO_JOB_LOG"] = str(halo_job_log_path)
@@ -474,14 +487,22 @@ def main() -> int:
                 f"{existing_extra} --disable-overlap-schedule".strip()
             )
 
-    # Phase 2 admission decision log auto-route. When admission mode is on
-    # (anything other than "off") and the operator didn't pin a path, route
-    # it into the session folder. See ms_dev/halo_dev/admission_design.md.
+    # Phase 2 admission decision log auto-route. When the predictive gate is
+    # on (admission mode != "off") OR the Stage B' KV cap is enabled (ratio
+    # in (0,1)), and the operator didn't pin a path, route it into the
+    # session folder. See ms_dev/halo_dev/admission_design.md.
     halo_admission_mode = (
         halo_config_snapshot.get("SGLANG_HALO_ADMISSION_MODE") or "off"
     ).lower()
+    try:
+        _kv_cap_ratio = float(
+            halo_config_snapshot.get("SGLANG_HALO_ADMISSION_KV_CAP_RATIO") or 0.0
+        )
+    except ValueError:
+        _kv_cap_ratio = 0.0
+    halo_kv_cap_on = 0.0 < _kv_cap_ratio < 1.0
     halo_admission_decision_log_path: Optional[Path] = None
-    if halo_enabled and halo_admission_mode != "off":
+    if halo_enabled and (halo_admission_mode != "off" or halo_kv_cap_on):
         pinned = halo_config_snapshot.get("SGLANG_HALO_ADMISSION_DECISION_LOG")
         if pinned:
             halo_admission_decision_log_path = Path(pinned)
@@ -605,16 +626,28 @@ def main() -> int:
             "prefill": {
                 "SGLANG_PD_PREFILL_PORT": str(args.prefill_port),
                 "SGLANG_DISAGGREGATION_BOOTSTRAP_PORT": str(args.disagg_bootstrap_port),
-                "SGLANG_PD_PREFILL_REQUEST_LOG_DIR": str(role_dir(request_log_root, "prefill")),
-                "SGLANG_PD_PREFILL_REQUEST_METRICS_DIR": str(role_dir(request_metrics_root, "prefill")),
-                "SGLANG_PD_PREFILL_CRASH_DUMP_DIR": str(role_dir(crash_dump_root, "prefill")),
+                "SGLANG_PD_PREFILL_REQUEST_LOG_DIR": str(
+                    role_dir(request_log_root, "prefill")
+                ),
+                "SGLANG_PD_PREFILL_REQUEST_METRICS_DIR": str(
+                    role_dir(request_metrics_root, "prefill")
+                ),
+                "SGLANG_PD_PREFILL_CRASH_DUMP_DIR": str(
+                    role_dir(crash_dump_root, "prefill")
+                ),
             },
             "decode": {
                 "SGLANG_PD_DECODE_PORT": str(args.decode_port),
                 "SGLANG_DISAGGREGATION_BOOTSTRAP_PORT": str(args.disagg_bootstrap_port),
-                "SGLANG_PD_DECODE_REQUEST_LOG_DIR": str(role_dir(request_log_root, "decode")),
-                "SGLANG_PD_DECODE_REQUEST_METRICS_DIR": str(role_dir(request_metrics_root, "decode")),
-                "SGLANG_PD_DECODE_CRASH_DUMP_DIR": str(role_dir(crash_dump_root, "decode")),
+                "SGLANG_PD_DECODE_REQUEST_LOG_DIR": str(
+                    role_dir(request_log_root, "decode")
+                ),
+                "SGLANG_PD_DECODE_REQUEST_METRICS_DIR": str(
+                    role_dir(request_metrics_root, "decode")
+                ),
+                "SGLANG_PD_DECODE_CRASH_DUMP_DIR": str(
+                    role_dir(crash_dump_root, "decode")
+                ),
             },
             "router": {
                 "SGLANG_PD_ROUTER_PORT": str(args.router_port),
@@ -655,7 +688,9 @@ def main() -> int:
             "server": {
                 "SGLANG_PORT": str(args.single_port),
                 "SGLANG_REQUEST_LOG_DIR": str(role_dir(request_log_root, "server")),
-                "SGLANG_REQUEST_METRICS_DIR": str(role_dir(request_metrics_root, "server")),
+                "SGLANG_REQUEST_METRICS_DIR": str(
+                    role_dir(request_metrics_root, "server")
+                ),
                 "SGLANG_CRASH_DUMP_DIR": str(role_dir(crash_dump_root, "server")),
             }
         }
@@ -681,6 +716,7 @@ def main() -> int:
             "SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC",
             "SGLANG_HALO_ADMISSION_DRY_RUN",
             "SGLANG_HALO_ADMISSION_DECISION_LOG",
+            "SGLANG_HALO_ADMISSION_KV_CAP_RATIO",
         ):
             v = halo_config_snapshot.get(k)
             if v:
@@ -694,7 +730,9 @@ def main() -> int:
             try:
                 cleanup_ports.append(int(item))
             except ValueError:
-                print(f"[run_experiment] ignore invalid cleanup port: {item}", flush=True)
+                print(
+                    f"[run_experiment] ignore invalid cleanup port: {item}", flush=True
+                )
 
     handles: Dict[str, ProcessHandle] = {}
     stop_event = threading.Event()
@@ -703,7 +741,10 @@ def main() -> int:
 
     def request_shutdown(reason: str) -> None:
         if not stop_event.is_set():
-            print(f"[run_experiment] shutdown requested ({reason}); cleaning up...", flush=True)
+            print(
+                f"[run_experiment] shutdown requested ({reason}); cleaning up...",
+                flush=True,
+            )
         stop_event.set()
 
     def signal_handler(signum, _frame):
@@ -787,9 +828,7 @@ def main() -> int:
             "applied_in_mode": halo_enabled and mode == "single",
             "env": halo_config_snapshot,
             "job_log_path": (
-                str(halo_job_log_path)
-                if halo_job_log_path is not None
-                else None
+                str(halo_job_log_path) if halo_job_log_path is not None else None
             ),
             "cost_sample_log_path": (
                 str(halo_cost_sample_log_path)
@@ -804,14 +843,18 @@ def main() -> int:
             ),
         },
     }
-    (meta_dir / "run_meta.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
+    (meta_dir / "run_meta.json").write_text(
+        json.dumps(run_meta, indent=2), encoding="utf-8"
+    )
 
     if not args.no_auto_kill_ports:
         print(
             f"[run_experiment] pre-cleanup listening ports: {sorted(set(cleanup_ports))}",
             flush=True,
         )
-        cleanup_result = cleanup_listening_ports(cleanup_ports, timeout_s=args.port_kill_timeout)
+        cleanup_result = cleanup_listening_ports(
+            cleanup_ports, timeout_s=args.port_kill_timeout
+        )
         (meta_dir / "precleanup_ports.json").write_text(
             json.dumps({"ts": now_iso(), **cleanup_result}, indent=2),
             encoding="utf-8",
@@ -854,8 +897,12 @@ def main() -> int:
             target = readiness_targets.get(role)
             if target is None:
                 continue
-            print(f"[run_experiment] waiting {role} readiness on {target}...", flush=True)
-            readiness[role] = wait_http_ready(target, args.startup_timeout, stop_event=stop_event)
+            print(
+                f"[run_experiment] waiting {role} readiness on {target}...", flush=True
+            )
+            readiness[role] = wait_http_ready(
+                target, args.startup_timeout, stop_event=stop_event
+            )
             print(f"[run_experiment] {role} ready via {readiness[role]}", flush=True)
 
         (meta_dir / "readiness.json").write_text(
@@ -867,7 +914,9 @@ def main() -> int:
         model_info = detect_runtime_model_info(process_log_dir, enabled_roles)
 
         active_role_endpoints = {
-            role: endpoint for role, endpoint in role_endpoints.items() if enabled_roles.get(role, False)
+            role: endpoint
+            for role, endpoint in role_endpoints.items()
+            if enabled_roles.get(role, False)
         }
         active_selectors = {role: selectors[role] for role in active_role_endpoints}
         active_out_files = {role: out_files[role] for role in active_role_endpoints}
@@ -884,7 +933,10 @@ def main() -> int:
         )
         metrics_collector.start()
 
-        print("[run_experiment] metrics collection started; running. press Ctrl+C to stop.", flush=True)
+        print(
+            "[run_experiment] metrics collection started; running. press Ctrl+C to stop.",
+            flush=True,
+        )
 
         next_status_ts = 0.0
         while True:
@@ -895,7 +947,11 @@ def main() -> int:
             if dead:
                 raise RuntimeError(f"one or more processes exited unexpectedly: {dead}")
 
-            if not args.quiet_status and metrics_collector is not None and time.time() >= next_status_ts:
+            if (
+                not args.quiet_status
+                and metrics_collector is not None
+                and time.time() >= next_status_ts
+            ):
                 snap = metrics_collector.get_latest_state()
                 if mode == "single":
                     block = render_status_single(
@@ -934,7 +990,9 @@ def main() -> int:
         return_code = 0
     except Exception as e:
         err = {"ts": now_iso(), "error": str(e)}
-        (meta_dir / "run_error.json").write_text(json.dumps(err, indent=2), encoding="utf-8")
+        (meta_dir / "run_error.json").write_text(
+            json.dumps(err, indent=2), encoding="utf-8"
+        )
         print(f"[run_experiment] ERROR: {e}", file=sys.stderr, flush=True)
         return_code = 1
     else:
@@ -961,7 +1019,9 @@ def main() -> int:
             "timezone": datetime.now().astimezone().tzname(),
             "return_code": return_code,
         }
-        (meta_dir / "run_end.json").write_text(json.dumps(end_meta, indent=2), encoding="utf-8")
+        (meta_dir / "run_end.json").write_text(
+            json.dumps(end_meta, indent=2), encoding="utf-8"
+        )
 
     return return_code
 

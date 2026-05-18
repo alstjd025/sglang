@@ -103,6 +103,10 @@ export SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD="${SGLANG_HALO_ADMISSION_VIOLAT
 export SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC="${SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC:-}"
 export SGLANG_HALO_ADMISSION_DRY_RUN="${SGLANG_HALO_ADMISSION_DRY_RUN:-0}"
 export SGLANG_HALO_ADMISSION_DECISION_LOG="${SGLANG_HALO_ADMISSION_DECISION_LOG:-}"
+# Stage B' KV-cache hard cap (0..1). Empty → server default (disabled).
+# Set e.g. 0.90 to reject new jobs when KV-cache usage >= 90%. Independent
+# of SGLANG_HALO_ADMISSION_MODE (a KV-cap-only run uses MODE=off).
+export SGLANG_HALO_ADMISSION_KV_CAP_RATIO="${SGLANG_HALO_ADMISSION_KV_CAP_RATIO:-}"
 
 # Some environments mount /tmp with noexec, which breaks Triton /
 # torchinductor when they try to mmap compiled .so files. Redirect their

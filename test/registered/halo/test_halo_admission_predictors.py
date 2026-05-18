@@ -2,20 +2,20 @@
 
 Design + rationale: ms_dev/halo_dev/admission_design.md.
 
-Coverage (per 2026-05-15 per-job-stretch design):
+Coverage (per 2026-05-16 memoryless-VSS design):
 - decide_admission threshold logic (admit / reject / boundaries)
 - JobSlowdownAdmissionPredictor (mode "job"):
     * empty active set → empty predictions
-    * single decode-phase job → stretch_decode applied
-    * single prefill-phase job → stretch_extend applied
-    * mixed (some prefill, some decode) jobs → each gets its own phase's stretch
-    * bigger arrival → larger predicted virtual job slowdown
-    * predicted_VJS = current_vjs × stretch (per job phase)
-    * declared fields ignored (predictor doesn't read them anymore)
+    * single decode-phase job → predicted_VSS = S_decode⁺ / solo_decode
+    * single prefill-phase job → predicted_VSS = S_extend⁺ / solo_extend
+    * mixed (some prefill, some decode) jobs → each scored on its phase
+    * bigger arrival → larger predicted VSS
+    * memoryless: prediction is a pure function of current batch + arrival
+      shape (no elapsed history, no current_vjs)
+    * declared fields ignored (predictor doesn't read them)
 - RequestSlowdownAdmissionPredictor (mode "request"):
     * per-request keys (rid), no job aggregation
-    * each active call scored by its own phase's stretch
-    * per-request slowdown = elapsed / solo, fallback to SLO when solo = 0
+    * each active call scored by its own phase's solo step
 - LookaheadAdmissionPredictor → DEPRECATED, kept callable for legacy
 - Input dataclasses are frozen (defensive — we share these with the
   controller and don't want mutation across threads).
@@ -54,7 +54,7 @@ def _split_cost_model():
         theta_p3=0.013,
         theta_d1=1.5e-5,
         theta_d2=0.18,
-        theta_c=22.0,         # mirror of θ_c_d for back-compat
+        theta_c=22.0,  # mirror of θ_c_d for back-compat
         theta_c_p=70.0,
         theta_c_d=22.0,
         form="halo_step_split_v1",
@@ -62,9 +62,9 @@ def _split_cost_model():
     )
 
 
-def _decode_call(rid: str, kv_len: int, decoded: int = 100,
-                 elapsed_ms: float = 1000.0,
-                 solo_ms: float = 0.0) -> ActiveCallInfo:
+def _decode_call(
+    rid: str, kv_len: int, decoded: int = 100, elapsed_ms: float = 1000.0
+) -> ActiveCallInfo:
     return ActiveCallInfo(
         rid=rid,
         is_prefill=False,
@@ -73,28 +73,26 @@ def _decode_call(rid: str, kv_len: int, decoded: int = 100,
         decoded_tokens=decoded,
         kv_len_now=kv_len,
         elapsed_actual_ms=elapsed_ms,
-        solo_elapsed_ms=solo_ms,
     )
 
 
-def _job(job_id: str, slo: float = 5.0,
-         current_vjs: float = 2.5,
-         active: tuple = (),
-         declared: bool = True) -> JobLookaheadInput:
+def _job(
+    job_id: str, slo: float = 5.0, active: tuple = (), declared: bool = True
+) -> JobLookaheadInput:
     """Helper: pre-canned active job.
 
-    `current_vjs` is the job's virtual job slowdown (the value the
-    job-scoped predictor multiplies by a stretch). The deprecated declared
-    fields are only populated when `declared=True`, for the deprecated
-    LookaheadAdmissionPredictor — the production predictors ignore them.
+    The memoryless VSS predictors use only `slo` + `active_calls`. The
+    declared fields are populated when `declared=True`, solely for the
+    deprecated LookaheadAdmissionPredictor — the production predictors
+    ignore them.
     """
     if declared:
-        # The legacy current_actual/current_solo pair (= 5000/2000 → 2.5)
-        # is only consumed by the deprecated LookaheadAdmissionPredictor.
+        # The legacy current_actual/current_solo pair is only consumed by
+        # the deprecated LookaheadAdmissionPredictor.
         return JobLookaheadInput(
-            job_id=job_id, slo=slo,
+            job_id=job_id,
+            slo=slo,
             active_calls=active,
-            current_vjs=current_vjs,
             current_actual_elapsed_ms=5000.0,
             current_solo_elapsed_ms=2000.0,
             remaining_calls=2,
@@ -104,9 +102,9 @@ def _job(job_id: str, slo: float = 5.0,
             expected_cached_prefix_lens=(1800, 2300),
         )
     return JobLookaheadInput(
-        job_id=job_id, slo=slo,
+        job_id=job_id,
+        slo=slo,
         active_calls=active,
-        current_vjs=current_vjs,
     )
 
 
@@ -152,7 +150,7 @@ class TestDecideAdmission(unittest.TestCase):
         slos = {"a": 10.0, "b": 2.0}
         r = decide_admission(preds, slos, threshold=0.2)
         self.assertEqual(r.violation_count, 1)  # b only
-        self.assertFalse(r.admit)               # 0.5 > 0.2
+        self.assertFalse(r.admit)  # 0.5 > 0.2
 
     def test_missing_slo_treated_as_satisfied(self):
         # If a job's SLO is unknown to the caller, do not count it as a
@@ -165,8 +163,7 @@ class TestDecideAdmission(unittest.TestCase):
     def test_result_payload_completeness(self):
         preds = {"a": 6.0, "b": 6.0, "c": 6.0, "d": 1.0}
         slos = {k: 5.0 for k in preds}
-        r = decide_admission(preds, slos, threshold=0.2, mode="job",
-                             horizon_sec=23.5)
+        r = decide_admission(preds, slos, threshold=0.2, mode="job", horizon_sec=23.5)
         self.assertEqual(r.active_jobs_total, 4)
         self.assertEqual(r.threshold, 0.2)
         self.assertEqual(r.predicted_slowdowns, preds)
@@ -181,158 +178,162 @@ class TestJobSlowdownPredictor(unittest.TestCase):
     def test_empty_active_returns_empty(self):
         cm = _split_cost_model()
         p = JobSlowdownAdmissionPredictor(cm)
-        new_job = NewJobInput(job_id="new", slo=5.0,
-                              first_call_input_len=1000)
+        new_job = NewJobInput(job_id="new", slo=5.0, first_call_input_len=1000)
         self.assertEqual(p.predict([], new_job), {})
 
-    # ── M-2 per-job-stretch tests (2026-05-15 design) ─────────────────
+    # ── memoryless-VSS tests (2026-05-16 design) ──────────────────────
 
-    def test_single_decode_job_uses_stretch_decode(self):
+    def test_single_decode_job_predicted_vss(self):
+        """predicted_VSS = S_decode⁺ / solo_decode for a decode-phase job."""
         cm = _split_cost_model()
         p = JobSlowdownAdmissionPredictor(cm)
-        # current_VJS = 2000 / 800 = 2.5
-        job = _job(
-            "a", current_vjs=2.5,
-            active=(_decode_call("r1", kv_len=3000),),
-            declared=False,
-        )
-        # New arrival joins decode batch with KV = prompt_len = 1000.
-        new_job = NewJobInput(job_id="new", slo=5.0,
-                              first_call_input_len=1000)
+        job = _job("a", active=(_decode_call("r1", kv_len=3000),), declared=False)
+        # New arrival joins both batch halves; a decode-phase job sees the
+        # augmented DECODE step (new arrival's KV = its prompt_len).
+        new_job = NewJobInput(job_id="new", slo=5.0, first_call_input_len=1000)
         preds = p.predict([job], new_job)
-        # Manually compute stretch_decode using the same cost_model.
-        base = cm.estimate_step_ms([], [3000])
-        aug = cm.estimate_step_ms([], [3000, 1000])
-        expected = 2.5 * (aug / base)
-        self.assertAlmostEqual(preds["a"], expected, places=4)
+        s_decode_aug = cm.estimate_step_ms([], [3000, 1000])
+        solo = cm.estimate_step_ms([], [3000])
+        self.assertAlmostEqual(preds["a"], s_decode_aug / solo, places=4)
 
-    def test_single_prefill_job_uses_stretch_extend(self):
-        """A single active job currently in prefill phase should have its
-        predicted_VJS = current_VJS × stretch_extend."""
+    def test_single_prefill_job_predicted_vss(self):
+        """predicted_VSS = S_extend⁺ / solo_extend for a prefill-phase job."""
         cm = _split_cost_model()
         p = JobSlowdownAdmissionPredictor(cm)
         prefill_call = ActiveCallInfo(
-            rid="r1", is_prefill=True,
-            prompt_len=4096, prefix_len=0, decoded_tokens=0,
-            kv_len_now=4096, elapsed_actual_ms=500.0,
+            rid="r1",
+            is_prefill=True,
+            prompt_len=4096,
+            prefix_len=0,
+            decoded_tokens=0,
+            kv_len_now=4096,
         )
-        job = _job(
-            "a", current_vjs=2.5,
-            active=(prefill_call,), declared=False,
-        )
+        job = _job("a", active=(prefill_call,), declared=False)
         new_job = NewJobInput(
-            job_id="new", slo=5.0,
-            first_call_input_len=8000, first_call_prefix_len=7500,
+            job_id="new",
+            slo=5.0,
+            first_call_input_len=8000,
+            first_call_prefix_len=7500,
         )  # n_new = 500
         preds = p.predict([job], new_job)
-        # stretch_extend uses current prefill batch composition.
-        base = cm.estimate_step_ms([(4096, 0)], [])
-        aug = cm.estimate_step_ms([(4096, 0), (500, 7500)], [])
-        expected = 2.5 * (aug / base)
-        self.assertAlmostEqual(preds["a"], expected, places=4)
+        s_extend_aug = cm.estimate_step_ms([(4096, 0), (500, 7500)], [])
+        solo = cm.estimate_step_ms([(4096, 0)], [])
+        self.assertAlmostEqual(preds["a"], s_extend_aug / solo, places=4)
 
-    def test_mixed_jobs_get_phase_specific_stretch(self):
-        """User example: A prefill, B/C decode. Each gets its own phase's
-        stretch — A receives stretch_extend, B/C receive stretch_decode."""
+    def test_mixed_jobs_user_example(self):
+        """User example: A prefill chunk=4096, B/C decode KV 3000/7000,
+        new prompt=8000 prefix=7500 (n_new=500). Each job is scored on its
+        own phase: A on the augmented EXTEND step, B/C on the augmented
+        DECODE step."""
         cm = _split_cost_model()
         p = JobSlowdownAdmissionPredictor(cm)
-
-        # A: prefill phase, current VJS = 2.0
         prefill_call_A = ActiveCallInfo(
-            rid="rA", is_prefill=True,
-            prompt_len=4096, prefix_len=0, decoded_tokens=0,
-            kv_len_now=4096, elapsed_actual_ms=1000.0,
+            rid="rA",
+            is_prefill=True,
+            prompt_len=4096,
+            prefix_len=0,
+            decoded_tokens=0,
+            kv_len_now=4096,
         )
-        job_A = _job(
-            "A", current_vjs=2.0,
-            active=(prefill_call_A,), declared=False,
-        )
-        # B: decode phase, current VJS = 1.5
-        job_B = _job(
-            "B", current_vjs=1.5,
-            active=(_decode_call("rB", kv_len=3000),),
-            declared=False,
-        )
-        # C: decode phase, current VJS = 3.0
-        job_C = _job(
-            "C", current_vjs=3.0,
-            active=(_decode_call("rC", kv_len=7000),),
-            declared=False,
-        )
-
+        job_A = _job("A", active=(prefill_call_A,), declared=False)
+        job_B = _job("B", active=(_decode_call("rB", kv_len=3000),), declared=False)
+        job_C = _job("C", active=(_decode_call("rC", kv_len=7000),), declared=False)
         new_job = NewJobInput(
-            job_id="new", slo=5.0,
-            first_call_input_len=8000, first_call_prefix_len=7500,
+            job_id="new",
+            slo=5.0,
+            first_call_input_len=8000,
+            first_call_prefix_len=7500,
         )
         preds = p.predict([job_A, job_B, job_C], new_job)
 
-        base_ext = cm.estimate_step_ms([(4096, 0)], [])
-        aug_ext = cm.estimate_step_ms([(4096, 0), (500, 7500)], [])
-        stretch_extend = aug_ext / base_ext
-
-        base_dec = cm.estimate_step_ms([], [3000, 7000])
-        aug_dec = cm.estimate_step_ms([], [3000, 7000, 8000])
-        stretch_decode = aug_dec / base_dec
-
-        self.assertAlmostEqual(preds["A"], 2.0 * stretch_extend, places=4)
-        self.assertAlmostEqual(preds["B"], 1.5 * stretch_decode, places=4)
-        self.assertAlmostEqual(preds["C"], 3.0 * stretch_decode, places=4)
+        s_extend = cm.estimate_step_ms([(4096, 0), (500, 7500)], [])
+        s_decode = cm.estimate_step_ms([], [3000, 7000, 8000])
+        self.assertAlmostEqual(
+            preds["A"], s_extend / cm.estimate_step_ms([(4096, 0)], []), places=4
+        )
+        self.assertAlmostEqual(
+            preds["B"], s_decode / cm.estimate_step_ms([], [3000]), places=4
+        )
+        self.assertAlmostEqual(
+            preds["C"], s_decode / cm.estimate_step_ms([], [7000]), places=4
+        )
 
     def test_bigger_arrival_raises_predicted_slowdown(self):
         cm = _split_cost_model()
         p = JobSlowdownAdmissionPredictor(cm)
-        job = _job(
-            "a", current_vjs=2.5,
-            active=(_decode_call("r1", kv_len=3000),),
-            declared=False,
+        job = _job("a", active=(_decode_call("r1", kv_len=3000),), declared=False)
+        small = NewJobInput(
+            job_id="new", slo=5.0, first_call_input_len=100, first_call_prefix_len=50
         )
-        small = NewJobInput(job_id="new", slo=5.0,
-                            first_call_input_len=100,
-                            first_call_prefix_len=50)
-        big = NewJobInput(job_id="new", slo=5.0,
-                          first_call_input_len=20000,
-                          first_call_prefix_len=0)
+        big = NewJobInput(
+            job_id="new", slo=5.0, first_call_input_len=20000, first_call_prefix_len=0
+        )
         small_preds = p.predict([job], small)
         big_preds = p.predict([job], big)
-        # Bigger new arrival → larger predicted_VJS for the active job.
+        # Bigger new arrival → larger augmented step → larger predicted VSS.
         self.assertGreater(big_preds["a"], small_preds["a"])
 
-    def test_predicted_vjs_is_current_vjs_times_stretch(self):
-        """The predictor multiplies the job's current_vjs by its phase
-        stretch — nothing else. A fresh job whose current_vjs equals its
-        SLO (the Job initial-VJS convention) with an empty decode batch
-        (stretch_decode = 1.0) predicts exactly the SLO."""
+    def test_memoryless_no_history_dependence(self):
+        """Two jobs with identical active_calls but very different elapsed
+        history predict identically — the VSS gate has no memory."""
         cm = _split_cost_model()
         p = JobSlowdownAdmissionPredictor(cm)
-        job = _job(
-            "a", current_vjs=5.0,  # fresh job → VJS initialised to SLO
-            active=(),  # no active calls — treated as decode phase
-            declared=False,
+        fresh = _job(
+            "a", active=(_decode_call("r1", 3000, elapsed_ms=1.0),), declared=False
         )
+        old = _job(
+            "a", active=(_decode_call("r1", 3000, elapsed_ms=9e5),), declared=False
+        )
+        new_job = NewJobInput(job_id="new", slo=5.0, first_call_input_len=1000)
+        self.assertAlmostEqual(
+            p.predict([fresh], new_job)["a"], p.predict([old], new_job)["a"], places=8
+        )
+
+    def test_job_with_no_active_calls_is_skipped(self):
+        cm = _split_cost_model()
+        p = JobSlowdownAdmissionPredictor(cm)
+        job = _job("a", active=(), declared=False)
         new_job = NewJobInput(job_id="new", slo=5.0, first_call_input_len=100)
-        preds = p.predict([job], new_job)
-        # Empty decode batch → stretch_decode = 1.0 → predicted = 5.0 × 1.0.
-        self.assertAlmostEqual(preds["a"], 5.0, places=4)
+        self.assertEqual(p.predict([job], new_job), {})
 
     def test_declared_fields_are_ignored(self):
-        """Whether declared lengths are present or not, the prediction should
-        match — the 2026-05-15 design no longer consults them."""
+        """Whether declared lengths are present or not, the prediction must
+        match — the memoryless VSS predictor does not consult them."""
         cm = _split_cost_model()
         p = JobSlowdownAdmissionPredictor(cm)
         active = (_decode_call("r1", kv_len=3000),)
-        job_with_declared = _job(
-            "a", current_vjs=2.5,
-            active=active, declared=True,
-        )
-        job_without_declared = _job(
-            "a", current_vjs=2.5,
-            active=active, declared=False,
-        )
-        new_job = NewJobInput(job_id="new", slo=5.0,
-                              first_call_input_len=1000)
-        with_decl = p.predict([job_with_declared], new_job)
-        without_decl = p.predict([job_without_declared], new_job)
+        new_job = NewJobInput(job_id="new", slo=5.0, first_call_input_len=1000)
+        with_decl = p.predict([_job("a", active=active, declared=True)], new_job)
+        without_decl = p.predict([_job("a", active=active, declared=False)], new_job)
         self.assertAlmostEqual(with_decl["a"], without_decl["a"], places=8)
+
+    def test_chunked_prefill_size_caps_extend_vss(self):
+        """결함 A fix: a huge prefill arrival must NOT blow up a prefill-phase
+        job's predicted VSS once chunked_prefill_size bounds the modelled
+        EXTEND step. Un-capped, the Σnᵢ² term explodes."""
+        cm = _split_cost_model()
+        p = JobSlowdownAdmissionPredictor(cm)
+        prefill_call = ActiveCallInfo(
+            rid="rA",
+            is_prefill=True,
+            prompt_len=2000,
+            prefix_len=0,
+            decoded_tokens=0,
+            kv_len_now=2000,
+        )
+        job = _job("A", active=(prefill_call,), declared=False)
+        # 200k-token arrival — un-chunked this makes the EXTEND batch absurd.
+        new_job = NewJobInput(
+            job_id="new",
+            slo=5.0,
+            first_call_input_len=200000,
+            first_call_prefix_len=0,
+        )
+        uncapped = p.predict([job], new_job, chunked_prefill_size=None)["A"]
+        capped = p.predict([job], new_job, chunked_prefill_size=8192)["A"]
+        self.assertLess(capped, uncapped)  # cap genuinely reduces it
+        self.assertGreater(uncapped, 30.0)  # un-capped really blew up
+        self.assertLess(capped, 10.0)  # capped → sane range
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -345,8 +346,7 @@ class TestRequestSlowdownPredictor(unittest.TestCase):
 
     def test_empty_active_returns_empty(self):
         p = RequestSlowdownAdmissionPredictor(_split_cost_model())
-        new_job = NewJobInput(job_id="new", slo=5.0,
-                              first_call_input_len=1000)
+        new_job = NewJobInput(job_id="new", slo=5.0, first_call_input_len=1000)
         self.assertEqual(p.predict([], new_job), {})
 
     def test_keys_are_rids_no_job_aggregation(self):
@@ -356,91 +356,88 @@ class TestRequestSlowdownPredictor(unittest.TestCase):
         cm = _split_cost_model()
         p = RequestSlowdownAdmissionPredictor(cm)
         job = _job(
-            "jobA", active=(
-                _decode_call("r1", kv_len=3000, elapsed_ms=2000.0,
-                             solo_ms=800.0),
-                _decode_call("r2", kv_len=5000, elapsed_ms=1000.0,
-                             solo_ms=800.0),
+            "jobA",
+            active=(
+                _decode_call("r1", kv_len=3000),
+                _decode_call("r2", kv_len=5000),
             ),
             declared=False,
         )
-        new_job = NewJobInput(job_id="new", slo=5.0,
-                              first_call_input_len=1000)
+        new_job = NewJobInput(job_id="new", slo=5.0, first_call_input_len=1000)
         preds = p.predict([job], new_job)
         self.assertEqual(set(preds.keys()), {"r1", "r2"})
         self.assertNotIn("jobA", preds)
 
-    def test_per_request_decode_slowdown(self):
-        """predicted_request_slowdown = (elapsed / solo) × stretch_decode,
-        computed per request."""
+    def test_per_request_decode_vss(self):
+        """predicted_VSS_c = S_decode⁺ / solo_decode_c, computed per
+        request from each call's own current KV."""
         cm = _split_cost_model()
         p = RequestSlowdownAdmissionPredictor(cm)
-        # r1 current slowdown = 2000/800 = 2.5; r2 = 1500/1000 = 1.5
         job = _job(
-            "jobA", active=(
-                _decode_call("r1", kv_len=3000, elapsed_ms=2000.0,
-                             solo_ms=800.0),
-                _decode_call("r2", kv_len=7000, elapsed_ms=1500.0,
-                             solo_ms=1000.0),
+            "jobA",
+            active=(
+                _decode_call("r1", kv_len=3000),
+                _decode_call("r2", kv_len=7000),
             ),
             declared=False,
         )
-        new_job = NewJobInput(job_id="new", slo=5.0,
-                              first_call_input_len=8000)
+        new_job = NewJobInput(job_id="new", slo=5.0, first_call_input_len=8000)
         preds = p.predict([job], new_job)
-        base = cm.estimate_step_ms([], [3000, 7000])
-        aug = cm.estimate_step_ms([], [3000, 7000, 8000])
-        stretch_decode = aug / base
-        self.assertAlmostEqual(preds["r1"], 2.5 * stretch_decode, places=4)
-        self.assertAlmostEqual(preds["r2"], 1.5 * stretch_decode, places=4)
+        s_decode = cm.estimate_step_ms([], [3000, 7000, 8000])
+        self.assertAlmostEqual(
+            preds["r1"], s_decode / cm.estimate_step_ms([], [3000]), places=4
+        )
+        self.assertAlmostEqual(
+            preds["r2"], s_decode / cm.estimate_step_ms([], [7000]), places=4
+        )
 
     def test_each_call_scored_by_own_phase(self):
-        """A prefill-phase call gets stretch_extend; a decode-phase call
-        gets stretch_decode — even within the same job."""
+        """A prefill-phase call is scored on the augmented EXTEND step; a
+        decode-phase call on the augmented DECODE step — even within the
+        same job."""
         cm = _split_cost_model()
         p = RequestSlowdownAdmissionPredictor(cm)
         prefill_call = ActiveCallInfo(
-            rid="rP", is_prefill=True, prompt_len=4096, prefix_len=0,
-            decoded_tokens=0, kv_len_now=4096,
-            elapsed_actual_ms=1000.0, solo_elapsed_ms=500.0,
+            rid="rP",
+            is_prefill=True,
+            prompt_len=4096,
+            prefix_len=0,
+            decoded_tokens=0,
+            kv_len_now=4096,
         )
-        decode_call = _decode_call("rD", kv_len=3000, elapsed_ms=1000.0,
-                                   solo_ms=500.0)
-        job = _job("jobA", active=(prefill_call, decode_call),
-                   declared=False)
+        decode_call = _decode_call("rD", kv_len=3000)
+        job = _job("jobA", active=(prefill_call, decode_call), declared=False)
         new_job = NewJobInput(
-            job_id="new", slo=5.0,
-            first_call_input_len=8000, first_call_prefix_len=7500,
+            job_id="new",
+            slo=5.0,
+            first_call_input_len=8000,
+            first_call_prefix_len=7500,
         )
         preds = p.predict([job], new_job)
-        base_ext = cm.estimate_step_ms([(4096, 0)], [])
-        aug_ext = cm.estimate_step_ms([(4096, 0), (500, 7500)], [])
-        stretch_extend = aug_ext / base_ext
-        base_dec = cm.estimate_step_ms([], [3000])
-        aug_dec = cm.estimate_step_ms([], [3000, 8000])
-        stretch_decode = aug_dec / base_dec
-        # Both calls have current slowdown 1000/500 = 2.0.
-        self.assertAlmostEqual(preds["rP"], 2.0 * stretch_extend, places=4)
-        self.assertAlmostEqual(preds["rD"], 2.0 * stretch_decode, places=4)
+        s_extend = cm.estimate_step_ms([(4096, 0), (500, 7500)], [])
+        s_decode = cm.estimate_step_ms([], [3000, 8000])
+        self.assertAlmostEqual(
+            preds["rP"], s_extend / cm.estimate_step_ms([(4096, 0)], []), places=4
+        )
+        self.assertAlmostEqual(
+            preds["rD"], s_decode / cm.estimate_step_ms([], [3000]), places=4
+        )
 
-    def test_zero_solo_falls_back_to_slo(self):
-        """A call with no accumulated solo time uses the job SLO as its
-        current slowdown — matches R1's initial convention."""
+    def test_matches_job_predictor_for_one_call_per_job(self):
+        """With exactly one active call per job, the request-scoped
+        prediction (keyed by rid) equals the job-scoped prediction (keyed
+        by job_id) — the ONLY difference between the two modes is the
+        scoring unit, not the VSS math."""
         cm = _split_cost_model()
-        p = RequestSlowdownAdmissionPredictor(cm)
-        job = _job(
-            "jobA", slo=4.0,
-            active=(_decode_call("r1", kv_len=3000, elapsed_ms=999.0,
-                                 solo_ms=0.0),),
-            declared=False,
+        jp = JobSlowdownAdmissionPredictor(cm)
+        rp = RequestSlowdownAdmissionPredictor(cm)
+        job = _job("jobA", active=(_decode_call("r1", kv_len=3000),), declared=False)
+        new_job = NewJobInput(job_id="new", slo=5.0, first_call_input_len=1000)
+        self.assertAlmostEqual(
+            jp.predict([job], new_job)["jobA"],
+            rp.predict([job], new_job)["r1"],
+            places=8,
         )
-        new_job = NewJobInput(job_id="new", slo=5.0,
-                              first_call_input_len=1000)
-        preds = p.predict([job], new_job)
-        base = cm.estimate_step_ms([], [3000])
-        aug = cm.estimate_step_ms([], [3000, 1000])
-        stretch_decode = aug / base
-        self.assertAlmostEqual(preds["r1"], 4.0 * stretch_decode, places=4)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -449,17 +446,25 @@ class TestRequestSlowdownPredictor(unittest.TestCase):
 class TestFrozenInputs(unittest.TestCase):
     def test_active_call_info_is_frozen(self):
         info = ActiveCallInfo(
-            rid="r", is_prefill=False, prompt_len=100, prefix_len=0,
-            decoded_tokens=10, kv_len_now=110, elapsed_actual_ms=100.0,
+            rid="r",
+            is_prefill=False,
+            prompt_len=100,
+            prefix_len=0,
+            decoded_tokens=10,
+            kv_len_now=110,
+            elapsed_actual_ms=100.0,
         )
         with self.assertRaises(Exception):
             info.prompt_len = 200  # type: ignore[misc]
 
     def test_admission_decision_result_is_frozen(self):
         r = AdmissionDecisionResult(
-            admit=True, reason=REASON_OK,
-            violation_ratio=0.0, violation_count=0,
-            active_jobs_total=0, threshold=0.2,
+            admit=True,
+            reason=REASON_OK,
+            violation_ratio=0.0,
+            violation_count=0,
+            active_jobs_total=0,
+            threshold=0.2,
             predicted_slowdowns={},
         )
         with self.assertRaises(Exception):
@@ -485,18 +490,21 @@ class TestLookaheadPredictor(unittest.TestCase):
 
     def test_empty_active_returns_empty(self):
         p = self._make()
-        new_job = NewJobInput(job_id="new", slo=5.0,
-                              first_call_input_len=1000)
+        new_job = NewJobInput(job_id="new", slo=5.0, first_call_input_len=1000)
         self.assertEqual(p.predict([], new_job), {})
 
     def test_returns_one_entry_per_active_job(self):
         p = self._make(horizon_sec=5.0)  # tight horizon for fast test
         # Two declared active jobs.
-        jobs = [_job("a", active=(_decode_call("r1", 4000),)),
-                _job("b", active=(_decode_call("r2", 6000),))]
+        jobs = [
+            _job("a", active=(_decode_call("r1", 4000),)),
+            _job("b", active=(_decode_call("r2", 6000),)),
+        ]
         new_job = NewJobInput(
-            job_id="new", slo=5.0,
-            first_call_input_len=2000, first_call_prefix_len=1500,
+            job_id="new",
+            slo=5.0,
+            first_call_input_len=2000,
+            first_call_prefix_len=1500,
             total_calls=2,
             stage_sequence=("LOCATE", "PLAN"),
             expected_input_lens=(2000, 2500),
@@ -509,10 +517,8 @@ class TestLookaheadPredictor(unittest.TestCase):
 
     def test_undeclared_active_still_runs(self):
         p = self._make(horizon_sec=5.0)
-        jobs = [_job("undeclared", active=(_decode_call("r1", 4000),),
-                     declared=False)]
-        new_job = NewJobInput(job_id="new", slo=5.0,
-                              first_call_input_len=1000)
+        jobs = [_job("undeclared", active=(_decode_call("r1", 4000),), declared=False)]
+        new_job = NewJobInput(job_id="new", slo=5.0, first_call_input_len=1000)
         preds = p.predict(jobs, new_job)
         self.assertIn("undeclared", preds)
         self.assertGreater(preds["undeclared"], 0)
@@ -523,13 +529,17 @@ class TestLookaheadPredictor(unittest.TestCase):
         jobs = [_job("a", active=(_decode_call("r1", 4000),))]
 
         small = NewJobInput(
-            job_id="new", slo=5.0,
-            first_call_input_len=100, first_call_prefix_len=50,
+            job_id="new",
+            slo=5.0,
+            first_call_input_len=100,
+            first_call_prefix_len=50,
             first_call_expected_output_len=10,
         )
         big = NewJobInput(
-            job_id="new", slo=5.0,
-            first_call_input_len=8000, first_call_prefix_len=0,
+            job_id="new",
+            slo=5.0,
+            first_call_input_len=8000,
+            first_call_prefix_len=0,
             first_call_expected_output_len=400,
         )
         small_preds = p.predict(jobs, small)
@@ -548,13 +558,17 @@ class TestLookaheadPredictor(unittest.TestCase):
         confirming the horizon argument is wired through."""
         p_short = self._make(horizon_sec=0.5)
         p_long = self._make(horizon_sec=10.0)
-        jobs = [_job(
-            "a",
-            active=(_decode_call("r1", 4000, decoded=0, elapsed_ms=0.0),),
-        )]
+        jobs = [
+            _job(
+                "a",
+                active=(_decode_call("r1", 4000, decoded=0, elapsed_ms=0.0),),
+            )
+        ]
         new_job = NewJobInput(
-            job_id="new", slo=5.0,
-            first_call_input_len=100, first_call_prefix_len=0,
+            job_id="new",
+            slo=5.0,
+            first_call_input_len=100,
+            first_call_prefix_len=0,
             first_call_expected_output_len=10000,
         )
         short = p_short.predict(jobs, new_job)
@@ -571,13 +585,16 @@ class TestLookaheadPredictor(unittest.TestCase):
         p = self._make(horizon_sec=0.0)
         jobs = [_job("a", slo=3.0)]  # declared remaining → horizon derivable
         new_job = NewJobInput(
-            job_id="new", slo=5.0,
-            first_call_input_len=1000, first_call_prefix_len=500,
+            job_id="new",
+            slo=5.0,
+            first_call_input_len=1000,
+            first_call_prefix_len=500,
             first_call_expected_output_len=200,
         )
         preds = p.predict(jobs, new_job)
         self.assertIn("a", preds)
         import math
+
         self.assertTrue(math.isfinite(preds["a"]))
 
     def test_mode_name_is_level2(self):
