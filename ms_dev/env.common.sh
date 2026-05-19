@@ -70,43 +70,35 @@ export SGLANG_ADMISSION_TBT_REACTIVE_RATIO="${SGLANG_ADMISSION_TBT_REACTIVE_RATI
 export SGLANG_ADMISSION_DRY_RUN="${SGLANG_ADMISSION_DRY_RUN:-0}"
 export SGLANG_ADMISSION_DECISION_LOG="${SGLANG_ADMISSION_DECISION_LOG:-}"
 
-# HALO: Project Halo Phase 1 — job-level slowdown tracking.
-# Off by default. See managers/halo/CLAUDE.md and ms_dev/halo_dev/CLAUDE.md.
+# HALO: Project Halo — request-level admission control + tracking.
+# Off by default. See managers/halo/CLAUDE.md.
 # Translated to --halo-* CLI flags by lib_server.sh::append_halo_args.
 # To turn on for an experiment, set SGLANG_HALO_ENABLED=1 (one-off) or
 # source ms_dev/experiments/halo_base.sh.
 export SGLANG_HALO_ENABLED="${SGLANG_HALO_ENABLED:-0}"
-export SGLANG_HALO_DEFAULT_SLO="${SGLANG_HALO_DEFAULT_SLO:-}"
 export SGLANG_HALO_TICK_INTERVAL_MS="${SGLANG_HALO_TICK_INTERVAL_MS:-}"
-export SGLANG_HALO_AGGREGATOR="${SGLANG_HALO_AGGREGATOR:-}"
-export SGLANG_HALO_JOB_LOG="${SGLANG_HALO_JOB_LOG:-}"
+# Admission: policy ∈ {off, mooncake, vss, reactive}; slo_mode ∈ {ratio, absolute}.
+export SGLANG_HALO_ADMISSION_POLICY="${SGLANG_HALO_ADMISSION_POLICY:-off}"
+export SGLANG_HALO_SLO_MODE="${SGLANG_HALO_SLO_MODE:-}"
+export SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD="${SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD:-}"
+export SGLANG_HALO_TBT_REACTIVE_RATIO="${SGLANG_HALO_TBT_REACTIVE_RATIO:-}"
+export SGLANG_HALO_ADMISSION_DRY_RUN="${SGLANG_HALO_ADMISSION_DRY_RUN:-0}"
+# When SGLANG_HALO_ENABLED=1 (and admission active), expctl/server_run_experiment.py
+# auto-routes SGLANG_HALO_ADMISSION_DECISION_LOG to <session>/admission_decisions.jsonl.
+export SGLANG_HALO_ADMISSION_DECISION_LOG="${SGLANG_HALO_ADMISSION_DECISION_LOG:-}"
+# Stage B' KV-cache hard cap (0..1). Empty → disabled. Set e.g. 0.90 to
+# reject when KV-cache usage >= 90%. Independent of the admission policy.
+export SGLANG_HALO_ADMISSION_KV_CAP_RATIO="${SGLANG_HALO_ADMISSION_KV_CAP_RATIO:-}"
+# Cost models. SGLANG_HALO_STEP_COST_MODEL supersedes the legacy prefill/tbt
+# pair when set. When SGLANG_HALO_COST_MODEL_SAMPLE_LOG is set (to "auto",
+# "1", or an explicit path), expctl/server_run_experiment.py auto-routes it
+# to <session>/halo_cost_samples.jsonl AND auto-adds --disable-overlap-schedule
+# (the sampler is only valid in normal-mode scheduling).
 export SGLANG_HALO_PREFILL_COST_MODEL="${SGLANG_HALO_PREFILL_COST_MODEL:-}"
 export SGLANG_HALO_TBT_COST_MODEL="${SGLANG_HALO_TBT_COST_MODEL:-}"
-export SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS="${SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS:-}"
-export SGLANG_HALO_QUIESCENT_TIMEOUT_SECONDS="${SGLANG_HALO_QUIESCENT_TIMEOUT_SECONDS:-}"
-# Halo Step Cost Model (post-Phase-1 follow-up) — see
-# ms_dev/halo_dev/prediction_model.md and tools/halo/README.md.
-# When SGLANG_HALO_STEP_COST_MODEL is set, it supersedes the legacy
-# prefill/tbt path pair. When SGLANG_HALO_COST_MODEL_SAMPLE_LOG is set
-# (to "auto", "1", or an explicit path), expctl/server_run_experiment.py
-# auto-routes to <session>/halo_cost_samples.jsonl (unless an absolute
-# path is given) AND auto-adds --disable-overlap-schedule because the
-# sampler is only valid in normal-mode scheduling.
 export SGLANG_HALO_STEP_COST_MODEL="${SGLANG_HALO_STEP_COST_MODEL:-}"
 export SGLANG_HALO_COST_MODEL_SAMPLE_LOG="${SGLANG_HALO_COST_MODEL_SAMPLE_LOG:-}"
 export SGLANG_HALO_COST_MODEL_SAMPLE_EVERY="${SGLANG_HALO_COST_MODEL_SAMPLE_EVERY:-}"
-# Phase 2 admission control — see ms_dev/halo_dev/admission_design.md.
-# When SGLANG_HALO_ADMISSION_MODE != "off", expctl/server_run_experiment.py auto-
-# routes SGLANG_HALO_ADMISSION_DECISION_LOG to <session>/admission_decisions.jsonl.
-export SGLANG_HALO_ADMISSION_MODE="${SGLANG_HALO_ADMISSION_MODE:-off}"
-export SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD="${SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD:-}"
-export SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC="${SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC:-}"
-export SGLANG_HALO_ADMISSION_DRY_RUN="${SGLANG_HALO_ADMISSION_DRY_RUN:-0}"
-export SGLANG_HALO_ADMISSION_DECISION_LOG="${SGLANG_HALO_ADMISSION_DECISION_LOG:-}"
-# Stage B' KV-cache hard cap (0..1). Empty → server default (disabled).
-# Set e.g. 0.90 to reject new jobs when KV-cache usage >= 90%. Independent
-# of SGLANG_HALO_ADMISSION_MODE (a KV-cap-only run uses MODE=off).
-export SGLANG_HALO_ADMISSION_KV_CAP_RATIO="${SGLANG_HALO_ADMISSION_KV_CAP_RATIO:-}"
 
 # Some environments mount /tmp with noexec, which breaks Triton /
 # torchinductor when they try to mmap compiled .so files. Redirect their

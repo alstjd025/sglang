@@ -243,10 +243,10 @@ def detect_runtime_feature_flags(
         "server_admission_tbt_slo_ms": None,
         "server_admission_ttft_slo_ratio": None,
         "server_admission_tbt_slo_ratio": None,
-        # HALO: Project Halo Phase 1 — job-level slowdown tracking.
-        # Single-server only in Phase 1; PD modes show N/A.
+        # HALO: Project Halo — request-level admission control + tracking.
+        # Single-server only; PD modes show N/A.
         "server_halo": None,
-        "server_halo_default_slo": None,
+        "server_halo_admission_policy": None,
         "server_halo_tick_interval_ms": None,
     }
 
@@ -295,13 +295,13 @@ def detect_runtime_feature_flags(
         states["server_admission_dry_run"] = detect_launch_flag(
             process_log_dir, "server", "--admission-dry-run"
         )
-        # HALO: Project Halo Phase 1 detection. --halo-enabled is a bare flag;
-        # --halo-default-slo / --halo-tick-interval-ms carry display values.
+        # HALO: Project Halo detection. --halo-enabled is a bare flag;
+        # --halo-admission-policy / --halo-tick-interval-ms carry display values.
         states["server_halo"] = detect_launch_flag(
             process_log_dir, "server", "--halo-enabled"
         )
-        states["server_halo_default_slo"] = detect_launch_arg(
-            process_log_dir, "server", "--halo-default-slo"
+        states["server_halo_admission_policy"] = detect_launch_arg(
+            process_log_dir, "server", "--halo-admission-policy"
         )  # type: ignore[assignment]
         states["server_halo_tick_interval_ms"] = detect_launch_arg(
             process_log_dir, "server", "--halo-tick-interval-ms"
@@ -404,9 +404,9 @@ def halo_state_text(
     role_enabled: bool,
     use_color: bool,
 ) -> str:
-    """HALO: Render the Project Halo Phase 1 feature cell.
+    """HALO: Render the Project Halo feature cell.
 
-    Phase 1 is single-instance only (NULL disaggregation). PD prefill/decode
+    Halo is single-instance only (NULL disaggregation). PD prefill/decode
     show N/A. Active iff `--halo-enabled` was on the launch command line.
     """
     if not role_enabled:
@@ -420,14 +420,11 @@ def halo_state_text(
     if not enabled:
         return colorize("OFF", "muted", use_color)
 
-    default_slo = feature_states.get("server_halo_default_slo")
+    policy = feature_states.get("server_halo_admission_policy")
     tick_ms = feature_states.get("server_halo_tick_interval_ms")
     parts: List[str] = []
-    if default_slo is not None:
-        try:
-            parts.append(f"slo={float(default_slo):g}x")
-        except (TypeError, ValueError):
-            parts.append(f"slo={default_slo}")
+    if policy is not None:
+        parts.append(f"policy={policy}")
     if tick_ms is not None:
         try:
             parts.append(f"tick={float(tick_ms):g}ms")
@@ -683,7 +680,7 @@ def render_status(
         enabled_roles.get("prefill", False),
         use_color,
     )
-    # HALO: Phase 1 is single-instance only; PD shows N/A.
+    # HALO: single-instance only; PD shows N/A.
     pd_halo_text = halo_state_text(
         feature_states,
         "prefill",
@@ -736,7 +733,7 @@ def render_status(
     lines.append(
         "legend: hicache=L1/L2/L3 tiered cache, pd_offload=PD decode-specific KV offload path, "
         "admission=Mooncake-style SLO admission (Phase A: single-mode only), "
-        "halo=Project Halo Phase 1 (single-mode only)"
+        "halo=Project Halo request-level admission (single-mode only)"
     )
     lines.append(colorize("-" * 118, "muted", use_color))
 
@@ -967,7 +964,7 @@ def render_status_single(
         enabled_roles.get("server", False),
         use_color,
     )
-    # HALO: Phase 1 job-level slowdown tracking cell.
+    # HALO: request-level admission control + tracking cell.
     server_halo_text = halo_state_text(
         feature_states,
         "server",
@@ -986,32 +983,17 @@ def render_status_single(
         server, "sglang:admission_decisions_total", "decision", "dryrun_would_reject"
     )
 
-    # HALO: live runtime state (gauges updated every sweep ≈100 ms,
-    # counters bumped on register/admit/reject events). All scoped to
-    # attn_tp_rank=0; series_sum returns the actual count.
-    server_halo_active = metric_value(server, "sglang:halo_active_jobs")
-    server_halo_total_known = metric_value(server, "sglang:halo_total_known_jobs")
-    server_halo_mean_vjs = metric_value(server, "sglang:halo_mean_vjs")
-    server_halo_max_vjs = metric_value(server, "sglang:halo_max_vjs")
-    server_halo_violations = metric_value(server, "sglang:halo_slo_violations_total")
-    server_halo_registered = metric_value(
-        server, "sglang:halo_programs_registered_total"
-    )
+    # HALO: request-level live state. The active-requests gauge + the
+    # admit/reject counters are scoped to attn_tp_rank=0.
+    server_halo_active = metric_value(server, "sglang:halo_active_requests")
     server_halo_admitted = metric_value(
         server, "sglang:halo_requests_admitted_total"
     )
     server_halo_rejected = metric_value(
         server, "sglang:halo_requests_rejected_total"
     )
-    # Split by reason so the panel distinguishes "no job_id field" from
-    # "job_id present but program not pre-registered" (very different
-    # client-side bugs).
-    server_halo_rejected_no_id = series_sum(
-        server, "sglang:halo_requests_rejected_total", "reason", "HALO_NO_JOB_ID"
-    )
-    server_halo_rejected_not_reg = series_sum(
-        server, "sglang:halo_requests_rejected_total", "reason",
-        "HALO_PROGRAM_NOT_REGISTERED",
+    server_halo_rej_kvcap = series_sum(
+        server, "sglang:halo_requests_rejected_total", "reason", "HALO_KV_CAP"
     )
 
     lines = []
@@ -1041,7 +1023,7 @@ def render_status_single(
     lines.append(
         "legend: hicache_l2=host memory tier, hicache_l3=storage tier, "
         "admission=Mooncake-style predictive SLO admission control, "
-        "halo=Project Halo Phase 1 job-level slowdown tracking"
+        "halo=Project Halo request-level admission control + tracking"
     )
     lines.append(colorize("-" * 118, "muted", use_color))
 
@@ -1150,21 +1132,12 @@ def render_status_single(
                 )
             )
 
-    # HALO: live job-level state (only when --halo-enabled was on the
-    # launch command). Two rows so the panel stays scannable:
-    #   row 1 — fleet shape: active jobs, total known, lifetime registered/
-    #           admitted/rejected counters.
-    #   row 2 — fleet slowdown: mean virtual job slowdown, worst single
-    #           job's virtual job slowdown, lifetime SLO violations.
+    # HALO: request-level live state (only when --halo-enabled was on the
+    # launch command). One row: active requests + lifetime admit/reject
+    # (split into KV-cap rejects vs admission-policy rejects).
     if feature_states.get("server_halo") is True:
         active_int = (
             int(server_halo_active) if server_halo_active is not None else None
-        )
-        total_known_int = (
-            int(server_halo_total_known) if server_halo_total_known is not None else None
-        )
-        reg_int = (
-            int(server_halo_registered) if server_halo_registered is not None else None
         )
         admitted_int = (
             int(server_halo_admitted) if server_halo_admitted is not None else None
@@ -1172,24 +1145,14 @@ def render_status_single(
         rejected_int = (
             int(server_halo_rejected) if server_halo_rejected is not None else None
         )
-        rej_no_id_int = (
-            int(server_halo_rejected_no_id)
-            if server_halo_rejected_no_id is not None else None
+        rej_kvcap_int = (
+            int(server_halo_rej_kvcap)
+            if server_halo_rej_kvcap is not None else None
         )
-        rej_not_reg_int = (
-            int(server_halo_rejected_not_reg)
-            if server_halo_rejected_not_reg is not None else None
+        rej_policy_int = (
+            rejected_int - (rej_kvcap_int or 0)
+            if rejected_int is not None else None
         )
-        violations_int = (
-            int(server_halo_violations) if server_halo_violations is not None else None
-        )
-
-        def _fmt_x(v):
-            return "-" if v is None else f"{v:.2f}x"
-
-        # Row 1 — Halo fleet shape. Prefix every label with "halo_" so the
-        # panel reader can't confuse them with the admission_control row
-        # right above (which has its own "admit"/"reject" counters).
         lines.append(
             "        "
             + metric_row(
@@ -1198,55 +1161,15 @@ def render_status_single(
                         active_int, fmt_int(active_int),
                         warn=64, bad=256, enabled=use_color,
                     )),
-                    ("halo_known", fmt_int(total_known_int)),
-                    ("halo_registered", fmt_int(reg_int)),
                     ("halo_admitted", fmt_int(admitted_int)),
                     ("halo_rejected", color_high_bad(
                         rejected_int, fmt_int(rejected_int),
                         warn=1, bad=100, enabled=use_color,
                     )),
+                    ("halo_rej_kvcap", fmt_int(rej_kvcap_int)),
+                    ("halo_rej_policy", fmt_int(rej_policy_int)),
                 ],
                 label_width=15,
-            )
-        )
-        # Row 1b — Halo reject by reason (only meaningful when total > 0;
-        # otherwise show zeros so the panel stays stable).
-        lines.append(
-            "        "
-            + metric_row(
-                [
-                    ("halo_rej_no_id", color_high_bad(
-                        rej_no_id_int, fmt_int(rej_no_id_int),
-                        warn=1, bad=100, enabled=use_color,
-                    )),
-                    ("halo_rej_not_reg", color_high_bad(
-                        rej_not_reg_int, fmt_int(rej_not_reg_int),
-                        warn=1, bad=100, enabled=use_color,
-                    )),
-                ],
-                label_width=17,
-            )
-        )
-        lines.append(
-            "        "
-            + metric_row(
-                [
-                    ("halo_mean_vjs", color_high_bad(
-                        server_halo_mean_vjs,
-                        _fmt_x(server_halo_mean_vjs),
-                        warn=2.0, bad=3.0, enabled=use_color,
-                    )),
-                    ("halo_worst_vjs", color_high_bad(
-                        server_halo_max_vjs,
-                        _fmt_x(server_halo_max_vjs),
-                        warn=3.0, bad=5.0, enabled=use_color,
-                    )),
-                    ("halo_slo_violations", color_high_bad(
-                        violations_int, fmt_int(violations_int),
-                        warn=1, bad=50, enabled=use_color,
-                    )),
-                ],
-                label_width=19,
             )
         )
 

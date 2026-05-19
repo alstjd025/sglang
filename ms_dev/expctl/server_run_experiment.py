@@ -428,39 +428,29 @@ def main() -> int:
             )
 
     # ------------------------------------------------------------------
-    # HALO: Project Halo Phase 1 — job-level slowdown tracking.
-    # See managers/halo/CLAUDE.md and ms_dev/halo_dev/CLAUDE.md.
+    # HALO: Project Halo — request-level admission control + tracking.
+    # See managers/halo/CLAUDE.md.
     # ------------------------------------------------------------------
     halo_env_keys = (
         "SGLANG_HALO_ENABLED",
-        "SGLANG_HALO_DEFAULT_SLO",
         "SGLANG_HALO_TICK_INTERVAL_MS",
-        "SGLANG_HALO_AGGREGATOR",
-        "SGLANG_HALO_JOB_LOG",
+        "SGLANG_HALO_ADMISSION_POLICY",
+        "SGLANG_HALO_SLO_MODE",
+        "SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD",
+        "SGLANG_HALO_TBT_REACTIVE_RATIO",
+        "SGLANG_HALO_ADMISSION_DRY_RUN",
+        "SGLANG_HALO_ADMISSION_DECISION_LOG",
+        "SGLANG_HALO_ADMISSION_KV_CAP_RATIO",
         "SGLANG_HALO_PREFILL_COST_MODEL",
         "SGLANG_HALO_TBT_COST_MODEL",
         "SGLANG_HALO_STEP_COST_MODEL",
         "SGLANG_HALO_COST_MODEL_SAMPLE_LOG",
         "SGLANG_HALO_COST_MODEL_SAMPLE_EVERY",
-        "SGLANG_HALO_ADMISSION_MODE",
-        "SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD",
-        "SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC",
-        "SGLANG_HALO_ADMISSION_DRY_RUN",
-        "SGLANG_HALO_ADMISSION_DECISION_LOG",
-        "SGLANG_HALO_ADMISSION_KV_CAP_RATIO",
     )
     halo_config_snapshot = {
         k: os.environ[k] for k in halo_env_keys if os.environ.get(k)
     }
     halo_enabled = halo_config_snapshot.get("SGLANG_HALO_ENABLED") == "1"
-    # Auto-route the per-sweep job log into the session folder unless pinned.
-    halo_job_log_path: Optional[Path] = None
-    if halo_enabled:
-        if halo_config_snapshot.get("SGLANG_HALO_JOB_LOG"):
-            halo_job_log_path = Path(halo_config_snapshot["SGLANG_HALO_JOB_LOG"])
-        else:
-            halo_job_log_path = session_dir / "halo_jobs.jsonl"
-            halo_config_snapshot["SGLANG_HALO_JOB_LOG"] = str(halo_job_log_path)
 
     # Halo Step Cost Model sampler: independent of --halo-enabled. The user
     # sets SGLANG_HALO_COST_MODEL_SAMPLE_LOG to any value to turn collection
@@ -487,12 +477,11 @@ def main() -> int:
                 f"{existing_extra} --disable-overlap-schedule".strip()
             )
 
-    # Phase 2 admission decision log auto-route. When the predictive gate is
-    # on (admission mode != "off") OR the Stage B' KV cap is enabled (ratio
-    # in (0,1)), and the operator didn't pin a path, route it into the
-    # session folder. See ms_dev/halo_dev/admission_design.md.
-    halo_admission_mode = (
-        halo_config_snapshot.get("SGLANG_HALO_ADMISSION_MODE") or "off"
+    # Admission decision log auto-route. When an admission policy is active
+    # (policy != "off") OR the Stage B' KV cap is enabled (ratio in (0,1)),
+    # and the operator didn't pin a path, route it into the session folder.
+    halo_admission_policy = (
+        halo_config_snapshot.get("SGLANG_HALO_ADMISSION_POLICY") or "off"
     ).lower()
     try:
         _kv_cap_ratio = float(
@@ -500,9 +489,9 @@ def main() -> int:
         )
     except ValueError:
         _kv_cap_ratio = 0.0
-    halo_kv_cap_on = 0.0 < _kv_cap_ratio < 1.0
+    halo_kv_cap_on = 0.0 < _kv_cap_ratio <= 1.0
     halo_admission_decision_log_path: Optional[Path] = None
-    if halo_enabled and (halo_admission_mode != "off" or halo_kv_cap_on):
+    if halo_enabled and (halo_admission_policy != "off" or halo_kv_cap_on):
         pinned = halo_config_snapshot.get("SGLANG_HALO_ADMISSION_DECISION_LOG")
         if pinned:
             halo_admission_decision_log_path = Path(pinned)
@@ -551,17 +540,15 @@ def main() -> int:
         "sglang:admission_predicted_tbt_ms",
         "sglang:admission_tbt_ewma_ms",
         "sglang:admission_queue_predicted_ms",
-        # HALO Phase 1 — job-level slowdown tracking.
+        # HALO — request-level admission control + tracking.
         # See managers/halo/CLAUDE.md.
-        "sglang:halo_programs_registered_total",
-        "sglang:halo_programs_rejected_total",
         "sglang:halo_requests_admitted_total",
         "sglang:halo_requests_rejected_total",
-        "sglang:halo_slo_violations_total",
-        "sglang:halo_active_jobs",
-        "sglang:halo_total_known_jobs",
-        "sglang:halo_mean_vjs",
-        "sglang:halo_max_vjs",
+        "sglang:halo_request_ttft_seconds",
+        "sglang:halo_request_tbt_seconds",
+        "sglang:halo_request_e2e_seconds",
+        "sglang:halo_request_e2e_slowdown",
+        "sglang:halo_active_requests",
     ]
 
     if mode == "pd":
@@ -699,26 +686,10 @@ def main() -> int:
             launch_env_overrides["server"]["SGLANG_ADMISSION_DECISION_LOG"] = str(
                 admission_decision_log_path
             )
-        # HALO: auto-route per-sweep job log into the session folder.
-        if halo_enabled and halo_job_log_path is not None:
-            launch_env_overrides["server"]["SGLANG_HALO_JOB_LOG"] = str(
-                halo_job_log_path
-            )
-        # HALO Step Cost Model sampler + Phase 2 admission: forward whichever
-        # env vars the user has set. Auto-routed paths (sample log, admission
-        # decision log) were already written back into halo_config_snapshot.
-        for k in (
-            "SGLANG_HALO_STEP_COST_MODEL",
-            "SGLANG_HALO_COST_MODEL_SAMPLE_LOG",
-            "SGLANG_HALO_COST_MODEL_SAMPLE_EVERY",
-            "SGLANG_HALO_ADMISSION_MODE",
-            "SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD",
-            "SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC",
-            "SGLANG_HALO_ADMISSION_DRY_RUN",
-            "SGLANG_HALO_ADMISSION_DECISION_LOG",
-            "SGLANG_HALO_ADMISSION_KV_CAP_RATIO",
-        ):
-            v = halo_config_snapshot.get(k)
+        # HALO: forward every request-level halo env var the user set,
+        # including the auto-routed sample-log + admission-decision-log
+        # paths already written back into halo_config_snapshot.
+        for k, v in halo_config_snapshot.items():
             if v:
                 launch_env_overrides["server"][k] = v
 
@@ -821,21 +792,18 @@ def main() -> int:
                 else None
             ),
         },
-        # HALO: Project Halo Phase 1 — snapshot of SGLANG_HALO_* env vars.
+        # HALO: Project Halo — snapshot of SGLANG_HALO_* env vars.
         # See managers/halo/CLAUDE.md.
         "halo_config": {
             "enabled": halo_enabled,
             "applied_in_mode": halo_enabled and mode == "single",
             "env": halo_config_snapshot,
-            "job_log_path": (
-                str(halo_job_log_path) if halo_job_log_path is not None else None
-            ),
             "cost_sample_log_path": (
                 str(halo_cost_sample_log_path)
                 if halo_cost_sample_log_path is not None
                 else None
             ),
-            "admission_mode": halo_admission_mode,
+            "admission_policy": halo_admission_policy,
             "admission_decision_log_path": (
                 str(halo_admission_decision_log_path)
                 if halo_admission_decision_log_path is not None

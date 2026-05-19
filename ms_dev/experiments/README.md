@@ -38,8 +38,8 @@ the calling shell, so anything `export`ed here flows all the way to
 | `admission_ratio_ttft_only.sh` | Hybrid: TTFT ratio + absolute TBT SLO with reactive EWMA. Use when TBT cost model is brittle. |
 | `admission_dryrun.sh` | Same as `_with_safety.sh` but with dry-run on — for SLO tuning against real traffic. |
 | `admission_off.sh` | Unsets every `SGLANG_ADMISSION_*` env var so the next run launches sglang with no admission control at all. Useful as a clean baseline or after sourcing a wrapper you want to undo. |
-| `halo_base.sh` | **Project Halo Phase 1** — turns on job-level slowdown tracking (observation only, no admission/scheduling decisions). Each request MUST carry `halo_job_id` (HTTP 400 otherwise). Per-sweep snapshot logged to `<session>/halo_jobs.jsonl`. See `ms_dev/halo_dev/CLAUDE.md`. |
-| `halo_off.sh` | Unsets every `SGLANG_HALO_*` env var so the next run launches sglang with no Halo tracking. |
+| `halo_base.sh` | **Project Halo** — turns on request-level tracking + the step cost model (no admission policy by default). Set `SGLANG_HALO_ADMISSION_POLICY` (`mooncake`/`vss`/`reactive`) to enable a policy. Per-request SLOs travel in the request body. See `python/sglang/srt/managers/halo/CLAUDE.md`. |
+| `halo_off.sh` | Unsets every `SGLANG_HALO_*` env var so the next run launches sglang with no Halo. |
 
 After running an experiment session, the resulting session folder contains
 `meta/run_meta.json` with `admission_config` and (when active) `halo_config`

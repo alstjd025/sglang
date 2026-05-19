@@ -165,7 +165,7 @@ append_admission_args() {
 #
 # HALO: Translates SGLANG_HALO_* env vars (set in env.common.sh) into --halo-*
 # CLI args. Off-by-default (SGLANG_HALO_ENABLED=0); non-zero values turn it on.
-# Each optional knob (default SLO, tick interval, cost-model paths, job log)
+# Each optional knob (tick interval, admission policy, cost-model paths)
 # only forwards when explicitly set, falling back to sglang CLI defaults.
 #
 # Arguments:
@@ -196,47 +196,25 @@ append_halo_args() {
   fi
 
   if [[ "${mode}" != "single" ]]; then
-    echo "[lib_server] HALO Phase 1 is single-instance only — flag will be passed but the controller is a no-op outside NULL disaggregation" >&2
+    echo "[lib_server] HALO is single-instance only — flag will be passed but the controller is a no-op outside NULL disaggregation" >&2
   fi
 
   _halo_out+=(--halo-enabled)
-  if [[ -n "${SGLANG_HALO_DEFAULT_SLO:-}" ]]; then
-    _halo_out+=(--halo-default-slo "${SGLANG_HALO_DEFAULT_SLO}")
-  fi
   if [[ -n "${SGLANG_HALO_TICK_INTERVAL_MS:-}" ]]; then
     _halo_out+=(--halo-tick-interval-ms "${SGLANG_HALO_TICK_INTERVAL_MS}")
   fi
-  if [[ -n "${SGLANG_HALO_AGGREGATOR:-}" ]]; then
-    _halo_out+=(--halo-aggregator "${SGLANG_HALO_AGGREGATOR}")
+  # ── Admission policy + SLO mode ──────────────────────────────────────
+  if [[ -n "${SGLANG_HALO_ADMISSION_POLICY:-}" ]]; then
+    _halo_out+=(--halo-admission-policy "${SGLANG_HALO_ADMISSION_POLICY}")
   fi
-  if [[ -n "${SGLANG_HALO_JOB_LOG:-}" ]]; then
-    _halo_out+=(--halo-job-log "${SGLANG_HALO_JOB_LOG}")
-  fi
-  if [[ -n "${SGLANG_HALO_PREFILL_COST_MODEL:-}" ]]; then
-    _halo_out+=(--halo-prefill-cost-model-path "${SGLANG_HALO_PREFILL_COST_MODEL}")
-  fi
-  if [[ -n "${SGLANG_HALO_TBT_COST_MODEL:-}" ]]; then
-    _halo_out+=(--halo-tbt-cost-model-path "${SGLANG_HALO_TBT_COST_MODEL}")
-  fi
-  # Step cost model — supersedes the legacy two-model pair when set.
-  if [[ -n "${SGLANG_HALO_STEP_COST_MODEL:-}" ]]; then
-    _halo_out+=(--halo-step-cost-model-path "${SGLANG_HALO_STEP_COST_MODEL}")
-  fi
-  if [[ -n "${SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS:-}" ]]; then
-    _halo_out+=(--halo-job-log-interval-seconds "${SGLANG_HALO_JOB_LOG_INTERVAL_SECONDS}")
-  fi
-  if [[ -n "${SGLANG_HALO_QUIESCENT_TIMEOUT_SECONDS:-}" ]]; then
-    _halo_out+=(--halo-quiescent-timeout-seconds "${SGLANG_HALO_QUIESCENT_TIMEOUT_SECONDS}")
-  fi
-  # Phase 2 admission control.
-  if [[ -n "${SGLANG_HALO_ADMISSION_MODE:-}" && "${SGLANG_HALO_ADMISSION_MODE}" != "off" ]]; then
-    _halo_out+=(--halo-admission-mode "${SGLANG_HALO_ADMISSION_MODE}")
+  if [[ -n "${SGLANG_HALO_SLO_MODE:-}" ]]; then
+    _halo_out+=(--halo-slo-mode "${SGLANG_HALO_SLO_MODE}")
   fi
   if [[ -n "${SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD:-}" ]]; then
     _halo_out+=(--halo-admission-violation-threshold "${SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD}")
   fi
-  if [[ -n "${SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC:-}" ]]; then
-    _halo_out+=(--halo-admission-lookahead-horizon-sec "${SGLANG_HALO_ADMISSION_LOOKAHEAD_HORIZON_SEC}")
+  if [[ -n "${SGLANG_HALO_TBT_REACTIVE_RATIO:-}" ]]; then
+    _halo_out+=(--halo-tbt-reactive-ratio "${SGLANG_HALO_TBT_REACTIVE_RATIO}")
   fi
   if [[ "${SGLANG_HALO_ADMISSION_DRY_RUN:-0}" == "1" ]]; then
     _halo_out+=(--halo-admission-dry-run)
@@ -244,9 +222,19 @@ append_halo_args() {
   if [[ -n "${SGLANG_HALO_ADMISSION_DECISION_LOG:-}" ]]; then
     _halo_out+=(--halo-admission-decision-log "${SGLANG_HALO_ADMISSION_DECISION_LOG}")
   fi
-  # Stage B' KV-cache hard cap — independent of admission mode.
+  # Stage B' KV-cache hard cap — independent of the admission policy.
   if [[ -n "${SGLANG_HALO_ADMISSION_KV_CAP_RATIO:-}" ]]; then
     _halo_out+=(--halo-admission-kv-cap-ratio "${SGLANG_HALO_ADMISSION_KV_CAP_RATIO}")
+  fi
+  # ── Cost models — step model supersedes the legacy pair when set. ────
+  if [[ -n "${SGLANG_HALO_PREFILL_COST_MODEL:-}" ]]; then
+    _halo_out+=(--halo-prefill-cost-model-path "${SGLANG_HALO_PREFILL_COST_MODEL}")
+  fi
+  if [[ -n "${SGLANG_HALO_TBT_COST_MODEL:-}" ]]; then
+    _halo_out+=(--halo-tbt-cost-model-path "${SGLANG_HALO_TBT_COST_MODEL}")
+  fi
+  if [[ -n "${SGLANG_HALO_STEP_COST_MODEL:-}" ]]; then
+    _halo_out+=(--halo-step-cost-model-path "${SGLANG_HALO_STEP_COST_MODEL}")
   fi
 }
 

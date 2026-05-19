@@ -173,13 +173,25 @@ scheduler. Module:
 Per-request SLOs travel in the request body as `halo_ttft_slo` /
 `halo_tbt_slo` / `halo_e2e_slo`; `halo_bypass` marks server-internal traffic.
 
-### ⚠ env-var wiring update pending
+### Env vars (`env.common.sh` → `lib_server.sh::append_halo_args` → `--halo-*`)
 
-`env.common.sh` / `lib_server.sh::append_halo_args` still translate the
-*job-level* `SGLANG_HALO_*` env vars (`SGLANG_HALO_ADMISSION_MODE`,
-`SGLANG_HALO_DEFAULT_SLO`, …) into the old flag names. They must be updated
-to the `--halo-*` flags above before experiments run — otherwise the server
-rejects unknown arguments.
+| Env var | CLI flag |
+|---|---|
+| `SGLANG_HALO_ENABLED` | `--halo-enabled` |
+| `SGLANG_HALO_TICK_INTERVAL_MS` | `--halo-tick-interval-ms` |
+| `SGLANG_HALO_ADMISSION_POLICY` | `--halo-admission-policy` |
+| `SGLANG_HALO_SLO_MODE` | `--halo-slo-mode` |
+| `SGLANG_HALO_ADMISSION_VIOLATION_THRESHOLD` | `--halo-admission-violation-threshold` |
+| `SGLANG_HALO_TBT_REACTIVE_RATIO` | `--halo-tbt-reactive-ratio` |
+| `SGLANG_HALO_ADMISSION_DRY_RUN` | `--halo-admission-dry-run` |
+| `SGLANG_HALO_ADMISSION_DECISION_LOG` | `--halo-admission-decision-log` |
+| `SGLANG_HALO_ADMISSION_KV_CAP_RATIO` | `--halo-admission-kv-cap-ratio` |
+| `SGLANG_HALO_{PREFILL,TBT,STEP}_COST_MODEL` | `--halo-{prefill,tbt,step}-cost-model-path` |
+| `SGLANG_HALO_COST_MODEL_SAMPLE_{LOG,EVERY}` | `--halo-cost-model-sample-{log,every}` |
+
+`ms_dev/experiments/halo_base.sh` turns Halo on with the step cost model;
+set `SGLANG_HALO_ADMISSION_POLICY` to enable a policy. `halo_off.sh` clears
+all `SGLANG_HALO_*`.
 
 ### Per-session auto-routing (run_experiment.py)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HALO: Disable Project Halo Phase 1 job-level tracking.
+# HALO: Disable Project Halo (request-level admission control + tracking).
 #
 # Resets every SGLANG_HALO_* env var to its inert default. After sourcing
 # this, lib_server.sh::append_halo_args adds no --halo-* CLI flags and
