@@ -173,6 +173,23 @@ class TestRequestTracker(unittest.TestCase):
         self.assertEqual(t.prefill_solo_ms(100, 0), 0.0)
         self.assertEqual(t.decode_step_ms([100]), 0.0)
 
+    def test_on_step_prefers_accurate_first_token_ts(self):
+        # The tick observes the request late (ts=5.0) but the scheduler's
+        # accurate prefill-finished timestamp (4.2) wins when supplied.
+        t = RequestTracker()
+        t.on_admitted(
+            "r1",
+            ttft_slo=None,
+            tbt_slo=None,
+            e2e_slo=None,
+            prompt_len=100,
+            prefix_len=0,
+            ts=0.0,
+        )
+        t.on_step("r1", decoded_tokens=1, kv_len=101, ts=5.0, first_token_ts=4.2)
+        self.assertEqual(t.get("r1").first_token_ts, 4.2)
+        self.assertAlmostEqual(t.get("r1").ttft_ms, 4200.0)
+
 
 # ───────────────────────────────────────────────────────────────────────────
 class TestHaloAdmissionGate(unittest.TestCase):
@@ -351,7 +368,7 @@ class TestHaloController(unittest.TestCase):
             prompt_len=100,
             prefix_len=0,
         )
-        c.tick([("r1", 7, 107)], now_monotonic=1.0)
+        c.tick([("r1", 7, 107, 0.0)], now_monotonic=1.0)
         rec = c.tracker.get("r1")
         self.assertEqual(rec.decoded_tokens, 7)
         self.assertIs(rec.state, RequestState.RUNNING)

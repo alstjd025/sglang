@@ -101,9 +101,7 @@ class RequestTracker:
         self._active[rid] = record
         return record
 
-    def on_state_change(
-        self, rid: str, new_state: RequestState, ts: float
-    ) -> None:
+    def on_state_change(self, rid: str, new_state: RequestState, ts: float) -> None:
         """Move a request between lifecycle states (e.g. QUEUED → RUNNING)."""
         record = self._active.get(rid)
         if record is None:
@@ -111,12 +109,21 @@ class RequestTracker:
         record.state = new_state
 
     def on_step(
-        self, rid: str, *, decoded_tokens: int, kv_len: int, ts: float
+        self,
+        rid: str,
+        *,
+        decoded_tokens: int,
+        kv_len: int,
+        ts: float,
+        first_token_ts: Optional[float] = None,
     ) -> None:
         """Per-step progress update for a running request.
 
-        Stamps `first_token_ts` the first time the request has produced a
-        token, and advances `last_token_ts` whenever the decoded count grows.
+        Advances `last_token_ts` / `decoded_tokens` / `kv_len`. Stamps
+        `first_token_ts` the first time the request has produced a token:
+        from `first_token_ts` when the caller supplies the scheduler's
+        accurate prefill-finished timestamp, else from `ts` (tick-granular,
+        ±tick_interval — see managers/halo/CLAUDE.md "Known limitations").
         """
         record = self._active.get(rid)
         if record is None:
@@ -127,7 +134,7 @@ class RequestTracker:
         decoded_tokens = max(0, decoded_tokens)
         if decoded_tokens > record.decoded_tokens:
             if record.first_token_ts is None and decoded_tokens >= 1:
-                record.first_token_ts = ts
+                record.first_token_ts = first_token_ts or ts
             record.last_token_ts = ts
             record.decoded_tokens = decoded_tokens
         record.kv_len = max(0, kv_len)
@@ -151,9 +158,7 @@ class RequestTracker:
         solo_decode = 0.0
         if record.decoded_tokens > 0:
             mean_kv = record.prompt_len + record.decoded_tokens / 2.0
-            solo_decode = record.decoded_tokens * self.decode_step_ms(
-                [int(mean_kv)]
-            )
+            solo_decode = record.decoded_tokens * self.decode_step_ms([int(mean_kv)])
         record.solo_e2e_ms = solo_prefill + solo_decode
 
         e2e_ms = record.e2e_ms

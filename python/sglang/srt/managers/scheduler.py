@@ -2641,6 +2641,14 @@ class Scheduler(
             return True
         return False
 
+    def _halo_first_token_ts(self, req: Req) -> float:
+        """The request's accurate first-token (prefill-finished) timestamp,
+        in perf_counter seconds. 0.0 when prefill has not finished yet.
+        Set scheduler-side by SchedulerReqTimeStats.set_prefill_finished_time.
+        """
+        ts = getattr(req, "time_stats", None)
+        return float(getattr(ts, "prefill_finished_time", 0.0) or 0.0)
+
     def _halo_on_request_finished(self, req: Req) -> None:
         """Scheduler finish-path hook — finalize the request's tracker
         record. No-op when Halo is off."""
@@ -2651,12 +2659,15 @@ class Scheduler(
             req.rid,
             decoded_tokens=len(getattr(req, "output_ids", []) or []),
             kv_len=int(getattr(req, "kv_committed_len", 0) or 0),
+            first_token_ts=self._halo_first_token_ts(req) or None,
         )
 
-    def _halo_running_infos(self) -> List[Tuple[str, int, int]]:
-        """(rid, decoded_tokens, kv_len) for every running-batch request —
-        the per-tick progress feed for the request tracker."""
-        infos: List[Tuple[str, int, int]] = []
+    def _halo_running_infos(self) -> List[Tuple[str, int, int, float]]:
+        """(rid, decoded_tokens, kv_len, first_token_ts) for every
+        running-batch request — the per-tick progress feed for the request
+        tracker. first_token_ts is 0.0 until the request finishes prefill.
+        """
+        infos: List[Tuple[str, int, int, float]] = []
         running = getattr(self, "running_batch", None)
         if running is not None and getattr(running, "reqs", None):
             for req in running.reqs:
@@ -2665,6 +2676,7 @@ class Scheduler(
                         req.rid,
                         len(getattr(req, "output_ids", []) or []),
                         int(getattr(req, "kv_committed_len", 0) or 0),
+                        self._halo_first_token_ts(req),
                     )
                 )
         return infos

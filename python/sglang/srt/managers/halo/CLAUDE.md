@@ -135,11 +135,12 @@ current active-request count is a gauge.
 
 ## Known limitations
 
-- **Tick-driven tracking.** `tracker.on_step` is currently fed by the ~100 ms
-  `tick`, not per forward step. A request that produces its first token *and*
-  finishes within one tick interval never gets a mid-flight `on_step`, so its
-  `first_token_ts` is stamped at finish → its measured TTFT ≈ e2e. Acceptable
-  for long requests; inaccurate for sub-tick requests. Not yet fixed.
+- **Tick-driven decode tracking.** `decoded_tokens` / `kv_len` of running
+  requests are refreshed by the ~100 ms `tick`, not per forward step — so the
+  TBT-mean (`(last_token_ts − first_token_ts) / (decoded − 1)`) carries ±tick
+  noise. `first_token_ts` is *not* affected: it is stamped from the scheduler's
+  accurate prefill-finished timestamp (`SchedulerReqTimeStats.prefill_finished_time`),
+  so TTFT is exact even for a request that finishes within one tick.
 - **e2e-slowdown solo baseline is an approximation.** `RequestTracker.on_finished`
   estimates solo decode with the mean-KV span rather than integrating per-step
   cost. The solo-run predictor is slated for a dedicated rework.

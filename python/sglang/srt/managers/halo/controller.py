@@ -266,7 +266,7 @@ class HaloController:
             e2e_slo=e2e_slo,
             prompt_len=prompt_len,
             prefix_len=prefix_len,
-            ts=time.monotonic(),
+            ts=time.perf_counter(),
             predicted_ttft_ms=pd.predicted_ttft_ms if pd else None,
             predicted_tbt_ms=pd.predicted_tbt_ms if pd else None,
         )
@@ -277,10 +277,23 @@ class HaloController:
     # Progress / finish hooks
     # ------------------------------------------------------------------
 
-    def on_request_step(self, rid: str, *, decoded_tokens: int, kv_len: int) -> None:
-        """Per-step progress update for a running request."""
+    def on_request_step(
+        self,
+        rid: str,
+        *,
+        decoded_tokens: int,
+        kv_len: int,
+        first_token_ts: Optional[float] = None,
+    ) -> None:
+        """Per-step progress update for a running request. `first_token_ts`
+        is the scheduler's accurate prefill-finished timestamp (perf_counter)
+        when known, else None."""
         self.tracker.on_step(
-            rid, decoded_tokens=decoded_tokens, kv_len=kv_len, ts=time.monotonic()
+            rid,
+            decoded_tokens=decoded_tokens,
+            kv_len=kv_len,
+            ts=time.perf_counter(),
+            first_token_ts=first_token_ts,
         )
 
     def on_request_finished(
@@ -289,17 +302,20 @@ class HaloController:
         *,
         decoded_tokens: Optional[int] = None,
         kv_len: Optional[int] = None,
+        first_token_ts: Optional[float] = None,
     ) -> None:
         """Finish hook — apply the final progress update, finalize the
-        record, and emit terminal metrics."""
+        record, and emit terminal metrics. `first_token_ts` is the
+        scheduler's accurate prefill-finished timestamp (perf_counter)."""
         if decoded_tokens is not None:
             self.tracker.on_step(
                 rid,
                 decoded_tokens=decoded_tokens,
                 kv_len=kv_len if kv_len is not None else 0,
-                ts=time.monotonic(),
+                ts=time.perf_counter(),
+                first_token_ts=first_token_ts,
             )
-        record = self.tracker.on_finished(rid, ts=time.monotonic())
+        record = self.tracker.on_finished(rid, ts=time.perf_counter())
         if record is not None and self.metrics is not None:
             self.metrics.observe_finished(record)
 
@@ -314,20 +330,28 @@ class HaloController:
 
     def tick(
         self,
-        running_infos: List[Tuple[str, int, int]],
+        running_infos: List[Tuple[str, int, int, float]],
         now_monotonic: Optional[float] = None,
     ) -> None:
-        """Periodic sweep. `running_infos` is (rid, decoded_tokens, kv_len)
-        for each request currently in the running batch. Cheap when the
-        tick interval has not elapsed.
+        """Periodic sweep. `running_infos` is
+        (rid, decoded_tokens, kv_len, first_token_ts) for each request in
+        the running batch — first_token_ts is the scheduler's accurate
+        prefill-finished timestamp (0.0 if prefill not yet done). Cheap
+        when the tick interval has not elapsed.
         """
-        now = time.monotonic() if now_monotonic is None else now_monotonic
+        now = time.perf_counter() if now_monotonic is None else now_monotonic
         if (now - self._last_tick_monotonic) < self._tick_interval_s:
             return
         self._last_tick_monotonic = now
 
-        for rid, decoded, kv in running_infos:
-            self.tracker.on_step(rid, decoded_tokens=decoded, kv_len=kv, ts=now)
+        for rid, decoded, kv, first_token_ts in running_infos:
+            self.tracker.on_step(
+                rid,
+                decoded_tokens=decoded,
+                kv_len=kv,
+                ts=now,
+                first_token_ts=first_token_ts or None,
+            )
 
         if self.metrics is not None:
             self.metrics.update_gauges(
