@@ -52,7 +52,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from sglang.srt.managers.admission_control.cost_model import HaloStepCostModel
+from sglang.srt.managers.halo.admission_control.cost_model import HaloStepCostModel
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Reject reason — kept in this module so the predictor + controller share it

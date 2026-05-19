@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-from sglang.srt.managers.admission_control.cost_model import (
+from sglang.srt.managers.halo.admission_control.cost_model import (
     HaloStepCostModel,
     try_load_halo_step_cost_model,
     try_load_prefill_cost_model,

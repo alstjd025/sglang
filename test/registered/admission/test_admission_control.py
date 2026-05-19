@@ -4,7 +4,7 @@ Step 1 covers PrefillCostModel, TBTCostModel, TBTEwmaTracker only. Controller
 and integration tests are added in later steps.
 
 See test/registered/admission/CLAUDE.md and
-python/sglang/srt/managers/admission_control/CLAUDE.md.
+python/sglang/srt/managers/halo/admission_control/CLAUDE.md.
 """
 
 import json
@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from sglang.srt.managers.admission_control.controller import (
+from sglang.srt.managers.halo.admission_control.controller import (
     REASON_ADMIT,
     REASON_DISABLED,
     REASON_TBT_PREDICTED,
@@ -25,16 +25,16 @@ from sglang.srt.managers.admission_control.controller import (
     AdmissionDecision,
     SchedulerSnapshot,
 )
-from sglang.srt.managers.admission_control.cost_model import (
+from sglang.srt.managers.halo.admission_control.cost_model import (
     CostModelLoadError,
     PrefillCostModel,
     TBTCostModel,
     try_load_prefill_cost_model,
     try_load_tbt_cost_model,
 )
-from sglang.srt.managers.admission_control.decision_log import DecisionLogger
-from sglang.srt.managers.admission_control.metrics import AdmissionMetrics
-from sglang.srt.managers.admission_control.tbt_tracker import TBTEwmaTracker
+from sglang.srt.managers.halo.admission_control.decision_log import DecisionLogger
+from sglang.srt.managers.halo.admission_control.metrics import AdmissionMetrics
+from sglang.srt.managers.halo.admission_control.tbt_tracker import TBTEwmaTracker
 from sglang.test.ci.ci_register import register_cpu_ci
 
 # Step 1 is pure-Python; CPU suite is enough.

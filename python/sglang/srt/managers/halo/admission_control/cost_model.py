@@ -1,6 +1,6 @@
 """Cost models for admission control AND for Halo step-latency prediction.
 
-See managers/admission_control/CLAUDE.md for the admission-control design and
+See managers/halo/admission_control/CLAUDE.md for the admission-control design and
 ms_dev/halo_dev/prediction_model.md for the Halo step model.
 
 Three coexisting models live in this file:

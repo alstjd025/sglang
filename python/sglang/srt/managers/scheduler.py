@@ -79,7 +79,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
-from sglang.srt.managers.admission_control import (
+from sglang.srt.managers.halo.admission_control import (
     AdmissionConfig,
     AdmissionController,
     AdmissionDecision,
@@ -507,7 +507,7 @@ class Scheduler(
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
 
-        # Init admission control — see managers/admission_control/CLAUDE.md
+        # Init admission control — see managers/halo/admission_control/CLAUDE.md
         self.init_admission_control()
 
         # HALO: Project Halo Phase 1 — job-level slowdown tracking.
@@ -1202,7 +1202,7 @@ class Scheduler(
             configure_gc_logger()
 
     def init_admission_control(self):
-        """Initialize the admission controller — see managers/admission_control/CLAUDE.md."""
+        """Initialize the admission controller — see managers/halo/admission_control/CLAUDE.md."""
         sa = self.server_args
         config = AdmissionConfig(
             ttft_slo_ms=sa.admission_ttft_slo_ms,
@@ -2361,7 +2361,7 @@ class Scheduler(
                 return
             if self._abort_on_queued_limit(req):
                 return
-            # admission control — see managers/admission_control/CLAUDE.md
+            # admission control — see managers/halo/admission_control/CLAUDE.md
             if self._abort_on_predicted_slo_violation(req):
                 return
             # HALO: Phase 1 job-level register hook. Strict mode — rejects
@@ -2507,7 +2507,7 @@ class Scheduler(
 
         Returns True iff the incoming request was rejected. Mirrors the
         contract of _abort_on_queued_limit. See
-        managers/admission_control/CLAUDE.md for the policy.
+        managers/halo/admission_control/CLAUDE.md for the policy.
         """
         controller = getattr(self, "admission_controller", None)
         if controller is None or not controller.is_active():
@@ -3948,7 +3948,7 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 
-        # admission control state — see managers/admission_control/CLAUDE.md
+        # admission control state — see managers/halo/admission_control/CLAUDE.md
         controller = getattr(self, "admission_controller", None)
         if controller is not None:
             cfg = controller.config

@@ -1,6 +1,6 @@
 """Admission control module — see CLAUDE.md for the full design."""
 
-from sglang.srt.managers.admission_control.controller import (
+from sglang.srt.managers.halo.admission_control.controller import (
     REASON_ADMIT,
     REASON_DISABLED,
     REASON_TBT_PREDICTED,
@@ -14,7 +14,7 @@ from sglang.srt.managers.admission_control.controller import (
     AdmissionDecision,
     SchedulerSnapshot,
 )
-from sglang.srt.managers.admission_control.cost_model import (
+from sglang.srt.managers.halo.admission_control.cost_model import (
     HALO_STEP_FORM_SPLIT_V1,
     HALO_STEP_FORM_V1,
     HALO_STEP_FORMS,
@@ -26,9 +26,9 @@ from sglang.srt.managers.admission_control.cost_model import (
     try_load_prefill_cost_model,
     try_load_tbt_cost_model,
 )
-from sglang.srt.managers.admission_control.decision_log import DecisionLogger
-from sglang.srt.managers.admission_control.metrics import AdmissionMetrics
-from sglang.srt.managers.admission_control.tbt_tracker import TBTEwmaTracker
+from sglang.srt.managers.halo.admission_control.decision_log import DecisionLogger
+from sglang.srt.managers.halo.admission_control.metrics import AdmissionMetrics
+from sglang.srt.managers.halo.admission_control.tbt_tracker import TBTEwmaTracker
 
 __all__ = [
     "AdmissionConfig",

@@ -31,7 +31,7 @@ REPO_ROOT = os.path.abspath(
 )
 sys.path.insert(0, REPO_ROOT)
 
-from sglang.srt.managers.admission_control.cost_model import (
+from sglang.srt.managers.halo.admission_control.cost_model import (
     HALO_STEP_FORM_SPLIT_V1,
     HaloStepCostModel,
 )

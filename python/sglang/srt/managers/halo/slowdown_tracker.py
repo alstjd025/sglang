@@ -45,7 +45,7 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from sglang.srt.managers.admission_control.cost_model import (
+from sglang.srt.managers.halo.admission_control.cost_model import (
     HaloStepCostModel,
     PrefillCostModel,
     TBTCostModel,

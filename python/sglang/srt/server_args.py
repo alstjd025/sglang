@@ -362,7 +362,7 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
     # Admission control (Mooncake-style predictive SLO admission).
-    # See managers/admission_control/CLAUDE.md.
+    # See managers/halo/admission_control/CLAUDE.md.
     admission_ttft_slo_ms: Optional[float] = None
     admission_tbt_slo_ms: Optional[float] = None
     admission_ttft_slo_ratio: Optional[float] = None
@@ -4560,7 +4560,7 @@ class ServerArgs:
             default=ServerArgs.max_queued_requests,
             help="The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
         )
-        # Admission control flags — see managers/admission_control/CLAUDE.md
+        # Admission control flags — see managers/halo/admission_control/CLAUDE.md
         parser.add_argument(
             "--admission-ttft-slo-ms",
             type=float,

@@ -9,7 +9,7 @@ See managers/halo/CLAUDE.md.
 # Note on terminology: this module performs *Halo's job-level admission
 # gate* — that is one of the three roles Halo plays inside SGLang (see
 # managers/halo/CLAUDE.md "Halo's three roles"). The per-request
-# *predictive* admission gate lives in managers/admission_control/ and
+# *predictive* admission gate lives in managers/halo/admission_control/ and
 # runs separately. The two gates compose in series in
 # scheduler._add_request_to_queue.
 #

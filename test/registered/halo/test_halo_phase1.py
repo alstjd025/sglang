@@ -15,7 +15,7 @@ import time
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.srt.managers.admission_control.cost_model import (
+from sglang.srt.managers.halo.admission_control.cost_model import (
     PrefillCostModel,
     TBTCostModel,
 )
@@ -305,7 +305,7 @@ def _step_model():
     prefill_solo(n, r) = (prompt_len - prefix_len)   [θ_p3=1, rest 0, θ_c_p=0]
     decode_step(kvs)   = batch_size + 10             [θ_d2=1, θ_c_d=10, rest 0]
     """
-    from sglang.srt.managers.admission_control.cost_model import HaloStepCostModel
+    from sglang.srt.managers.halo.admission_control.cost_model import HaloStepCostModel
 
     return HaloStepCostModel(
         theta_p1=0.0,
@@ -681,7 +681,7 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
     See ms_dev/halo_dev/admission_design.md §9 (workflow)."""
 
     def _step_cost(self):
-        from sglang.srt.managers.admission_control.cost_model import (
+        from sglang.srt.managers.halo.admission_control.cost_model import (
             HaloStepCostModel,
         )
 
@@ -1311,7 +1311,7 @@ class TestFactory(unittest.TestCase):
         import os
         import tempfile
 
-        from sglang.srt.managers.admission_control.cost_model import (
+        from sglang.srt.managers.halo.admission_control.cost_model import (
             HaloStepCostModel,
         )
 

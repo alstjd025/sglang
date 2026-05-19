@@ -22,7 +22,7 @@ same decision under different SLOs:
       "running_batch_total_kv_tokens": 145000
     }
 
-See managers/admission_control/CLAUDE.md and tools/admission_control/CLAUDE.md
+See managers/halo/admission_control/CLAUDE.md and tools/admission_control/CLAUDE.md
 for the replay tool that consumes this log.
 """
 
@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:  # pragma: no cover
-    from sglang.srt.managers.admission_control.controller import (
+    from sglang.srt.managers.halo.admission_control.controller import (
         AdmissionDecision,
         SchedulerSnapshot,
     )

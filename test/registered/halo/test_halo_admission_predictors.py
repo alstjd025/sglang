@@ -23,7 +23,7 @@ Coverage (per 2026-05-16 memoryless-VSS design):
 
 import unittest
 
-from sglang.srt.managers.admission_control.cost_model import HaloStepCostModel
+from sglang.srt.managers.halo.admission_control.cost_model import HaloStepCostModel
 from sglang.srt.managers.halo.admission_decision import (
     REASON_HALO_ADMISSION_PREDICTED,
     REASON_OK,

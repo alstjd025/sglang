@@ -1,6 +1,6 @@
 """Prometheus metrics for admission control.
 
-See managers/admission_control/CLAUDE.md.
+See managers/halo/admission_control/CLAUDE.md.
 
 Metric registration is gated on the caller (scheduler.init_admission_control).
 When admission control is off OR --enable-metrics is off we never instantiate
@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Dict, Optional
 
 if TYPE_CHECKING:  # pragma: no cover
-    from sglang.srt.managers.admission_control.controller import AdmissionDecision
+    from sglang.srt.managers.halo.admission_control.controller import AdmissionDecision
 
 
 class AdmissionMetrics:

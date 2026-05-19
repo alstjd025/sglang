@@ -1,6 +1,6 @@
 """Admission controller — hybrid 3-stage SLO-based admission policy.
 
-See managers/admission_control/CLAUDE.md for the full design.
+See managers/halo/admission_control/CLAUDE.md for the full design.
 
 Stage 1: TTFT predicted = sum of queued T_prefill + this request's T_prefill
 Stage 2: TBT predicted with current running batch + this request
@@ -20,11 +20,11 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from sglang.srt.managers.admission_control.cost_model import (
+from sglang.srt.managers.halo.admission_control.cost_model import (
     PrefillCostModel,
     TBTCostModel,
 )
-from sglang.srt.managers.admission_control.tbt_tracker import TBTEwmaTracker
+from sglang.srt.managers.halo.admission_control.tbt_tracker import TBTEwmaTracker
 
 logger = logging.getLogger(__name__)
 

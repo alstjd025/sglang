@@ -1,6 +1,6 @@
 """Reactive TBT safety net for admission control.
 
-See managers/admission_control/CLAUDE.md for the full design.
+See managers/halo/admission_control/CLAUDE.md for the full design.
 
 EWMA over per-decode-step latency. Used as Stage 3 — even if Stage 2's predictor
 underestimates, this catches sustained SLO violations: when the smoothed TBT

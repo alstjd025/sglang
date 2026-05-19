@@ -519,7 +519,7 @@ class SchedulerMetricsMixin:
             )
 
         # Feed measured per-step TBT into admission control's reactive EWMA.
-        # See managers/admission_control/CLAUDE.md.
+        # See managers/halo/admission_control/CLAUDE.md.
         controller = getattr(self, "admission_controller", None)
         if controller is not None and controller.tbt_tracker is not None:
             avg_step_ms = (

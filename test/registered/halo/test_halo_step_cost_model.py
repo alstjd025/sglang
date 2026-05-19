@@ -19,7 +19,7 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.managers.admission_control.cost_model import (
+from sglang.srt.managers.halo.admission_control.cost_model import (
     HALO_STEP_FORM_SPLIT_V1,
     HALO_STEP_FORM_V1,
     CostModelLoadError,
@@ -210,7 +210,7 @@ class TestHaloStepCostModelLenientLoader(unittest.TestCase):
         self.assertIsNone(try_load_halo_step_cost_model(""))
 
     def test_missing_file_returns_none_with_warn(self):
-        with self.assertLogs("sglang.srt.managers.admission_control.cost_model",
+        with self.assertLogs("sglang.srt.managers.halo.admission_control.cost_model",
                              level="WARNING"):
             self.assertIsNone(
                 try_load_halo_step_cost_model("/nonexistent/path.json")
@@ -222,7 +222,7 @@ class TestHaloStepCostModelLenientLoader(unittest.TestCase):
             with open(p, "w") as f:
                 f.write("not-json")
             with self.assertLogs(
-                "sglang.srt.managers.admission_control.cost_model",
+                "sglang.srt.managers.halo.admission_control.cost_model",
                 level="WARNING",
             ):
                 self.assertIsNone(try_load_halo_step_cost_model(p))
@@ -240,7 +240,7 @@ class TestHaloStepCostModelLenientLoader(unittest.TestCase):
                     f,
                 )
             with self.assertLogs(
-                "sglang.srt.managers.admission_control.cost_model",
+                "sglang.srt.managers.halo.admission_control.cost_model",
                 level="WARNING",
             ):
                 self.assertIsNone(try_load_halo_step_cost_model(p))
@@ -251,7 +251,7 @@ class TestHaloStepCostModelLenientLoader(unittest.TestCase):
             p = os.path.join(d, "good.json")
             m.to_json(p)
             with self.assertLogs(
-                "sglang.srt.managers.admission_control.cost_model",
+                "sglang.srt.managers.halo.admission_control.cost_model",
                 level="INFO",
             ):
                 loaded = try_load_halo_step_cost_model(p)
@@ -385,7 +385,7 @@ class TestSplitModeJson(unittest.TestCase):
             p = os.path.join(d, "split.json")
             m.to_json(p)
             with self.assertLogs(
-                "sglang.srt.managers.admission_control.cost_model",
+                "sglang.srt.managers.halo.admission_control.cost_model",
                 level="INFO",
             ) as captured:
                 loaded = try_load_halo_step_cost_model(p)
