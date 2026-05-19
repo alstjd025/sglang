@@ -16,6 +16,7 @@ design supersedes them.
 | `halo_api_reference.md` | Job-level client API (`POST /halo/programs`, `halo_job_id`) |
 | `prediction_model.md` | Job-lifetime VJS + Halo step cost model |
 | `verify/e2e_smoke.sh`, `verify/microbench_overhead.py` | Job-level verification scripts |
+| `CLAUDE_job_level.md` | The job-level project plan + decision log (was `halo_dev/CLAUDE.md`) |
 
 ## Recovery point
 
