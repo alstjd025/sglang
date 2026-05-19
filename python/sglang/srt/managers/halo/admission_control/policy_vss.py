@@ -24,8 +24,8 @@ from sglang.srt.managers.halo.admission_control.policy import (
 )
 from sglang.srt.managers.halo.admission_control.vss_predictor import (
     ActiveCallInfo,
-    JobLookaheadInput,
-    NewJobInput,
+    ArrivalInput,
+    BatchSnapshot,
     RequestSlowdownAdmissionPredictor,
     decide_admission,
 )
@@ -67,30 +67,23 @@ class VssPolicy(AdmissionPolicy):
             )
             for r in state.running
         )
-        batch = JobLookaheadInput(
-            job_id="_server_", slo=0.0, active_calls=active_calls
-        )
-        arrival = NewJobInput(
-            job_id=new_req.rid,
+        batch = BatchSnapshot(slo=0.0, active_calls=active_calls)
+        arrival = ArrivalInput(
             slo=0.0,
             first_call_input_len=new_req.prompt_len,
             first_call_prefix_len=new_req.prefix_len,
         )
         predicted = self._predictor.predict(
-            [batch], arrival, chunked_prefill_size=self.chunked_prefill_size
+            batch, arrival, chunked_prefill_size=self.chunked_prefill_size
         )
         # Score each running request's predicted VSS against its e2e_slo;
         # decide_admission treats a missing SLO as always satisfied.
-        slos = {
-            r.rid: r.e2e_slo for r in state.running if r.e2e_slo is not None
-        }
-        result = decide_admission(
-            predicted, slos, self.violation_threshold, mode="request"
-        )
+        slos = {r.rid: r.e2e_slo for r in state.running if r.e2e_slo is not None}
+        result = decide_admission(predicted, slos, self.violation_threshold)
         detail = {
             "violation_ratio": result.violation_ratio,
             "violation_count": result.violation_count,
-            "scored_units": result.active_jobs_total,
+            "scored_units": result.scored_total,
         }
         return PolicyDecision(
             admit=result.admit,
