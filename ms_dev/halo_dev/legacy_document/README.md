@@ -15,6 +15,7 @@ design supersedes them.
 | `admission_design.md` | Phase 2 job-level admission design (VSS, KV cap, VJS) |
 | `halo_api_reference.md` | Job-level client API (`POST /halo/programs`, `halo_job_id`) |
 | `prediction_model.md` | Job-lifetime VJS + Halo step cost model |
+| `verify/e2e_smoke.sh`, `verify/microbench_overhead.py` | Job-level verification scripts |
 
 ## Recovery point
 
