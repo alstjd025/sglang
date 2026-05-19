@@ -763,112 +763,25 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return _create_error_response(e)
 
 
-# HALO: Project Halo Phase 1 Option A — pre-register a job.
-# See managers/halo/CLAUDE.md and ms_dev/halo_dev/CLAUDE.md §13.
-# Body schema (all fields except job_id / slo are optional):
-#   {"job_id": str, "slo": float, "total_calls": int?, "stage_sequence": [str]?,
-#    "expected_input_lens": [int]?, "expected_output_lens": [int]?,
-#    "dag": {...}? }
-# Returns: 200 on fresh registration, 409 on duplicate job_id, 400 on
-# disabled / malformed.
-_HALO_BODY_MAX_BYTES = 16 * 1024  # Q14: cap DAG / metadata size at 16 KiB
-
-
 @app.get("/halo/status")
 async def halo_status():
     """HALO: lightweight server-status probe for client integrators.
 
-    Lets a client (Agent_applications, etc.) check at startup whether the
-    server has Halo enabled before issuing any LLM traffic, so a
-    client-on / server-off mismatch can abort the run immediately rather
-    than failing the first LLM call with HALO_NO_JOB_ID.
-
-    Does not touch the scheduler — just reflects server_args. Always 200.
+    Lets a client check at startup whether the server has Halo enabled and
+    which admission policy is active before issuing LLM traffic. Does not
+    touch the scheduler — just reflects server_args. Always 200.
     """
     sa = _global_state.tokenizer_manager.server_args
     return ORJSONResponse(
         {
             "enabled": bool(getattr(sa, "halo_enabled", False)),
-            "default_slo": getattr(sa, "halo_default_slo", None),
+            "admission_policy": getattr(sa, "halo_admission_policy", "off"),
+            "slo_mode": getattr(sa, "halo_slo_mode", "ratio"),
+            "kv_cap_ratio": getattr(sa, "halo_admission_kv_cap_ratio", 0.0),
             "tick_interval_ms": getattr(sa, "halo_tick_interval_ms", None),
-            "program_idle_timeout_seconds": getattr(
-                sa, "halo_program_idle_timeout_seconds", None
-            ),
-            "cost_models": {
-                "prefill_path": getattr(sa, "halo_prefill_cost_model_path", None),
-                "tbt_path": getattr(sa, "halo_tbt_cost_model_path", None),
-            },
         },
         status_code=200,
     )
-
-
-@app.post("/halo/programs")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def halo_register_program(request: Request):
-    """Pre-register a Halo job (Option A)."""
-    from sglang.srt.managers.io_struct import HaloRegisterProgramReqInput
-
-    raw = await request.body()
-    if len(raw) > _HALO_BODY_MAX_BYTES:
-        return ORJSONResponse(
-            {
-                "registered": False,
-                "reason": "BODY_TOO_LARGE",
-                "limit_bytes": _HALO_BODY_MAX_BYTES,
-            },
-            status_code=HTTPStatus.BAD_REQUEST,
-        )
-    import json as _json
-    try:
-        payload = _json.loads(raw) if raw else {}
-    except _json.JSONDecodeError as e:
-        return ORJSONResponse(
-            {"registered": False, "reason": "BAD_JSON", "detail": str(e)},
-            status_code=HTTPStatus.BAD_REQUEST,
-        )
-    try:
-        obj = HaloRegisterProgramReqInput(**payload)
-    except TypeError as e:
-        return ORJSONResponse(
-            {"registered": False, "reason": "BAD_FIELDS", "detail": str(e)},
-            status_code=HTTPStatus.BAD_REQUEST,
-        )
-    if not obj.job_id or obj.slo <= 0.0:
-        return ORJSONResponse(
-            {
-                "registered": False,
-                "reason": "MISSING_FIELDS",
-                "detail": "job_id (non-empty) and slo (>0) are required",
-            },
-            status_code=HTTPStatus.BAD_REQUEST,
-        )
-    result = await _global_state.tokenizer_manager.register_halo_program(obj)
-
-    if result.registered:
-        return ORJSONResponse(
-            {
-                "registered": True,
-                "job_id": result.job_id,
-                "active_jobs": result.active_jobs,
-            },
-            status_code=200,
-        )
-    # Map reason → status code.
-    if result.reason == "JOB_ID_ALREADY_REGISTERED":
-        status = HTTPStatus.CONFLICT       # 409
-    elif result.reason == "HALO_DISABLED":
-        status = HTTPStatus.BAD_REQUEST    # 400 — halo is off, can't register
-    else:
-        status = HTTPStatus.BAD_REQUEST
-    body = {
-        "registered": False,
-        "job_id": result.job_id,
-        "reason": result.reason,
-    }
-    if result.existing is not None:
-        body["existing"] = result.existing
-    return ORJSONResponse(body, status_code=status)
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])

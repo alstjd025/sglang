@@ -36,8 +36,9 @@ class HaloAdmissionGate:
     """Runs the KV-cache hard cap, then the selected admission policy."""
 
     def __init__(
-        self, policy: AdmissionPolicy, kv_cap_ratio: float = 0.0
+        self, policy: Optional[AdmissionPolicy], kv_cap_ratio: float = 0.0
     ) -> None:
+        # policy None ⇒ admission_policy="off": the gate runs only the KV cap.
         self.policy = policy
         # kv_cap_ratio in (0, 1]: reject when KV usage ≥ ratio. 0 disables it.
         self.kv_cap_ratio = kv_cap_ratio
@@ -46,13 +47,12 @@ class HaloAdmissionGate:
         self, new_req: NewRequestInput, state: ServerStateSnapshot
     ) -> AdmissionResult:
         # ── Stage B′: KV-cache hard cap (policy-independent) ──────────────
-        if (
-            0.0 < self.kv_cap_ratio <= 1.0
-            and state.kv_usage_ratio >= self.kv_cap_ratio
-        ):
+        if 0.0 < self.kv_cap_ratio <= 1.0 and state.kv_usage_ratio >= self.kv_cap_ratio:
             return AdmissionResult(admit=False, reason=REASON_KV_CAP)
 
-        # ── Selected policy ─────────────────────────────────────────────
+        # ── Selected policy (None ⇒ admission off, KV cap only) ──────────
+        if self.policy is None:
+            return AdmissionResult(admit=True, reason=REASON_ADMIT)
         decision = self.policy.decide(new_req, state)
         return AdmissionResult(
             admit=decision.admit,

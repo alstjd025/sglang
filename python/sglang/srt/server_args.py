@@ -374,19 +374,25 @@ class ServerArgs:
     admission_tbt_reactive_ratio: float = 0.9
     admission_dry_run: bool = False
     admission_decision_log: Optional[str] = None
-    # HALO: Project Halo Phase 1 — job-level slowdown tracking.
+    # HALO: Project Halo — request-level admission control + tracking.
     # See managers/halo/CLAUDE.md. Off by default; when off, zero impact.
     halo_enabled: bool = False
-    halo_default_slo: float = 5.0
     halo_tick_interval_ms: float = 100.0
-    halo_aggregator: str = "max+mean"
-    halo_job_log: Optional[str] = None
+    # Admission policy: off | mooncake | vss | reactive.
+    halo_admission_policy: str = "off"
+    # TTFT/TBT SLO interpretation: "ratio" (vs solo) or "absolute" (ms).
+    halo_slo_mode: str = "ratio"
+    halo_admission_violation_threshold: float = 0.2  # vss policy
+    halo_tbt_reactive_ratio: float = 0.9  # mooncake Stage-3 EWMA
+    halo_admission_dry_run: bool = False  # log only; admit
+    halo_admission_decision_log: Optional[str] = None  # JSONL path
+    # Stage B′ KV-cache hard cap: reject when the KV-cache pool usage ratio
+    # is at/above this value. Active iff 0 < ratio ≤ 1 (0.0 = disabled);
+    # independent of halo_admission_policy.
+    halo_admission_kv_cap_ratio: float = 0.0
+    # Cost models (request-level admission policies + solo baselines).
     halo_prefill_cost_model_path: Optional[str] = None
     halo_tbt_cost_model_path: Optional[str] = None
-    # Halo Step Cost Model (post-Phase-1 follow-up — see
-    # ms_dev/halo_dev/prediction_model.md). When set, the SlowdownTracker
-    # ignores the legacy two-path pair above and uses this 6-coefficient
-    # unified step model. When None, legacy behavior is preserved.
     halo_step_cost_model_path: Optional[str] = None
     # Per-step JSONL sampler for fitting the Halo Step Cost Model. When unset,
     # the sampler is not instantiated and the hot-path hook short-circuits on
@@ -394,32 +400,6 @@ class ServerArgs:
     halo_cost_model_sample_log: Optional[str] = None
     # Subsample rate: write every Nth step. Default 1 (every step).
     halo_cost_model_sample_every: int = 1
-    # ── Phase 2 admission control ──────────────────────────────────────
-    # See ms_dev/halo_dev/admission_design.md.
-    halo_admission_mode: str = "off"  # off | job | request
-    halo_admission_violation_threshold: float = 0.2  # D3
-    halo_admission_lookahead_horizon_sec: float = 0.0  # 0 = SLO-driven
-    halo_admission_dry_run: bool = False  # log only; admit
-    halo_admission_decision_log: Optional[str] = None  # JSONL path
-    # Stage B′ KV-cache hard cap: reject a new job's first request when the
-    # KV-cache pool usage ratio is at/above this value. Active iff
-    # 0 < ratio < 1 (default 0.0 = disabled); independent of
-    # halo_admission_mode.
-    halo_admission_kv_cap_ratio: float = 0.0
-    # Q13: pre-registered programs that never get an LLM request are dropped
-    # after this many seconds. Set to 0 to keep them indefinitely.
-    halo_program_idle_timeout_seconds: float = 300.0
-    # JSONL job-log write interval (seconds). The slowdown sweep itself
-    # runs every halo_tick_interval_ms, but the log gets a verbose
-    # per-sweep snapshot — writing every sweep blows up jsonl size on
-    # long runs. 0 → write every sweep.
-    halo_job_log_interval_seconds: float = 10.0
-    # Safety-net timeout: when a job has had no admit/finish activity for
-    # this many seconds, force COMPLETE so gc_completed can drop it.
-    # Catches clients that crashed or forgot to send halo_job_done. Set
-    # to 0 to disable. Tune up for workloads with legitimately long
-    # mid-chain waits (human-in-the-loop, external API, etc.).
-    halo_quiescent_timeout_seconds: float = 300.0
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
@@ -4627,92 +4607,51 @@ class ServerArgs:
             default=ServerArgs.admission_decision_log,
             help="Append every admission decision as a JSONL row to this path. Consumed by tools/admission_control/replay_admission.py.",
         )
-        # HALO: Project Halo Phase 1 — job-level slowdown tracking.
+        # HALO: Project Halo — request-level admission control + tracking.
         # See managers/halo/CLAUDE.md.
         parser.add_argument(
             "--halo-enabled",
             action="store_true",
             default=ServerArgs.halo_enabled,
-            help="Enable Project Halo Phase 1 job-level slowdown tracking. Off by default. When enabled, requests MUST carry halo_job_id (HTTP 400 otherwise).",
-        )
-        parser.add_argument(
-            "--halo-default-slo",
-            type=float,
-            default=ServerArgs.halo_default_slo,
-            help="Default slowdown SLO (multiplier of solo-run) used when a request omits halo_slo. E.g., 5.0 means job e2e latency may be at most 5x its solo-run baseline.",
+            help="Enable Project Halo request-level admission control + tracking. Off by default; when off, zero impact.",
         )
         parser.add_argument(
             "--halo-tick-interval-ms",
             type=float,
             default=ServerArgs.halo_tick_interval_ms,
-            help="Min wall-clock interval (ms) between Halo slowdown-tracker sweeps. Lower = finer time resolution at higher overhead.",
+            help="Min wall-clock interval (ms) between Halo request-tracker ticks.",
         )
         parser.add_argument(
-            "--halo-aggregator",
+            "--halo-admission-policy",
             type=str,
-            default=ServerArgs.halo_aggregator,
-            help="Reserved. Phase 1 always tracks (max, mean). Phase 2 may use this to pick the policy-relevant aggregate.",
+            choices=("off", "mooncake", "vss", "reactive"),
+            default=ServerArgs.halo_admission_policy,
+            help="Halo admission policy. 'off' = no policy (KV cap still applies). 'mooncake' = per-request predictive TTFT/TBT gate. 'vss' = per-request memoryless virtual-server-slowdown gate. 'reactive' = measured queueing-inclusive gate (Phase 3). See managers/halo/CLAUDE.md.",
         )
         parser.add_argument(
-            "--halo-job-log",
+            "--halo-slo-mode",
             type=str,
-            default=ServerArgs.halo_job_log,
-            help="Per-sweep job snapshot JSONL path (rank-0 only). Auto-routed by run_experiment.py to <session>/halo_jobs.jsonl.",
-        )
-        parser.add_argument(
-            "--halo-prefill-cost-model-path",
-            type=str,
-            default=ServerArgs.halo_prefill_cost_model_path,
-            help="Prefill cost model JSON for Halo slowdown computation. Same schema as admission_control. Missing/malformed → Halo tracks job counters only, no slowdown math.",
-        )
-        parser.add_argument(
-            "--halo-tbt-cost-model-path",
-            type=str,
-            default=ServerArgs.halo_tbt_cost_model_path,
-            help="TBT cost model JSON for Halo slowdown computation. Same schema as admission_control.",
-        )
-        parser.add_argument(
-            "--halo-step-cost-model-path",
-            type=str,
-            default=ServerArgs.halo_step_cost_model_path,
-            help="Halo Step Cost Model JSON (form='halo_step_v1'). When set, supersedes --halo-prefill-cost-model-path and --halo-tbt-cost-model-path for Halo slowdown computation. See ms_dev/halo_dev/prediction_model.md.",
-        )
-        parser.add_argument(
-            "--halo-cost-model-sample-log",
-            type=str,
-            default=ServerArgs.halo_cost_model_sample_log,
-            help="Per-forward-step JSONL output for fitting the Halo Step Cost Model. Only rank attn_tp_rank==0 writes. When unset, the sampler is disabled (zero hot-path overhead).",
-        )
-        parser.add_argument(
-            "--halo-cost-model-sample-every",
-            type=int,
-            default=ServerArgs.halo_cost_model_sample_every,
-            help="Subsample rate for --halo-cost-model-sample-log: write every Nth step. Default 1 (every step). Increase to reduce JSONL size or hot-path queue pressure during long runs.",
-        )
-        parser.add_argument(
-            "--halo-admission-mode",
-            type=str,
-            choices=("off", "job", "request", "level0", "level2"),
-            default=ServerArgs.halo_admission_mode,
-            help="Halo Phase 2 predictive admission control mode. 'off' disables predictive admission (Phase 1 strict-mode still applies). 'job' is the job-scoped gate (decision once per job, at its first request). 'request' is the request-scoped baseline (decision on every request; a mid-chain request can be rejected). 'level0' is a deprecated alias of 'job'; 'level2' is the deprecated lookahead (falls back to 'job' with a WARN). See ms_dev/halo_dev/admission_design.md.",
+            choices=("ratio", "absolute"),
+            default=ServerArgs.halo_slo_mode,
+            help="Interpretation of per-request halo_ttft_slo / halo_tbt_slo: 'ratio' = slowdown bound vs solo-run baseline; 'absolute' = millisecond cap. (halo_e2e_slo is always a ratio.)",
         )
         parser.add_argument(
             "--halo-admission-violation-threshold",
             type=float,
             default=ServerArgs.halo_admission_violation_threshold,
-            help="Fraction in [0,1]. If more than this share of active jobs are predicted to exceed their SLO after admitting the new request, reject. Default 0.2 (20%%).",
+            help="vss policy: reject when more than this fraction [0,1] of in-flight requests are predicted to breach their SLO. Default 0.2.",
         )
         parser.add_argument(
-            "--halo-admission-lookahead-horizon-sec",
+            "--halo-tbt-reactive-ratio",
             type=float,
-            default=ServerArgs.halo_admission_lookahead_horizon_sec,
-            help="Level 2 lookahead horizon in seconds. 0 (default) means SLO-driven: simulate until the earliest SLO-violation moment across active jobs.",
+            default=ServerArgs.halo_tbt_reactive_ratio,
+            help="mooncake policy Stage-3: the reactive TBT EWMA trips at tbt_slo * this ratio (absolute slo_mode only). Default 0.9.",
         )
         parser.add_argument(
             "--halo-admission-dry-run",
             action="store_true",
             default=ServerArgs.halo_admission_dry_run,
-            help="Halo admission Phase 2 dry-run: compute the decision and write it to the decision log, but ALWAYS admit. Mirrors --admission-dry-run.",
+            help="Halo admission dry-run: compute + log the decision but ALWAYS admit.",
         )
         parser.add_argument(
             "--halo-admission-decision-log",
@@ -4724,25 +4663,37 @@ class ServerArgs:
             "--halo-admission-kv-cap-ratio",
             type=float,
             default=ServerArgs.halo_admission_kv_cap_ratio,
-            help="Stage B' KV-cache hard cap. Reject a new job's first request when the KV-cache pool usage ratio is at/above this value. Active iff 0 < ratio < 1; default 0.0 = disabled (set to e.g. 0.90 to enable). Independent of --halo-admission-mode (a KV-cap-only run uses mode=off). See ms_dev/halo_dev/admission_design.md.",
+            help="Stage B' KV-cache hard cap. Reject when the KV-cache pool usage ratio is at/above this value. Active iff 0 < ratio <= 1; default 0.0 = disabled. Independent of --halo-admission-policy.",
         )
         parser.add_argument(
-            "--halo-program-idle-timeout-seconds",
-            type=float,
-            default=ServerArgs.halo_program_idle_timeout_seconds,
-            help="HALO Option A: drop pre-registered programs that never receive an LLM request after this many seconds (default 300). Set to 0 to keep them indefinitely.",
+            "--halo-prefill-cost-model-path",
+            type=str,
+            default=ServerArgs.halo_prefill_cost_model_path,
+            help="Prefill cost model JSON (legacy two-model pair). Used by the mooncake policy + solo baselines when no step cost model is set.",
         )
         parser.add_argument(
-            "--halo-job-log-interval-seconds",
-            type=float,
-            default=ServerArgs.halo_job_log_interval_seconds,
-            help="HALO: how often (seconds) to append a full active-jobs snapshot to halo_jobs.jsonl. Default 10. Slowdown sweep + Prometheus gauges still update every tick_interval_ms; only the verbose JSONL log is throttled. Set to 0 to write every sweep (legacy).",
+            "--halo-tbt-cost-model-path",
+            type=str,
+            default=ServerArgs.halo_tbt_cost_model_path,
+            help="TBT cost model JSON (legacy two-model pair).",
         )
         parser.add_argument(
-            "--halo-quiescent-timeout-seconds",
-            type=float,
-            default=ServerArgs.halo_quiescent_timeout_seconds,
-            help="HALO: safety net. A job that hasn't seen any admit/finish for this many seconds is force-completed (then GC'd after retain_seconds). Catches clients that crashed or forgot to send halo_job_done. Default 300. Set to 0 to disable.",
+            "--halo-step-cost-model-path",
+            type=str,
+            default=ServerArgs.halo_step_cost_model_path,
+            help="Halo Step Cost Model JSON (form='halo_step_v1'). When set, supersedes the legacy prefill/tbt pair. Required by the vss policy. See ms_dev/halo_dev/prediction_model.md.",
+        )
+        parser.add_argument(
+            "--halo-cost-model-sample-log",
+            type=str,
+            default=ServerArgs.halo_cost_model_sample_log,
+            help="Per-forward-step JSONL output for fitting the Halo Step Cost Model. Only rank attn_tp_rank==0 writes. When unset, the sampler is disabled (zero hot-path overhead).",
+        )
+        parser.add_argument(
+            "--halo-cost-model-sample-every",
+            type=int,
+            default=ServerArgs.halo_cost_model_sample_every,
+            help="Subsample rate for --halo-cost-model-sample-log: write every Nth step. Default 1 (every step).",
         )
         parser.add_argument(
             "--max-total-tokens",

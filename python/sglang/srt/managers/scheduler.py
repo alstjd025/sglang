@@ -79,6 +79,16 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+
+# HALO: Project Halo — request-level admission control + tracking.
+# See managers/halo/CLAUDE.md.
+from sglang.srt.managers.halo import (
+    HaloController,
+    HaloMetrics,
+    HaloRejectError,
+    build_halo_controller_from_server_args,
+    build_halo_cost_sampler_from_server_args,
+)
 from sglang.srt.managers.halo.admission_control import (
     AdmissionConfig,
     AdmissionController,
@@ -90,19 +100,8 @@ from sglang.srt.managers.halo.admission_control import (
     try_load_prefill_cost_model,
     try_load_tbt_cost_model,
 )
-
-# HALO: Project Halo Phase 1 — job-level slowdown tracking.
-# See managers/halo/CLAUDE.md.
-from sglang.srt.managers.halo import (
-    HaloController,
-    HaloMetrics,
-    HaloRejectError,
-    RequestExecutionInfo,
-    build_halo_controller_from_server_args,
-    build_halo_cost_sampler_from_server_args,
-)
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-from sglang.srt.managers.io_struct import (  # HALO: Option A — POST /halo/programs IO structs.
+from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
@@ -133,8 +132,6 @@ from sglang.srt.managers.io_struct import (  # HALO: Option A — POST /halo/pro
     GetInternalStateReqOutput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
-    HaloRegisterProgramReqInput,
-    HaloRegisterProgramReqOutput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -1528,9 +1525,6 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
-                # HALO: Option A — POST /halo/programs.
-                # See managers/halo/CLAUDE.md.
-                (HaloRegisterProgramReqInput, self.register_halo_program),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -2163,16 +2157,13 @@ class Scheduler(
                 ),
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
-                # HALO: forward Project Halo Phase 1 job-level metadata so
-                # _halo_register_or_abort sees the same values the client
-                # sent. Phase 1's initial integration plumbed these into
-                # io_struct + Req but missed this Req(...) call site, so
-                # every LLM request ended up with halo_job_id=None →
-                # always-reject. See managers/halo/CLAUDE.md.
-                halo_job_id=recv_req.halo_job_id,
-                halo_slo=recv_req.halo_slo,
+                # HALO: forward request-level admission metadata so the
+                # admission gate sees the values the client sent.
+                # See managers/halo/CLAUDE.md.
+                halo_ttft_slo=recv_req.halo_ttft_slo,
+                halo_tbt_slo=recv_req.halo_tbt_slo,
+                halo_e2e_slo=recv_req.halo_e2e_slo,
                 halo_bypass=recv_req.halo_bypass,
-                halo_job_done=recv_req.halo_job_done,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -2364,10 +2355,10 @@ class Scheduler(
             # admission control — see managers/halo/admission_control/CLAUDE.md
             if self._abort_on_predicted_slo_violation(req):
                 return
-            # HALO: Phase 1 job-level register hook. Strict mode — rejects
-            # with HTTP 400 if --halo-enabled is on and req.halo_job_id is
-            # missing. See managers/halo/CLAUDE.md.
-            if self._halo_register_or_abort(req):
+            # HALO: request-level admission gate. Rejects with HTTP 400
+            # when the selected policy / KV cap declines the request.
+            # See managers/halo/CLAUDE.md.
+            if self._halo_admission_gate(req):
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
@@ -2591,95 +2582,46 @@ class Scheduler(
     # HALO: Project Halo Phase 1 — see managers/halo/CLAUDE.md.
     # ------------------------------------------------------------------
 
-    def _halo_register_or_abort(self, recv_req: Req) -> bool:
-        """Register the request with the Halo controller. Returns True iff
-        the request was rejected (HTTP 400 sent) so the caller skips queueing.
+    def _halo_admission_gate(self, recv_req: Req) -> bool:
+        """Run the Halo admission gate. Returns True iff the request was
+        rejected (HTTP 400 sent) so the caller skips queueing.
 
-        Phase 1 strict mode: when --halo-enabled, requests MUST carry
-        halo_job_id; missing → reject with HTTP 400. Missing halo_slo falls
-        back to --halo-default-slo (see HaloController).
+        The gate runs the KV-cache hard cap then the selected admission
+        policy (see managers/halo/CLAUDE.md). Server-internal traffic
+        (warmup, loopback) carries halo_bypass and skips the gate.
         """
         controller = getattr(self, "halo_controller", None)
         if controller is None:
             return False
-        # HALO: server-internal requests (warmup, self-loopback) bypass the
-        # admission gate entirely so strict mode (Q7/Q12) doesn't reject
-        # traffic the user never issued.
         if getattr(recv_req, "halo_bypass", False):
             return False
-        # Compute prefix match length *before* the admission call — Phase 2
-        # Stage A needs (prompt_len, prefix_len) to score the new arrival's
-        # contribution to the batch. We reuse the admission_control helper
-        # so the two paths see the exact same number (avoids drift).
+
         prompt_len = len(getattr(recv_req, "origin_input_ids", None) or [])
         try:
             prefix_len = self._admission_match_prefix_len(recv_req)
-        except Exception:  # noqa: BLE001 — Halo must never crash request path
+        except Exception:  # noqa: BLE001 — Halo must never crash the request path
             prefix_len = 0
-        # Snapshot of currently in-flight Halo requests. The same builder
-        # the periodic sweep uses — keeps Stage A consistent with R1.
-        active_infos = (
-            self._halo_build_request_execution_infos()
-            if getattr(controller, "admission_predictor", None) is not None
-            else None
-        )
-        # Stage B′ KV cap — current KV-cache pool usage ratio (0..1). Only
-        # fetched when the controller has the KV cap enabled; guarded so
-        # Halo never crashes the request path.
-        kv_usage_ratio = None
-        if getattr(controller, "kv_cap_enabled", False):
-            try:
-                kv_usage_ratio = self.get_pool_stats().get_kv_token_stats()[1]
-            except Exception:  # noqa: BLE001 — Halo must never crash request path
-                kv_usage_ratio = None
+        try:
+            kv_usage_ratio = self.get_pool_stats().get_kv_token_stats()[1]
+        except Exception:  # noqa: BLE001 — Halo must never crash the request path
+            kv_usage_ratio = 0.0
 
         try:
             controller.register_request(
-                rid=recv_req.rid,
-                halo_job_id=getattr(recv_req, "halo_job_id", None),
-                halo_slo=getattr(recv_req, "halo_slo", None),
+                recv_req.rid,
+                ttft_slo=getattr(recv_req, "halo_ttft_slo", None),
+                tbt_slo=getattr(recv_req, "halo_tbt_slo", None),
+                e2e_slo=getattr(recv_req, "halo_e2e_slo", None),
                 prompt_len=prompt_len,
                 prefix_len=prefix_len,
-                active_request_infos=active_infos,
                 kv_usage_ratio=kv_usage_ratio,
-                # Effective chunked-prefill token budget — bounds the Stage A
-                # EXTEND-step cost so the prefill term can't blow up (결함 A).
-                chunked_prefill_size=getattr(self, "chunked_prefill_size", None),
             )
         except HaloRejectError as e:
-            # HALO: per managers/halo/CLAUDE.md §13 Q7 + Q12 +
-            # admission_design.md (Phase 2). Reason-specific message so the
-            # client can distinguish missing field / missing pre-registration
-            # / predictive rejection.
-            if e.reason == "HALO_PROGRAM_NOT_REGISTERED":
-                message = (
-                    "Halo rejected: program not pre-registered. Call "
-                    "POST /halo/programs with this halo_job_id before issuing "
-                    "LLM requests."
-                )
-            elif e.reason == "HALO_ADMISSION_PREDICTED":
-                message = (
-                    "Halo rejected: predictive admission gate — admitting this "
-                    "request would push too many active jobs over their SLO. "
-                    "Retry later or raise --halo-admission-violation-threshold."
-                )
-            elif e.reason == "HALO_CONCURRENCY_CAP":
-                message = (
-                    "Halo rejected: per-job concurrency cap exceeded "
-                    "(declared_max_concurrency in register_program). "
-                    "Wait for an in-flight call to finish before retrying."
-                )
-            elif e.reason == "HALO_KV_CAP":
-                message = (
-                    "Halo rejected: KV-cache pool near capacity. The server "
-                    "is at/above the configured KV-cap ratio "
-                    "(--halo-admission-kv-cap-ratio); retry later."
-                )
-            else:
-                message = (
-                    "Halo rejected: missing halo_job_id. --halo-enabled is on; "
-                    "include halo_job_id in the request body."
-                )
+            message = (
+                f"Halo admission gate rejected this request (reason={e.reason}). "
+                "The server is shedding load to protect request SLOs; "
+                "retry later."
+            )
             logger.info("[halo] REJECT rid=%s reason=%s", recv_req.rid, e.reason)
             self.send_to_tokenizer.send_output(
                 AbortReq(
@@ -2697,141 +2639,43 @@ class Scheduler(
                 abort_info={"reason": message, "halo_reason": e.reason}
             )
             return True
-
-        recv_req.halo_first_admitted_ts = time.monotonic()
-        recv_req.halo_prefix_len_at_admission = prefix_len
         return False
 
     def _halo_on_request_finished(self, req: Req) -> None:
-        """Called from the scheduler's per-request finish path. No-op if Halo off.
-
-        Builds the finished request's final snapshot so the controller can
-        freeze its time span onto the owning job (lifetime VJS), and forwards
-        the client's `halo_job_done` flag so the controller can explicitly
-        transition the job to COMPLETE on the chain's last call. See
-        managers/halo/CLAUDE.md and halo_api_reference.md.
-        """
+        """Scheduler finish-path hook — finalize the request's tracker
+        record. No-op when Halo is off."""
         controller = getattr(self, "halo_controller", None)
         if controller is None:
             return
-        finished_info = None
-        job_id = getattr(req, "halo_job_id", None)
-        t0 = getattr(req, "halo_first_admitted_ts", None)
-        if job_id is not None and t0 is not None:
-            finished_info = RequestExecutionInfo(
-                rid=req.rid,
-                job_id=job_id,
-                prompt_len=len(req.origin_input_ids or []),
-                prefix_len_at_admission=getattr(req, "halo_prefix_len_at_admission", 0),
-                decoded_tokens_so_far=len(getattr(req, "output_ids", []) or []),
-                kv_len_now=int(getattr(req, "kv_committed_len", 0) or 0),
-                elapsed_ms=(time.monotonic() - t0) * 1000.0,
-                admitted_ts=t0,
-            )
         controller.on_request_finished(
             req.rid,
-            finished_info=finished_info,
-            halo_job_done=getattr(req, "halo_job_done", False),
+            decoded_tokens=len(getattr(req, "output_ids", []) or []),
+            kv_len=int(getattr(req, "kv_committed_len", 0) or 0),
         )
 
-    def _halo_build_request_execution_infos(self) -> List[RequestExecutionInfo]:
-        """Snapshot the in-flight Halo-tracked requests for the periodic sweep.
-
-        Pulls from both the running batch and the waiting queue so that a job
-        whose request is waiting still shows up as "slow" if the queue is long.
-        Each info is a plain dataclass — no scheduler references leak into the
-        Halo module.
-        """
-        controller = getattr(self, "halo_controller", None)
-        if controller is None:
-            return []
-        infos: List[RequestExecutionInfo] = []
-        now = time.monotonic()
-
-        def _add(req: Req, kv_len_now: int, decoded_so_far: int) -> None:
-            if getattr(req, "halo_job_id", None) is None:
-                return
-            t0 = getattr(req, "halo_first_admitted_ts", None)
-            if t0 is None:
-                return
-            infos.append(
-                RequestExecutionInfo(
-                    rid=req.rid,
-                    job_id=req.halo_job_id,
-                    prompt_len=len(req.origin_input_ids or []),
-                    prefix_len_at_admission=getattr(
-                        req, "halo_prefix_len_at_admission", 0
-                    ),
-                    decoded_tokens_so_far=decoded_so_far,
-                    kv_len_now=kv_len_now,
-                    elapsed_ms=(now - t0) * 1000.0,
-                    admitted_ts=t0,
-                )
-            )
-
-        # Waiting queue: decoded_so_far=0, kv_len_now=0 (request hasn't run yet).
-        for req in self.waiting_queue:
-            _add(req, kv_len_now=0, decoded_so_far=0)
-
-        # Running batch: pull KV and decoded counters from each Req.
+    def _halo_running_infos(self) -> List[Tuple[str, int, int]]:
+        """(rid, decoded_tokens, kv_len) for every running-batch request —
+        the per-tick progress feed for the request tracker."""
+        infos: List[Tuple[str, int, int]] = []
         running = getattr(self, "running_batch", None)
         if running is not None and getattr(running, "reqs", None):
             for req in running.reqs:
-                kv_len = int(getattr(req, "kv_committed_len", 0) or 0)
-                decoded = len(getattr(req, "output_ids", []) or [])
-                _add(req, kv_len_now=kv_len, decoded_so_far=decoded)
-
+                infos.append(
+                    (
+                        req.rid,
+                        len(getattr(req, "output_ids", []) or []),
+                        int(getattr(req, "kv_committed_len", 0) or 0),
+                    )
+                )
         return infos
 
-    def register_halo_program(
-        self, recv_req: HaloRegisterProgramReqInput
-    ) -> HaloRegisterProgramReqOutput:
-        """HALO: Option A scheduler handler for `POST /halo/programs`.
-
-        Called via the request dispatcher (zmq from TokenizerManager).
-        Off path: when Halo is disabled, returns `registered=False` with
-        REASON_DISABLED so HTTP layer returns 400; we never start a Job.
-
-        See managers/halo/CLAUDE.md §11.7 and §13 Q9-Q14.
-        """
-        controller = getattr(self, "halo_controller", None)
-        if controller is None:
-            return HaloRegisterProgramReqOutput(
-                registered=False,
-                job_id=recv_req.job_id,
-                reason="HALO_DISABLED",
-            )
-        result = controller.register_program(
-            job_id=recv_req.job_id,
-            slo=recv_req.slo,
-            total_calls=recv_req.total_calls,
-            stage_sequence=recv_req.stage_sequence,
-            expected_input_lens=recv_req.expected_input_lens,
-            expected_output_lens=recv_req.expected_output_lens,
-            dag=recv_req.dag,
-            declared_max_concurrency=getattr(
-                recv_req, "declared_max_concurrency", None
-            ),
-        )
-        return HaloRegisterProgramReqOutput(
-            registered=result.registered,
-            job_id=result.job_id,
-            reason=result.reason,
-            active_jobs=result.active_jobs,
-            existing=result.existing,
-        )
-
     def _halo_maybe_tick(self) -> None:
-        """Wall-clock-gated tick. Called once per scheduler-loop iteration.
-
-        The controller itself checks the wall-clock interval (`should_tick`)
-        and skips if not due — this keeps the hot-path cost to ~1 attribute
-        access + 1 monotonic() when off, and trivially cheap when on.
-        """
+        """Wall-clock-gated tick. Called once per scheduler-loop iteration;
+        the controller checks the interval and skips when not due."""
         controller = getattr(self, "halo_controller", None)
         if controller is None:
             return
-        controller.tick(self._halo_build_request_execution_infos)
+        controller.tick(self._halo_running_infos())
 
     def _abort_on_waiting_timeout(self):
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:

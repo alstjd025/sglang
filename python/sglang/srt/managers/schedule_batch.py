@@ -607,12 +607,12 @@ class Req(ReqDllmMixin):
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
-        # HALO: Project Halo Phase 1 — job-level slowdown tracking.
+        # HALO: Project Halo — request-level admission control.
         # See managers/halo/CLAUDE.md.
-        halo_job_id: Optional[str] = None,
-        halo_slo: Optional[float] = None,
+        halo_ttft_slo: Optional[float] = None,
+        halo_tbt_slo: Optional[float] = None,
+        halo_e2e_slo: Optional[float] = None,
         halo_bypass: bool = False,
-        halo_job_done: bool = False,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -689,20 +689,14 @@ class Req(ReqDllmMixin):
         self.lora_id = lora_id
         self.routing_key = routing_key
 
-        # HALO: Phase 1 job-level metadata stashed on the Req.
-        # halo_first_admitted_ts is set by the scheduler at admission time
-        # (see managers/halo/CLAUDE.md) and consumed by SlowdownTracker.
-        # halo_bypass=True means "skip the Halo admission gate" — used by
-        # server-internal traffic (warmup, self-loopback).
-        self.halo_job_id = halo_job_id
-        self.halo_slo = halo_slo
+        # HALO: request-level admission metadata stashed on the Req.
+        # The per-request SLOs the admission gate reads; halo_bypass=True
+        # means "skip the Halo admission gate" — used by server-internal
+        # traffic (warmup, self-loopback). See managers/halo/CLAUDE.md.
+        self.halo_ttft_slo = halo_ttft_slo
+        self.halo_tbt_slo = halo_tbt_slo
+        self.halo_e2e_slo = halo_e2e_slo
         self.halo_bypass = halo_bypass
-        self.halo_job_done = halo_job_done
-        self.halo_first_admitted_ts: Optional[float] = None
-        # Prefix-cache match length captured at admission time (used by Halo
-        # to compute solo-run baseline; matches admission_control's snapshot
-        # of the same value).
-        self.halo_prefix_len_at_admission: int = 0
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None

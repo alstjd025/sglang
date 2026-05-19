@@ -1,170 +1,142 @@
-"""Prometheus metrics for Halo (Project Halo Phase 1).
+"""Prometheus metrics for Halo (request-level).
 
-Mirrors `admission_control/metrics.py`. Instantiated once per scheduler
-process by `scheduler.init_halo`, gated on `--enable-metrics` and
-rank-0 the same way (so a TP=N deployment doesn't inflate counter
-values by tp_size).
+Instantiated once per scheduler process by `scheduler.init_halo`, gated on
+`--enable-metrics` + rank-0 the same way as `admission_control/metrics.py`
+(so a TP=N deployment doesn't inflate counter values by tp_size).
 
-See managers/halo/CLAUDE.md and ms_dev/expctl/CLAUDE.md.
+Per-request quantities (TTFT, TBT, e2e, e2e-slowdown) are *histograms* —
+one observation per finished request — so percentiles come for free.
+Only genuinely-current state (active request count) is a gauge.
+
+See managers/halo/CLAUDE.md.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Iterable
+from typing import TYPE_CHECKING, Dict
 
 if TYPE_CHECKING:  # pragma: no cover
-    from sglang.srt.managers.halo.job import Job
+    from sglang.srt.managers.halo.request_tracker.record import RequestRecord
+
+# Slowdown-ratio histogram buckets (dimensionless: actual / solo).
+_SLOWDOWN_BUCKETS = (1.0, 1.25, 1.5, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0)
+# Latency histogram buckets (seconds).
+_LATENCY_BUCKETS = (
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+)
 
 
 class HaloMetrics:
-    """Prometheus metric set for Halo.
-
-    The collector uses the same allowlist pattern as admission_control —
-    metric names are exact-matched in run_experiment.py so they get
-    persisted into `<session>/metrics/server_metrics.jsonl` and rendered
-    by `monitoring_view`.
-    """
+    """Prometheus metric set for request-level Halo."""
 
     def __init__(self, labels: Dict[str, str], registry=None) -> None:
-        from prometheus_client import Counter, Gauge
+        from prometheus_client import Counter, Gauge, Histogram
 
         self._labels = labels
         label_keys = list(labels.keys())
-        common_kwargs = {"registry": registry} if registry is not None else {}
+        common = {"registry": registry} if registry is not None else {}
         gauge_extra = (
             {} if registry is not None else {"multiprocess_mode": "mostrecent"}
         )
 
-        # ---- counters (lifecycle events) ----
-        self._programs_registered_total = Counter(
-            name="sglang:halo_programs_registered_total",
-            documentation=(
-                "Halo: number of successful POST /halo/programs registrations."
-            ),
-            labelnames=label_keys,
-            **common_kwargs,
-        )
-        self._programs_rejected_total = Counter(
-            name="sglang:halo_programs_rejected_total",
-            documentation=(
-                "Halo: rejected POST /halo/programs requests. "
-                "labels: reason in {JOB_ID_ALREADY_REGISTERED, HALO_DISABLED}."
-            ),
-            labelnames=label_keys + ["reason"],
-            **common_kwargs,
-        )
-        self._requests_admitted_total = Counter(
+        # ---- counters (admission events) ----
+        self._admitted_total = Counter(
             name="sglang:halo_requests_admitted_total",
-            documentation=("Halo: LLM requests admitted into a registered job."),
+            documentation="Halo: requests admitted by the admission gate.",
             labelnames=label_keys,
-            **common_kwargs,
+            **common,
         )
-        self._requests_rejected_total = Counter(
+        self._rejected_total = Counter(
             name="sglang:halo_requests_rejected_total",
             documentation=(
-                "Halo: LLM requests rejected by the job-level admission gate. "
-                "labels: reason in {HALO_NO_JOB_ID, HALO_PROGRAM_NOT_REGISTERED, "
-                "HALO_ADMISSION_PREDICTED, HALO_CONCURRENCY_CAP, HALO_KV_CAP}."
+                "Halo: requests rejected by the admission gate. labels: "
+                "reason in {HALO_KV_CAP, MOONCAKE_TTFT, MOONCAKE_TBT, "
+                "MOONCAKE_TBT_REACTIVE, HALO_VSS_PREDICTED}."
             ),
             labelnames=label_keys + ["reason"],
-            **common_kwargs,
-        )
-        self._slo_violations_total = Counter(
-            name="sglang:halo_slo_violations_total",
-            documentation=(
-                "Halo: per-sweep increments where a job's virtual job "
-                "slowdown exceeded its SLO bound."
-            ),
-            labelnames=label_keys,
-            **common_kwargs,
+            **common,
         )
 
-        # ---- gauges (sweep-derived live state) ----
-        self._active_jobs = Gauge(
-            name="sglang:halo_active_jobs",
-            documentation="Halo: number of jobs in QUEUED or RUNNING state.",
+        # ---- histograms (one observation per finished request) ----
+        self._ttft_seconds = Histogram(
+            name="sglang:halo_request_ttft_seconds",
+            documentation="Halo: measured per-request time-to-first-token.",
             labelnames=label_keys,
-            **gauge_extra,
-            **common_kwargs,
+            buckets=_LATENCY_BUCKETS,
+            **common,
         )
-        self._total_known_jobs = Gauge(
-            name="sglang:halo_total_known_jobs",
+        self._tbt_seconds = Histogram(
+            name="sglang:halo_request_tbt_seconds",
+            documentation="Halo: measured per-request mean time-between-tokens.",
+            labelnames=label_keys,
+            buckets=_LATENCY_BUCKETS,
+            **common,
+        )
+        self._e2e_seconds = Histogram(
+            name="sglang:halo_request_e2e_seconds",
+            documentation="Halo: measured per-request end-to-end latency.",
+            labelnames=label_keys,
+            buckets=_LATENCY_BUCKETS,
+            **common,
+        )
+        self._e2e_slowdown = Histogram(
+            name="sglang:halo_request_e2e_slowdown",
             documentation=(
-                "Halo: total jobs the registry currently knows (active + "
-                "completed-but-not-GC'd)."
+                "Halo: measured per-request end-to-end slowdown "
+                "(actual e2e / solo-run e2e)."
             ),
             labelnames=label_keys,
-            **gauge_extra,
-            **common_kwargs,
+            buckets=_SLOWDOWN_BUCKETS,
+            **common,
         )
-        self._mean_vjs = Gauge(
-            name="sglang:halo_mean_vjs",
-            documentation=(
-                "Halo: mean over active jobs of each job's virtual job "
-                "slowdown — fleet-average slowdown."
-            ),
+
+        # ---- gauge (current state) ----
+        self._active_requests = Gauge(
+            name="sglang:halo_active_requests",
+            documentation="Halo: requests currently QUEUED or RUNNING.",
             labelnames=label_keys,
             **gauge_extra,
-            **common_kwargs,
-        )
-        self._max_vjs = Gauge(
-            name="sglang:halo_max_vjs",
-            documentation=(
-                "Halo: max over active jobs of virtual job slowdown — the "
-                "worst single job seen this sweep."
-            ),
-            labelnames=label_keys,
-            **gauge_extra,
-            **common_kwargs,
+            **common,
         )
 
     # ------------------------------------------------------------------
-    # Counter increments (called from controller)
+    # Counter increments — called from the controller's admission hook.
     # ------------------------------------------------------------------
-
-    def record_program_registered(self) -> None:
-        self._programs_registered_total.labels(**self._labels).inc()
-
-    def record_program_rejected(self, reason: str) -> None:
-        self._programs_rejected_total.labels(**self._labels, reason=reason).inc()
 
     def record_request_admitted(self) -> None:
-        self._requests_admitted_total.labels(**self._labels).inc()
+        self._admitted_total.labels(**self._labels).inc()
 
     def record_request_rejected(self, reason: str) -> None:
-        self._requests_rejected_total.labels(**self._labels, reason=reason).inc()
+        self._rejected_total.labels(**self._labels, reason=reason).inc()
 
     # ------------------------------------------------------------------
-    # Sweep — gauges from the active-jobs snapshot
+    # Per-finished-request observations.
     # ------------------------------------------------------------------
 
-    def update_from_sweep(
-        self,
-        active_jobs: Iterable["Job"],
-        total_known: int,
-        slo_violations_delta: int,
-    ) -> None:
-        """Called after every sweep with the current set of active jobs."""
-        actives = list(active_jobs)
-        n = len(actives)
-        self._active_jobs.labels(**self._labels).set(n)
-        self._total_known_jobs.labels(**self._labels).set(total_known)
+    def observe_finished(self, record: "RequestRecord") -> None:
+        """Record the terminal latency + slowdown of one finished request."""
+        if record.ttft_ms is not None:
+            self._ttft_seconds.labels(**self._labels).observe(record.ttft_ms / 1e3)
+        if record.tbt_mean_ms is not None:
+            self._tbt_seconds.labels(**self._labels).observe(record.tbt_mean_ms / 1e3)
+        if record.e2e_ms is not None:
+            self._e2e_seconds.labels(**self._labels).observe(record.e2e_ms / 1e3)
+        if record.e2e_slowdown is not None:
+            self._e2e_slowdown.labels(**self._labels).observe(record.e2e_slowdown)
 
-        if slo_violations_delta > 0:
-            self._slo_violations_total.labels(**self._labels).inc(slo_violations_delta)
+    # ------------------------------------------------------------------
+    # Gauge refresh — called from the periodic tick.
+    # ------------------------------------------------------------------
 
-        if n == 0:
-            # No active jobs — zero out the slowdown gauges so the panel
-            # doesn't show a stale spike.
-            self._mean_vjs.labels(**self._labels).set(0.0)
-            self._max_vjs.labels(**self._labels).set(0.0)
-            return
-
-        sum_vjs = 0.0
-        peak_vjs = 0.0
-        for j in actives:
-            sum_vjs += j.virtual_job_slowdown
-            if j.virtual_job_slowdown > peak_vjs:
-                peak_vjs = j.virtual_job_slowdown
-        self._mean_vjs.labels(**self._labels).set(sum_vjs / n)
-        self._max_vjs.labels(**self._labels).set(peak_vjs)
+    def update_gauges(self, *, active_requests: int) -> None:
+        self._active_requests.labels(**self._labels).set(active_requests)

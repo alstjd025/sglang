@@ -126,12 +126,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
-            # HALO: forward Project Halo Phase 1 job-level metadata.
+            # HALO: forward request-level admission metadata.
             # See managers/halo/CLAUDE.md.
-            halo_job_id=request.halo_job_id,
-            halo_slo=request.halo_slo,
+            halo_ttft_slo=request.halo_ttft_slo,
+            halo_tbt_slo=request.halo_tbt_slo,
+            halo_e2e_slo=request.halo_e2e_slo,
             halo_bypass=bool(request.halo_bypass),
-            halo_job_done=bool(request.halo_job_done),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
         )

@@ -227,24 +227,20 @@ class GenerateReqInput(BaseReq):
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
-    # HALO: Project Halo Phase 1 — job-level slowdown tracking.
-    # See managers/halo/CLAUDE.md. Both fields are optional from the
-    # client side; when --halo-enabled is on, halo_job_id is required
-    # (server rejects HTTP 400 if absent).
-    halo_job_id: Optional[str] = None
-    halo_slo: Optional[float] = None
+    # HALO: Project Halo — request-level admission control.
+    # See managers/halo/CLAUDE.md. Per-request SLOs — all optional; each
+    # admission policy uses whichever ones it can speak to. ttft/tbt are
+    # interpreted as absolute ms or as a slowdown ratio per --halo-slo-mode;
+    # e2e is always a slowdown ratio (actual e2e / solo-run e2e).
+    halo_ttft_slo: Optional[float] = None
+    halo_tbt_slo: Optional[float] = None
+    halo_e2e_slo: Optional[float] = None
     # HALO: skip the Halo admission gate entirely for this request. Used
-    # by server-internal traffic (warmup, self-loopback) so strict mode
+    # by server-internal traffic (warmup, self-loopback) so the gate
     # doesn't trip on requests the user never issued. Real clients should
     # leave this False — it's not a security boundary, just a way to mark
     # server-emitted requests as "not real user traffic".
     halo_bypass: bool = False
-    # HALO: explicit "this is the last LLM call of the job" signal. When
-    # true, the server marks the owning job COMPLETE on this request's
-    # finish so it can be GC'd. Decouples job termination from "remaining
-    # call count == 0", which is fragile when DAGs are dynamic (tool
-    # delays, conditional branches, parallel rounds). See halo_api_reference.md.
-    halo_job_done: bool = False
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -705,10 +701,10 @@ class GenerateReqInput(BaseReq):
             priority=self.priority,
             extra_key=self.extra_key,
             # HALO: passthrough fields to TokenizedGenerateReqInput.
-            halo_job_id=self.halo_job_id,
-            halo_slo=self.halo_slo,
+            halo_ttft_slo=self.halo_ttft_slo,
+            halo_tbt_slo=self.halo_tbt_slo,
+            halo_e2e_slo=self.halo_e2e_slo,
             halo_bypass=self.halo_bypass,
-            halo_job_done=self.halo_job_done,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -796,11 +792,11 @@ class TokenizedGenerateReqInput(BaseReq):
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
-    # HALO: Project Halo Phase 1 — see managers/halo/CLAUDE.md.
-    halo_job_id: Optional[str] = None
-    halo_slo: Optional[float] = None
+    # HALO: Project Halo — request-level admission. See managers/halo/CLAUDE.md.
+    halo_ttft_slo: Optional[float] = None
+    halo_tbt_slo: Optional[float] = None
+    halo_e2e_slo: Optional[float] = None
     halo_bypass: bool = False
-    halo_job_done: bool = False
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -1273,32 +1269,6 @@ class FlushCacheReqInput(BaseReq):
 class FlushCacheReqOutput(BaseReq):
     success: bool
     message: str = ""
-
-
-# HALO: Project Halo Phase 1 Option A — pre-registration IO structs.
-# See managers/halo/CLAUDE.md §11 and ms_dev/halo_dev/CLAUDE.md §13.
-# Routed HTTP → tokenizer_manager → scheduler, mirroring flush_cache.
-@dataclass
-class HaloRegisterProgramReqInput(BaseReq):
-    job_id: str = ""
-    slo: float = 0.0
-    total_calls: Optional[int] = None
-    stage_sequence: Optional[List[str]] = None
-    expected_input_lens: Optional[List[int]] = None
-    expected_output_lens: Optional[List[int]] = None
-    dag: Optional[Dict[str, Any]] = None
-    # Phase 2 — Stage B: application's promise for the maximum in-flight
-    # LLM calls this job will hold open. None means no cap (per D4).
-    declared_max_concurrency: Optional[int] = None
-
-
-@dataclass
-class HaloRegisterProgramReqOutput(BaseReq):
-    registered: bool = False
-    job_id: str = ""
-    reason: Optional[str] = None         # set when registered=False
-    active_jobs: int = 0
-    existing: Optional[Dict[str, Any]] = None     # set on 409 conflict
 
 
 @dataclass

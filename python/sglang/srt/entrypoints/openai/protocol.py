@@ -316,12 +316,11 @@ class CompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
-    # HALO: Project Halo Phase 1 — job-level slowdown tracking.
-    # See managers/halo/CLAUDE.md.
-    halo_job_id: Optional[str] = None
-    halo_slo: Optional[float] = None
+    # HALO: Project Halo — request-level admission. See managers/halo/CLAUDE.md.
+    halo_ttft_slo: Optional[float] = None
+    halo_tbt_slo: Optional[float] = None
+    halo_e2e_slo: Optional[float] = None
     halo_bypass: Optional[bool] = False
-    halo_job_done: Optional[bool] = False
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -670,12 +669,11 @@ class ChatCompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
-    # HALO: Project Halo Phase 1 — job-level slowdown tracking.
-    # See managers/halo/CLAUDE.md.
-    halo_job_id: Optional[str] = None
-    halo_slo: Optional[float] = None
+    # HALO: Project Halo — request-level admission. See managers/halo/CLAUDE.md.
+    halo_ttft_slo: Optional[float] = None
+    halo_tbt_slo: Optional[float] = None
+    halo_e2e_slo: Optional[float] = None
     halo_bypass: Optional[bool] = False
-    halo_job_done: Optional[bool] = False
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
