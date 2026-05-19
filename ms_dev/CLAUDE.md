@@ -146,53 +146,46 @@ those are upstream-tracked defaults. The pre-baked wrappers under
 on the running process and renders `admission=ON|OFF|DRY_RUN` plus `ttft_slo`/`tbt_slo`
 on the live status panel — see [expctl/CLAUDE.md](expctl/CLAUDE.md).
 
-## Project Halo Phase 1 (job-level slowdown tracking)
+## Project Halo (request-level admission control + tracking)
 
-Sibling to admission control but operates at *job* granularity. Phase 1 is
-observation only (no decisions). Module:
+Request-level admission control + per-request tracking on the single-instance
+scheduler. Module:
 [python/sglang/srt/managers/halo/CLAUDE.md](../python/sglang/srt/managers/halo/CLAUDE.md).
-Development plan + decisions: [halo_dev/CLAUDE.md](halo_dev/CLAUDE.md).
 
-### Env vars (added in `env.common.sh`)
+> Refactored from job-level to request-level on 2026-05-19. Job-level
+> design docs are archived in `halo_dev/legacy_document/`; the job-level
+> codebase is at git tag `halo-job-level-final`.
 
-| Env var | CLI flag | Default | Notes |
-|---|---|---|---|
-| `SGLANG_HALO_ENABLED` | `--halo-enabled` | `0` (off) | Master on/off. Off ⇒ zero-cost (no-op hooks) |
-| `SGLANG_HALO_DEFAULT_SLO` | `--halo-default-slo` | `5.0` | Default slowdown SLO when request omits `halo_slo` |
-| `SGLANG_HALO_TICK_INTERVAL_MS` | `--halo-tick-interval-ms` | `100` | Wall-clock gate between sweeps |
-| `SGLANG_HALO_AGGREGATOR` | `--halo-aggregator` | `max+mean` | Reserved — Phase 1 tracks both |
-| `SGLANG_HALO_JOB_LOG` | `--halo-job-log` | unset (auto-routed) | Per-sweep snapshot JSONL (rank-0 only) |
-| `SGLANG_HALO_PREFILL_COST_MODEL` | `--halo-prefill-cost-model-path` | unset | Same JSON schema as admission_control's |
-| `SGLANG_HALO_TBT_COST_MODEL` | `--halo-tbt-cost-model-path` | unset | Same |
+### CLI flags
 
-### `lib_server.sh::append_halo_args` (added)
+| Flag | Default | Notes |
+|---|---|---|
+| `--halo-enabled` | off | Master on/off. Off ⇒ zero-cost (no-op hooks). |
+| `--halo-admission-policy` | `off` | `off` / `mooncake` / `vss` / `reactive`. |
+| `--halo-slo-mode` | `ratio` | TTFT/TBT SLO interpretation: `ratio` (vs solo) or `absolute` (ms). |
+| `--halo-admission-kv-cap-ratio` | `0.0` | Stage B′ KV-cache hard cap (0 = off). |
+| `--halo-admission-violation-threshold` | `0.2` | vss-policy reject threshold. |
+| `--halo-admission-dry-run` | off | Log decisions but always admit. |
+| `--halo-admission-decision-log` | unset (auto-routed) | per-decision JSONL. |
+| `--halo-{prefill,tbt,step}-cost-model-path` | unset | cost model JSONs. |
+| `--halo-tick-interval-ms` | `100` | request-tracker tick interval. |
 
-Translates the env vars above into `--halo-*` flags. Adds nothing when
-`SGLANG_HALO_ENABLED=0`. Used by `start_server_no_pd.sh`; in PD launchers
-flag is passed but the controller is a no-op (Phase 1 is single-mode only).
+Per-request SLOs travel in the request body as `halo_ttft_slo` /
+`halo_tbt_slo` / `halo_e2e_slo`; `halo_bypass` marks server-internal traffic.
+
+### ⚠ env-var wiring update pending
+
+`env.common.sh` / `lib_server.sh::append_halo_args` still translate the
+*job-level* `SGLANG_HALO_*` env vars (`SGLANG_HALO_ADMISSION_MODE`,
+`SGLANG_HALO_DEFAULT_SLO`, …) into the old flag names. They must be updated
+to the `--halo-*` flags above before experiments run — otherwise the server
+rejects unknown arguments.
 
 ### Per-session auto-routing (run_experiment.py)
 
-Mirrors admission_control:
-- Detects `SGLANG_HALO_ENABLED=1` at session start.
-- Auto-routes `SGLANG_HALO_JOB_LOG` to `<session_dir>/halo_jobs.jsonl` (unless pinned).
-- Records the env-var snapshot into `meta/run_meta.json::halo_config`.
-
-### Live monitoring
-
-`expctl/monitoring_view.py::halo_state_text()` renders
-`halo=ON slo=5x tick=100ms` / `OFF` / `UNKNOWN` / `N/A` on both the single
-and PD panels.
-
-### Where to put Halo settings
-
-Same three patterns as admission control: ad-hoc shell `export`, committed
-wrapper under `ms_dev/experiments/halo_*.sh`, or host-local `env.local.sh`.
-Pre-baked wrappers:
-
-- `halo_base.sh` — turn on with sensible defaults + cost models from
-  admission_control. **Strict mode**: clients must send `halo_job_id`.
-- `halo_off.sh` — clean baseline (unsets all `SGLANG_HALO_*`).
+Auto-routes `--halo-admission-decision-log` to
+`<session_dir>/admission_decisions.jsonl` (unless pinned) and records the
+halo flag snapshot into `meta/run_meta.json`.
 
 ## Quick start
 

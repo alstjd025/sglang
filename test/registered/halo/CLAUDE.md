@@ -1,20 +1,28 @@
-# Halo Phase 1 Tests
+# Halo Tests
 
-Pure-Python unit tests for the `managers/halo/` module. No GPU, no model load —
-runs in the `stage-a-test-cpu` suite. Covers:
+Pure-Python unit tests for the request-level `managers/halo/` module. No GPU,
+no model load — runs in the `stage-a-test-cpu` suite.
+
+`test_halo_phase1.py` covers:
 
 | Area | Coverage |
 |---|---|
-| `Job` dataclass | Lifecycle (admitted → completed), initial VJS = SLO, record_vjs |
-| `JobRegistry` | rid↔job mapping, lazy creation, completion bookkeeping, gc_completed |
-| `SlowdownTracker` | compute_job_vjs stage-merge VJS, cost-model primitives, sweep, no-cost-model fallback |
-| `HaloController` | enable/disable, register_request strict mode (raises on missing job_id), tick wall-clock gate, snapshot |
-| `build_halo_controller_from_server_args` | factory returns None when off |
+| `RequestTracker` / `RequestRecord` | `on_admitted` / `on_step` / `on_finished` / `on_rejected`, first-token stamping, TBT mean, e2e + slowdown at finish, `snapshot` partitioning, solo primitives |
+| `HaloAdmissionGate` | KV-cache hard cap (reject / disabled), None-policy admit |
+| `MooncakePolicy` | admits without cost models, TTFT-ratio reject, absolute `slo_mode` |
+| `VssPolicy` | admits empty batch, decide runs with a populated running batch |
+| `HaloController` | off-by-default factory, register→tracker record, KV-cap reject raises `HaloRejectError`, dry-run, finish, tick |
 
-What is **not** covered here (Phase 2 / integration):
-- Live HTTP request → scheduler → Halo flow (requires running server)
+Cost models are duck-typed fakes (`_FakePrefill` / `_FakeTbt` / `_FakeStep`)
+so the tests stay model-file-free.
+
+Other halo test files in this directory (`test_halo_step_cost_model.py`,
+`test_halo_cost_model_sampler.py`, `test_fit_halo_cost_model.py`) cover the
+cost-model machinery and are unaffected by the request-level refactor.
+
+What is **not** covered here (integration):
+- Live HTTP request → scheduler → Halo flow (requires a running server)
 - Multi-TP rank dedup (single-process test)
-- Cost-model fitting (admission_control's existing test exercises that)
 
 Run:
 
