@@ -1,6 +1,6 @@
 """HALO (Project Halo) — job-level slowdown tracking. See CLAUDE.md."""
 
-from sglang.srt.managers.halo.admission_decision import (
+from sglang.srt.managers.halo.admission_control.vss_predictor import (
     REASON_HALO_ADMISSION_PREDICTED,
     REASON_OK,
     ActiveCallInfo,

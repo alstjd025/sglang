@@ -29,7 +29,7 @@ from sglang.srt.managers.halo.admission_control.cost_model import (
     try_load_prefill_cost_model,
     try_load_tbt_cost_model,
 )
-from sglang.srt.managers.halo.admission_decision import (
+from sglang.srt.managers.halo.admission_control.vss_predictor import (
     REASON_HALO_ADMISSION_PREDICTED,
     ActiveCallInfo,
     AdmissionDecisionResult,

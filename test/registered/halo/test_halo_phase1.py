@@ -803,7 +803,7 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
         c.register_program("new-1", slo=5.0, total_calls=2)
         c.registry.admit_to_job("active-1", 2.0, "rid-x")
 
-        from sglang.srt.managers.halo.admission_decision import (
+        from sglang.srt.managers.halo.admission_control.vss_predictor import (
             AdmissionPredictor,
         )
 
@@ -845,7 +845,7 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
         c.register_program("new-1", slo=5.0, total_calls=2)
         c.registry.admit_to_job("active-1", 2.0, "rid-x")
 
-        from sglang.srt.managers.halo.admission_decision import (
+        from sglang.srt.managers.halo.admission_control.vss_predictor import (
             AdmissionPredictor,
         )
 
@@ -943,7 +943,7 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
         )
         # Force-replace the predictor with one that always rejects. If
         # Stage A were called, this would raise.
-        from sglang.srt.managers.halo.admission_decision import (
+        from sglang.srt.managers.halo.admission_control.vss_predictor import (
             AdmissionPredictor,
         )
 
@@ -1012,7 +1012,7 @@ class TestPhase2AdmissionIntegration(unittest.TestCase):
         )
         # Force a predictor that always rejects. In request mode the gate
         # runs even for a follow-up → the second request must be rejected.
-        from sglang.srt.managers.halo.admission_decision import (
+        from sglang.srt.managers.halo.admission_control.vss_predictor import (
             AdmissionPredictor,
         )
 
